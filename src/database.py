@@ -503,6 +503,17 @@ def _log_alert_pg(
             %(recipient_name)s, %(recipient_phone)s, %(recipient_email)s
         )
     """
+    import uuid as _uuid
+    try:
+        _uuid.UUID(str(assessment_id))
+        valid_uuid = True
+    except (ValueError, AttributeError):
+        valid_uuid = False
+
+    if not valid_uuid:
+        logger.info(f"[PG] Skipping alert log — interaction_id '{assessment_id}' is not a UUID (manual/test call).")
+        return
+
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, {
@@ -513,6 +524,7 @@ def _log_alert_pg(
                 "recipient_phone": recipient_phone,
                 "recipient_email": recipient_email,
             })
+
 
 
 # ===========================================================================
