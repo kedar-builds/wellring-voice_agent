@@ -52,7 +52,7 @@ from src.database import (
     add_reminder, get_reminders, delete_reminder, update_reminder_trigger,
     get_assessments_list, get_assessment_stats, get_user_health_context
 )
-from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder
+from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp
 
 # ---------------------------------------------------------------------------
 # Background Reminder Scheduler
@@ -634,5 +634,72 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
         "has_history": ctx.get("has_history", False),
         "history_summary": ctx.get("summary_lines", []),
         "prompt_preview": dynamic_prompt[:300] + "..."
+    }
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp Test & Notification Endpoints
+# ---------------------------------------------------------------------------
+
+class TestWhatsAppRequest(BaseModel):
+    to_phone: str = Field(..., description="Phone number to send test to, e.g. +919004261186")
+    patient_name: Optional[str] = Field("Atharva", description="Patient name for the test message")
+
+
+@app.post("/test-whatsapp", tags=["WhatsApp"])
+def test_whatsapp(payload: TestWhatsAppRequest, api_key: str = Depends(get_api_key)):
+    """
+    Send a test WhatsApp message to verify Twilio integration.
+    Set USE_TWILIO=true and USE_WHATSAPP=true in .env to actually send.
+    """
+    result = send_test_whatsapp(
+        to_phone=payload.to_phone,
+        patient_name=payload.patient_name or "the patient",
+    )
+    return result
+
+
+@app.post("/notify", tags=["WhatsApp"])
+async def manual_notify(request: Request, api_key: str = Depends(get_api_key)):
+    """
+    Manually trigger a WhatsApp alert to a caregiver.
+    Useful for testing the full alert pipeline without a real call.
+
+    Body: { phone: '+91...', risk_level: 'HIGH', symptoms: ['fever'], patient_name: 'Atharva' }
+    """
+    body = await request.json()
+    phone        = body.get("phone", os.environ.get("CAREGIVER_PHONE", ""))
+    risk_level   = body.get("risk_level", "HIGH")
+    symptoms     = body.get("symptoms", ["fever"])
+    patient_name = body.get("patient_name", "the patient")
+    caregiver_name = body.get("caregiver_name")
+
+    if not phone:
+        raise HTTPException(status_code=400, detail="phone is required")
+
+    from src.notifications import send_whatsapp_alert
+    fake_assessment = {
+        "risk_level": risk_level,
+        "score": 75,
+        "symptoms": symptoms,
+        "action": "notify_caregiver",
+        "steps": [
+            "Check on the patient immediately",
+            "Monitor temperature every 2 hours",
+            "Ensure they stay hydrated",
+        ],
+    }
+    sent = send_whatsapp_alert(
+        interaction_id="manual-test",
+        response_data=fake_assessment,
+        to_phone=phone,
+        patient_name=patient_name,
+        caregiver_name=caregiver_name,
+    )
+    return {
+        "sent": sent,
+        "to": phone,
+        "risk_level": risk_level,
+        "symptoms": symptoms,
     }
 
