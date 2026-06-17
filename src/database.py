@@ -911,3 +911,143 @@ def get_assessment_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
     # -- SQLite fallback --
     return _get_assessment_stats_sqlite(db_path)
 
+
+# ===========================================================================
+# get_user_health_context  — used by /call to inject memory into Bolna prompt
+# ===========================================================================
+
+def get_user_health_context(phone: str, days: int = 7) -> Dict[str, Any]:
+    """
+    Fetch a user's recent health history by phone number.
+
+    Returns a dict with:
+        user_id          — UUID of the user (or None if not found)
+        user_name        — user's name (or "the patient")
+        recent_symptoms  — deduplicated list of symptom keys from last `days` days
+        last_risk_level  — most recent risk level string (LOW/MEDIUM/HIGH/CRITICAL)
+        last_assessment  — ISO timestamp of the last assessment
+        summary_lines    — list of human-readable strings describing recent history
+        has_history      — bool: True if any assessments found
+    """
+    if _use_postgres() and _PG_AVAILABLE:
+        return _get_user_health_context_pg(phone, days)
+
+    # SQLite / no-history fallback
+    return {
+        "user_id": None,
+        "user_name": "the patient",
+        "recent_symptoms": [],
+        "last_risk_level": None,
+        "last_assessment": None,
+        "summary_lines": [],
+        "has_history": False,
+    }
+
+
+def _get_user_health_context_pg(phone: str, days: int) -> Dict[str, Any]:
+    """PostgreSQL implementation of get_user_health_context."""
+    # Normalise: strip spaces / dashes so +91 90042 61186 == +919004261186
+    phone_clean = phone.replace(" ", "").replace("-", "")
+
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+
+    # 1. Look up user by phone (try both raw and cleaned)
+    user_sql = """
+        SELECT user_id, name, age, medical_conditions, caregiver_phone
+        FROM   users
+        WHERE  phone = %(phone)s OR phone = %(phone_clean)s
+        LIMIT  1
+    """
+    # 2. Fetch recent assessments for this user
+    assess_sql = """
+        SELECT symptoms, severity, risk_level, assessed_at
+        FROM   assessments
+        WHERE  user_id = %(user_id)s
+          AND  assessed_at >= %(cutoff)s
+        ORDER  BY assessed_at DESC
+        LIMIT  20
+    """
+
+    result: Dict[str, Any] = {
+        "user_id": None,
+        "user_name": "the patient",
+        "recent_symptoms": [],
+        "last_risk_level": None,
+        "last_assessment": None,
+        "summary_lines": [],
+        "has_history": False,
+    }
+
+    try:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                # Find user
+                cur.execute(user_sql, {"phone": phone, "phone_clean": phone_clean})
+                user_row = cur.fetchone()
+
+                if not user_row:
+                    logger.info(f"[CTX] No user found for phone {phone_clean}")
+                    return result
+
+                user_id  = str(user_row["user_id"])
+                user_name = user_row["name"] or "the patient"
+                result["user_id"]   = user_id
+                result["user_name"] = user_name
+
+                # Fetch assessments
+                cur.execute(assess_sql, {"user_id": user_id, "cutoff": cutoff})
+                rows = cur.fetchall()
+
+                if not rows:
+                    logger.info(f"[CTX] No recent assessments for user {user_id}")
+                    return result
+
+                result["has_history"] = True
+                result["last_risk_level"] = rows[0]["risk_level"]
+                result["last_assessment"] = rows[0]["assessed_at"].isoformat() if rows[0]["assessed_at"] else None
+
+                # Collect unique symptoms across all recent assessments
+                seen: set = set()
+                all_symptoms: List[str] = []
+                for row in rows:
+                    for sym in (row["symptoms"] or []):
+                        if sym and sym not in seen:
+                            seen.add(sym)
+                            all_symptoms.append(sym)
+
+                result["recent_symptoms"] = all_symptoms
+
+                # Build natural-language summary lines
+                summary: List[str] = []
+
+                # Group by day for "yesterday", "2 days ago" etc.
+                now_date = datetime.datetime.utcnow().date()
+                day_buckets: Dict[int, List[str]] = {}
+                for row in rows:
+                    if not row["assessed_at"]:
+                        continue
+                    row_date = row["assessed_at"].date() if hasattr(row["assessed_at"], "date") else datetime.datetime.fromisoformat(str(row["assessed_at"])).date()
+                    days_ago = (now_date - row_date).days
+                    bucket_syms = row["symptoms"] or []
+                    if bucket_syms:
+                        day_buckets.setdefault(days_ago, []).extend(bucket_syms)
+
+                for days_ago_key in sorted(day_buckets.keys()):
+                    syms = list(dict.fromkeys(day_buckets[days_ago_key]))  # dedup, preserve order
+                    sym_str = ", ".join(s.replace("_", " ") for s in syms)
+                    if days_ago_key == 0:
+                        label = "earlier today"
+                    elif days_ago_key == 1:
+                        label = "yesterday"
+                    else:
+                        label = f"{days_ago_key} days ago"
+                    summary.append(f"{label.capitalize()}: {sym_str}")
+
+                result["summary_lines"] = summary
+                logger.info(f"[CTX] Built health context for {user_name}: {summary}")
+
+    except Exception as exc:
+        logger.error(f"[CTX] Error fetching health context for {phone}: {exc}")
+
+    return result
+

@@ -30,6 +30,7 @@ import asyncio
 import logging
 import sqlite3
 import json
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ from src.scoring_engine import calculate_score, determine_action, SYMPTOM_WEIGHT
 from src.database import (
     init_db, log_interaction, get_symptom_repeat_count,
     add_reminder, get_reminders, delete_reminder, update_reminder_trigger,
-    get_assessments_list, get_assessment_stats
+    get_assessments_list, get_assessment_stats, get_user_health_context
 )
 from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder
 
@@ -529,4 +530,109 @@ def remove_reminder(reminder_id: int, api_key: str = Depends(get_api_key)):
     if not success:
         raise HTTPException(status_code=404, detail="Reminder not found")
     return {"message": "Reminder deleted successfully"}
+
+
+# ---------------------------------------------------------------------------
+# Outbound Call Endpoint (context-aware)
+# ---------------------------------------------------------------------------
+
+BOLNA_API_KEY = os.environ.get("BOLNA_API_KEY", "")
+BOLNA_AGENT_ID = os.environ.get("BOLNA_AGENT_ID", "ab32d1ed-a6ae-4581-a712-c7f5e235f9f0")
+
+BASE_SYSTEM_PROMPT = """You are Riley, a warm and caring health assistant from WellRing calling to check on an elderly patient.
+
+Your role:
+- Greet the patient by name if known, then gently ask how they are feeling
+- If they had symptoms recently, ask a specific follow-up (e.g. "Yesterday you mentioned fever — has your temperature come down?")
+- Listen carefully for any new or worsening symptoms
+- If they mention chest pain, difficulty breathing, stroke symptoms, or unconsciousness — immediately say: "This sounds urgent. Please call emergency services at 112 right now. I will also alert your caregiver."
+- After talking, call the assess_health_risk tool to log the outcome
+
+Speaking style:
+- Speak in short, simple, warm sentences
+- Never use medical jargon
+- Be patient — they may speak slowly"""
+
+
+class CallRequest(BaseModel):
+    phone: str = Field(..., description="Phone number to call, e.g. +919004261186")
+    user_name: Optional[str] = Field(None, description="Override patient name")
+
+
+@app.post("/call", tags=["Outbound Calls"])
+async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key)):
+    """
+    Initiate a context-aware outbound call via Bolna.
+
+    Steps:
+      1. Fetch the user's health history from the DB by phone number.
+      2. Build a personalised system prompt that references recent symptoms.
+      3. POST to Bolna /call with the dynamic agent_prompts override.
+    """
+    if not BOLNA_API_KEY:
+        raise HTTPException(status_code=500, detail="BOLNA_API_KEY not configured")
+
+    # 1. Fetch health context from DB
+    ctx = get_user_health_context(payload.phone, days=7)
+    user_name = payload.user_name or ctx.get("user_name", "there")
+
+    # 2. Build personalised prompt
+    history_block = ""
+    if ctx.get("has_history") and ctx.get("summary_lines"):
+        lines = ctx["summary_lines"]
+        history_block = (
+            f"\n\nIMPORTANT — This patient's recent health history:\n"
+            + "\n".join(f"  • {line}" for line in lines)
+            + "\n\nStart the call by warmly asking a specific follow-up about the most recent symptoms listed above."
+        )
+    else:
+        history_block = (
+            "\n\nThis is a routine wellness check. No recent health history found. "
+            "Start by asking: 'How have you been feeling lately?'"
+        )
+
+    dynamic_prompt = BASE_SYSTEM_PROMPT + history_block
+
+    logger.info(f"[CALL] Initiating call to {payload.phone} | history={ctx.get('has_history')} | user={user_name}")
+
+    # 3. Call Bolna API
+    bolna_payload = {
+        "agent_id": BOLNA_AGENT_ID,
+        "recipient_phone_number": payload.phone,
+        "agent_prompts": {
+            "task_1": {
+                "system_prompt": dynamic_prompt
+            }
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://api.bolna.ai/call",
+            headers={
+                "Authorization": f"Bearer {BOLNA_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=bolna_payload
+        )
+
+    if resp.status_code not in (200, 201, 202):
+        logger.error(f"[CALL] Bolna API error {resp.status_code}: {resp.text}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Bolna API returned {resp.status_code}: {resp.text}"
+        )
+
+    resp_data = resp.json()
+    logger.info(f"[CALL] Bolna call queued: {resp_data}")
+
+    return {
+        "status": "queued",
+        "run_id": resp_data.get("run_id") or resp_data.get("execution_id"),
+        "phone": payload.phone,
+        "user_name": user_name,
+        "has_history": ctx.get("has_history", False),
+        "history_summary": ctx.get("summary_lines", []),
+        "prompt_preview": dynamic_prompt[:300] + "..."
+    }
 
