@@ -1,0 +1,211 @@
+{
+  "id": "ab32d1ed-a6ae-4581-a712-c7f5e235f9f0",
+  "agent_name": "My New Agent",
+  "agent_status": "processed",
+  "agent_welcome_message": "Hello, this is your WellRing nursing assistant. How are you feeling today?",
+  "agent_type": "",
+  "webhook_url": null,
+  "tasks": [
+    {
+      "task_type": "conversation",
+      "toolchain": {
+        "execution": "parallel",
+        "pipelines": [
+          [
+            "transcriber",
+            "llm",
+            "synthesizer"
+          ]
+        ]
+      },
+      "task_config": {
+        "voicemail": false,
+        "use_fillers": false,
+        "dtmf_enabled": false,
+        "ambient_noise": false,
+        "inbound_limit": -1,
+        "backchanneling": false,
+        "call_terminate": 300,
+        "auto_reschedule": false,
+        "optimize_latency": true,
+        "incremental_delay": 500,
+        "ambient_noise_track": "office-ambience",
+        "call_hangup_message": null,
+        "check_if_user_online": true,
+        "hangup_after_LLMCall": false,
+        "hangup_after_silence": 15,
+        "welcome_message_delay": 0,
+        "whitelist_phone_numbers": null,
+        "call_cancellation_prompt": null,
+        "disallow_unknown_numbers": false,
+        "language_detection_turns": null,
+        "noise_cancellation_level": null,
+        "voicemail_check_interval": 7.0,
+        "voicemail_detection_time": 2.5,
+        "check_user_online_message": {
+          "en": "Hello, are you still on the line?",
+          "hi": "Hello, \u0915\u094d\u092f\u093e \u0906\u092a \u0905\u092d\u0940 \u092d\u0940 \u0932\u093e\u0907\u0928 \u092a\u0930 \u0939\u0948\u0902?"
+        },
+        "backchanneling_message_gap": 5,
+        "backchanneling_start_delay": 5,
+        "interruption_backoff_period": 0,
+        "voicemail_detection_duration": 30.0,
+        "discard_pre_welcome_utterance": false,
+        "voicemail_min_transcript_length": 7,
+        "number_of_words_for_interruption": 2,
+        "trigger_user_online_message_after": 10
+      },
+      "tools_config": {
+        "input": {
+          "format": "wav",
+          "provider": "vobiz"
+        },
+        "output": {
+          "format": "wav",
+          "provider": "vobiz"
+        },
+        "api_tools": {
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "assess_health_risk",
+                "description": "Assess the user's health symptoms and determine risk severity. Must be called whenever symptoms are mentioned.",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "intent": {
+                      "type": "string",
+                      "enum": ["health_issue", "general"],
+                      "description": "Whether the user is reporting a health issue."
+                    },
+                    "symptoms": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "List of symptoms mentioned by the user."
+                    },
+                    "severity": {
+                      "type": "string",
+                      "enum": ["low", "medium", "high", "critical"],
+                      "description": "The severity of the symptoms."
+                    },
+                    "confidence": {
+                      "type": "number",
+                      "description": "Confidence score of the assessment from 0.0 to 1.0."
+                    }
+                  },
+                  "required": ["intent", "symptoms", "severity", "confidence"]
+                },
+                "strict": true
+              }
+            }
+          ],
+          "tools_params": {
+            "assess_health_risk": {
+              "url": "https://wellring-backend.onrender.com/assess",
+              "method": "POST",
+              "headers": {
+                "X-API-Key": "wellring-secure-2026",
+                "Content-Type": "application/json"
+              },
+              "param": {
+                "intent": "%(intent)s",
+                "symptoms": "%(symptoms)s",
+                "severity": "%(severity)s",
+                "confidence": "%(confidence)s"
+              }
+            }
+          }
+        },
+        "llm_agent": {
+          "agent_type": "simple_llm_agent",
+          "llm_config": {
+            "stop": null,
+            "min_p": 0.1,
+            "model": "azure/gpt-4.1-mini",
+            "top_k": 0,
+            "top_p": 0.9,
+            "family": "openai",
+            "base_url": null,
+            "provider": "azure",
+            "verbosity": null,
+            "max_tokens": 350,
+            "temperature": 0.2,
+            "request_json": false,
+            "agent_flow_type": "streaming",
+            "presence_penalty": 0.0,
+            "reasoning_effort": null,
+            "compact_threshold": null,
+            "frequency_penalty": 0.0,
+            "use_responses_api": false,
+            "extraction_details": null,
+            "summarization_details": null
+          },
+          "agent_flow_type": "streaming"
+        },
+        "agent_names": null,
+        "synthesizer": {
+          "stream": true,
+          "caching": true,
+          "provider": "elevenlabs",
+          "buffer_size": 220,
+          "audio_format": "wav",
+          "provider_config": {
+            "model": "eleven_turbo_v2_5",
+            "speed": 1.0,
+            "style": 0.0,
+            "voice": "Tripti - Soothing Customer Care Agent",
+            "voice_id": "1Z7Y8o9cvUeWq8oLKgMY",
+            "temperature": 0.5,
+            "similarity_boost": 0.6
+          }
+        },
+        "transcriber": {
+          "task": "transcribe",
+          "delay": "medium",
+          "model": "nova-2",
+          "active": null,
+          "stream": true,
+          "encoding": "linear16",
+          "keywords": "",
+          "language": "en",
+          "provider": "deepgram",
+          "endpointing": 300,
+          "multilingual": null,
+          "eot_threshold": null,
+          "sampling_rate": 16000,
+          "vad_threshold": 0.5,
+          "eot_timeout_ms": null,
+          "language_hints": null,
+          "noise_reduction": false,
+          "eager_eot_threshold": null,
+          "vad_prefix_padding_ms": 300
+        },
+        "multilingual_config": null,
+        "switch_handoff_messages": null,
+        "switch_tool_description": null
+      }
+    }
+  ],
+  "created_at": "2026-06-15T18:23:20.932347",
+  "updated_at": "2026-06-15T18:23:20.971991",
+  "gpt_assistants": [],
+  "custom_analytics": [],
+  "inbound_phone_number": null,
+  "restricted": false,
+  "calling_guardrails": null,
+  "webhook_headers": null,
+  "sip_header_variables": null,
+  "ingest_lookup_key": null,
+  "webhook_config": null,
+  "dispositions": [
+    "1b01b5e3-bcaf-43a8-9acc-825aa1485e6e",
+    "b3b1dc75-5ac8-46e6-a3b9-af761328ddbb"
+  ],
+  "agent_prompts": {
+    "task_1": {
+      "system_prompt": "You are a health assistant for elderly people.\n\nSTRICT RULES:\n1. If the user mentions chest pain, heart, breathing, fallen, unconscious, bleeding, stroke - start with: ALERT - Please call emergency services immediately on 112\n2. After alert, ask follow up questions calmly\n3. Always speak in very simple short sentences\n4. Never use difficult medical words\n5. Be warm and caring like a family member\n6. Crucially, when the user reports any symptoms or health conditions, you MUST immediately call the 'assess_health_risk' tool with the extracted details so it is saved in their health record."
+    }
+  },
+  "ingest_source_config": null
+}

@@ -619,7 +619,7 @@ def log_conversation_turn(
 
 
 # ===========================================================================
-# Reminders  (SQLite-only for now; Supabase/Postgres can be added later)
+# Reminders (Multi-backend)
 # ===========================================================================
 
 def add_reminder(
@@ -627,6 +627,20 @@ def add_reminder(
     frequency: str, phone: str,
     notes: Optional[str] = None, db_path: Optional[str] = None,
 ) -> int:
+    if _use_postgres() and _PG_AVAILABLE:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                cur.execute("""
+                    INSERT INTO reminders (type, title, time, frequency, phone, notes, last_triggered)
+                    VALUES (%(type)s, %(title)s, %(time)s, %(frequency)s, %(phone)s, %(notes)s, NULL)
+                    RETURNING id
+                """, {
+                    "type": type_val, "title": title, "time": time_val,
+                    "frequency": frequency, "phone": phone, "notes": notes
+                })
+                row = cur.fetchone()
+                return int(row["id"]) if row else 0
+
     db_path = _resolve_db_path(db_path)
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -641,6 +655,12 @@ def add_reminder(
 
 
 def get_reminders(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    if _use_postgres() and _PG_AVAILABLE:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                cur.execute("SELECT * FROM reminders")
+                return [dict(r) for r in cur.fetchall()]
+
     db_path = _resolve_db_path(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -652,6 +672,12 @@ def get_reminders(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
 
 
 def delete_reminder(reminder_id: int, db_path: Optional[str] = None) -> bool:
+    if _use_postgres() and _PG_AVAILABLE:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                cur.execute("DELETE FROM reminders WHERE id = %s", (reminder_id,))
+                return cur.rowcount > 0
+
     db_path = _resolve_db_path(db_path)
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -663,6 +689,12 @@ def delete_reminder(reminder_id: int, db_path: Optional[str] = None) -> bool:
 
 
 def update_reminder_trigger(reminder_id: int, timestamp: str, db_path: Optional[str] = None) -> bool:
+    if _use_postgres() and _PG_AVAILABLE:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                cur.execute("UPDATE reminders SET last_triggered = %s WHERE id = %s", (timestamp, reminder_id))
+                return cur.rowcount > 0
+
     db_path = _resolve_db_path(db_path)
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
