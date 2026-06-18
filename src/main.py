@@ -87,7 +87,7 @@ async def run_reminder_scheduler():
                 should_trigger = False
                 trigger_timestamp = ""
                 
-                if rem_freq == "once" or "T" in rem_time:
+                if "T" in rem_time:
                     try:
                         # e.g., "2026-06-10T14:30"
                         rem_dt = datetime.datetime.fromisoformat(rem_time.replace("Z", ""))
@@ -114,6 +114,10 @@ async def run_reminder_scheduler():
                             if last_trig != current_year:
                                 should_trigger = True
                                 trigger_timestamp = current_year
+                        elif rem_freq == "once":
+                            if not last_trig:
+                                should_trigger = True
+                                trigger_timestamp = now.isoformat()
                 
                 if should_trigger:
                     logger.info(f"Triggering reminder {rem_id} ({rem_title}) for {rem_phone}")
@@ -147,12 +151,54 @@ async def run_reminder_scheduler():
 # App setup
 # ---------------------------------------------------------------------------
 
+def seed_demo_data():
+    from src.database import _use_postgres, _PG_AVAILABLE, get_user_profile, upsert_user_profile, get_reminders, add_reminder
+    
+    if not (_use_postgres() and _PG_AVAILABLE):
+        logger.info("PostgreSQL not active. Skipping demo seed data.")
+        return
+        
+    DEMO_UID = "demo_sharma_001"
+    
+    profile = get_user_profile(DEMO_UID)
+    if not profile:
+        logger.info("Seeding demo data for Mr. Sharma...")
+        upsert_user_profile(
+            firebase_uid=DEMO_UID,
+            name="Mr. Sharma",
+            phone="+919876543210",
+            age=72,
+            conditions=["Hypertension", "Mild Diabetes"],
+            notes="Requires regular BP monitoring. Prefers afternoon calls."
+        )
+        
+        reminders = get_reminders()
+        if not reminders:
+            add_reminder(
+                type_val="medicine",
+                title="Amlodipine 5mg (BP)",
+                time_val="09:00",
+                frequency="daily",
+                phone="+919876543210",
+                notes="Take with breakfast"
+            )
+            add_reminder(
+                type_val="call",
+                title="Weekly Wellness Check-in",
+                time_val="14:00",
+                frequency="weekly",
+                phone="+919876543210",
+                notes="Routine AI check-in"
+            )
+            logger.info("Demo reminders seeded successfully.")
+
 scheduler_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scheduler_task
     init_db()
+    seed_demo_data()
     scheduler_task = asyncio.create_task(run_reminder_scheduler())
     yield
     if scheduler_task:

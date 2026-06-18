@@ -231,3 +231,19 @@ CREATE TRIGGER trg_users_updated_at
     BEFORE UPDATE ON users
     FOR EACH ROW
     EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- 6. REMINDERS
+-- ---------------------------------------------------------------------------
+-- Scheduled reminders for the voice agent to trigger
+
+CREATE TABLE IF NOT EXISTS reminders (
+    id              SERIAL PRIMARY KEY,
+    type            TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    time            TEXT NOT NULL,
+    frequency       TEXT NOT NULL,
+    phone           TEXT NOT NULL,
+    notes           TEXT,
+    last_triggered  TEXT
+);
