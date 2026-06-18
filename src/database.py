@@ -133,8 +133,8 @@ def init_db(db_path: Optional[str] = None) -> None:
     For Postgres: run `python -m src.db.migrate` instead.
     """
     if _use_postgres():
-        logger.info("PostgreSQL backend active — skipping SQLite init_db().")
-        return
+        logger.info("PostgreSQL backend active — still initializing SQLite for reminders table.")
+
 
     db_path = _resolve_db_path(db_path)
     conn = sqlite3.connect(db_path)
@@ -953,6 +953,8 @@ def get_user_health_context(phone: str, days: int = 7) -> Dict[str, Any]:
         "last_assessment": None,
         "summary_lines": [],
         "has_history": False,
+        "medical_conditions": [],
+        "medical_notes": "",
     }
 
 
@@ -965,7 +967,7 @@ def _get_user_health_context_pg(phone: str, days: int) -> Dict[str, Any]:
 
     # 1. Look up user by phone (try both raw and cleaned)
     user_sql = """
-        SELECT user_id, name, age, medical_conditions, caregiver_phone
+        SELECT user_id, name, age, medical_conditions, medical_notes, caregiver_phone
         FROM   users
         WHERE  phone = %(phone)s OR phone = %(phone_clean)s
         LIMIT  1
@@ -988,6 +990,8 @@ def _get_user_health_context_pg(phone: str, days: int) -> Dict[str, Any]:
         "last_assessment": None,
         "summary_lines": [],
         "has_history": False,
+        "medical_conditions": [],
+        "medical_notes": "",
     }
 
     try:
@@ -1005,6 +1009,8 @@ def _get_user_health_context_pg(phone: str, days: int) -> Dict[str, Any]:
                 user_name = user_row["name"] or "the patient"
                 result["user_id"]   = user_id
                 result["user_name"] = user_name
+                result["medical_conditions"] = user_row.get("medical_conditions") or []
+                result["medical_notes"] = user_row.get("medical_notes") or ""
 
                 # Fetch assessments
                 cur.execute(assess_sql, {"user_id": user_id, "cutoff": cutoff})
@@ -1063,3 +1069,124 @@ def _get_user_health_context_pg(phone: str, days: int) -> Dict[str, Any]:
 
     return result
 
+
+# ===========================================================================
+# Onboarding & User Profile Management
+# ===========================================================================
+
+def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[int], 
+                        conditions: List[str], notes: str) -> str:
+    """Upsert the elder user's profile, returns the Postgres UUID."""
+    if not _use_postgres() or not _PG_AVAILABLE:
+        # Fallback for SQLite/Supabase MVP: just raise or log
+        logger.warning("Profile onboarding currently requires PostgreSQL.")
+        return ""
+        
+    with get_pg_conn() as conn:
+        with _pg_cursor(conn) as cur:
+            cur.execute("""
+                INSERT INTO users (firebase_uid, name, phone, age, medical_conditions, medical_notes, role)
+                VALUES (%(uid)s, %(name)s, %(phone)s, %(age)s, %(conds)s, %(notes)s, 'elderly')
+                ON CONFLICT (firebase_uid) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    phone = EXCLUDED.phone,
+                    age = EXCLUDED.age,
+                    medical_conditions = EXCLUDED.medical_conditions,
+                    medical_notes = EXCLUDED.medical_notes,
+                    updated_at = now()
+                RETURNING user_id
+            """, {
+                "uid": firebase_uid,
+                "name": name,
+                "phone": phone,
+                "age": age,
+                "conds": conditions,
+                "notes": notes
+            })
+            row = cur.fetchone()
+            return str(row["user_id"]) if row else ""
+
+def get_user_profile(firebase_uid: str) -> Optional[Dict[str, Any]]:
+    """Retrieve an elder's profile by Firebase UID."""
+    if not _use_postgres() or not _PG_AVAILABLE:
+        return None
+        
+    with get_pg_conn() as conn:
+        with _pg_cursor(conn) as cur:
+            cur.execute("""
+                SELECT user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes
+                FROM users
+                WHERE firebase_uid = %s AND role = 'elderly'
+            """, (firebase_uid,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+def upsert_family_contacts(elder_user_id: str, contacts: List[Dict[str, str]]) -> None:
+    """Insert or update family caregiver contacts for an elder. This deletes existing contacts first for simplicity."""
+    if not _use_postgres() or not _PG_AVAILABLE:
+        return
+        
+    with get_pg_conn() as conn:
+        with _pg_cursor(conn) as cur:
+            # Delete existing caregivers
+            cur.execute("""
+                DELETE FROM users
+                WHERE caregiver_for_user_id = %s AND role = 'caregiver'
+            """, (elder_user_id,))
+            
+            # Insert new ones
+            for c in contacts:
+                cur.execute("""
+                    INSERT INTO users (name, phone, role, caregiver_for_user_id, relationship)
+                    VALUES (%(name)s, %(phone)s, 'caregiver', %(elder_id)s, %(rel)s)
+                """, {
+                    "name": c.get("name"),
+                    "phone": c.get("phone"),
+                    "elder_id": elder_user_id,
+                    "rel": c.get("relationship", "Other")
+                })
+
+def add_single_family_contact(elder_user_id: str, name: str, phone: str, relationship: str) -> None:
+    """Add a single family contact without deleting existing ones."""
+    if not _use_postgres() or not _PG_AVAILABLE:
+        return
+        
+    with get_pg_conn() as conn:
+        with _pg_cursor(conn) as cur:
+            cur.execute("""
+                INSERT INTO users (name, phone, role, caregiver_for_user_id, relationship)
+                VALUES (%(name)s, %(phone)s, 'caregiver', %(elder_id)s, %(rel)s)
+            """, {
+                "name": name,
+                "phone": phone,
+                "elder_id": elder_user_id,
+                "rel": relationship
+            })
+
+def get_family_contacts(elder_user_id: str) -> List[Dict[str, Any]]:
+    """Fetch family contacts linked to an elder."""
+    if not _use_postgres() or not _PG_AVAILABLE:
+        return []
+        
+    with get_pg_conn() as conn:
+        with _pg_cursor(conn) as cur:
+            cur.execute("""
+                SELECT user_id, name, phone, relationship
+                FROM users
+                WHERE caregiver_for_user_id = %s AND role = 'caregiver'
+            """, (elder_user_id,))
+            return [dict(r) for r in cur.fetchall()]
+
+def delete_family_contact(contact_id: str) -> bool:
+    """Delete a specific family contact."""
+    if not _use_postgres() or not _PG_AVAILABLE:
+        return False
+        
+    with get_pg_conn() as conn:
+        with _pg_cursor(conn) as cur:
+            cur.execute("""
+                DELETE FROM users
+                WHERE user_id = %s AND role = 'caregiver'
+                RETURNING user_id
+            """, (contact_id,))
+            return bool(cur.fetchone())

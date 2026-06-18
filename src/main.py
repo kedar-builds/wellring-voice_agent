@@ -18,7 +18,7 @@ Interactive docs:
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Security, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Security, Depends, status, Request, UploadFile, File, Form
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -50,7 +50,9 @@ from src.scoring_engine import calculate_score, determine_action, SYMPTOM_WEIGHT
 from src.database import (
     init_db, log_interaction, get_symptom_repeat_count,
     add_reminder, get_reminders, delete_reminder, update_reminder_trigger,
-    get_assessments_list, get_assessment_stats, get_user_health_context
+    get_assessments_list, get_assessment_stats, get_user_health_context,
+    upsert_user_profile, get_user_profile, upsert_family_contacts, get_family_contacts, delete_family_contact,
+    add_single_family_contact
 )
 from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp
 
@@ -67,7 +69,8 @@ async def run_reminder_scheduler():
             if not reminders:
                 continue
                 
-            now = datetime.datetime.now()
+            ist_tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+            now = datetime.datetime.now(ist_tz)
             current_time_str = now.strftime("%H:%M")
             current_date_str = now.strftime("%Y-%m-%d")
             
@@ -88,6 +91,8 @@ async def run_reminder_scheduler():
                     try:
                         # e.g., "2026-06-10T14:30"
                         rem_dt = datetime.datetime.fromisoformat(rem_time.replace("Z", ""))
+                        if rem_dt.tzinfo is None:
+                            rem_dt = rem_dt.replace(tzinfo=ist_tz)
                         if now >= rem_dt and not last_trig:
                             should_trigger = True
                             trigger_timestamp = now.isoformat()
@@ -111,19 +116,27 @@ async def run_reminder_scheduler():
                                 trigger_timestamp = current_year
                 
                 if should_trigger:
-                    if rem_type == "call":
-                        body = f"📞 WellRing Daily Voice Call Reminder:\nTime for your scheduled check-in call.\nNotes: {rem_notes}"
-                    elif rem_type == "medicine":
-                        body = f"💊 WellRing Medicine Reminder:\nPlease take {rem_title}.\nNotes: {rem_notes}"
-                    elif rem_type == "checkup":
-                        body = f"🏥 WellRing Health Checkup Reminder:\nYou have '{rem_title}' scheduled.\nNotes: {rem_notes}"
-                    else:
-                        body = f"⏰ WellRing Reminder: {rem_title}.\nNotes: {rem_notes}"
-                    
                     logger.info(f"Triggering reminder {rem_id} ({rem_title}) for {rem_phone}")
-                    success = send_whatsapp_reminder(rem_phone, body)
-                    if success:
+                    if rem_type == "call":
+                        body = f"📞 WellRing check-in call is ringing you now..."
+                        send_whatsapp_reminder(rem_phone, body)
+                        try:
+                            req = CallRequest(phone=rem_phone, user_name=None)
+                            await initiate_call(req, api_key="internal")
+                        except Exception as e:
+                            logger.error(f"Error initiating voice call for reminder: {e}")
                         update_reminder_trigger(rem_id, trigger_timestamp)
+                    else:
+                        if rem_type == "medicine":
+                            body = f"💊 WellRing Medicine Reminder:\nPlease take {rem_title}.\nNotes: {rem_notes}"
+                        elif rem_type == "checkup":
+                            body = f"🏥 WellRing Health Checkup Reminder:\nYou have '{rem_title}' scheduled.\nNotes: {rem_notes}"
+                        else:
+                            body = f"⏰ WellRing Reminder: {rem_title}.\nNotes: {rem_notes}"
+                        
+                        success = send_whatsapp_reminder(rem_phone, body)
+                        if success:
+                            update_reminder_trigger(rem_id, trigger_timestamp)
         except asyncio.CancelledError:
             logger.info("Reminder scheduler task cancelled.")
             break
@@ -591,7 +604,19 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
             "Start by asking: 'How have you been feeling lately?'"
         )
 
-    dynamic_prompt = BASE_SYSTEM_PROMPT + history_block
+    # 2b. Add Medical Context (if available)
+    medical_context = ""
+    conditions = ctx.get("medical_conditions")
+    notes = ctx.get("medical_notes")
+    if conditions or notes:
+        medical_context = "\n\nPATIENT MEDICAL CONTEXT:\n"
+        if conditions:
+            medical_context += f"Medical Conditions: {', '.join(conditions)}\n"
+        if notes:
+            medical_context += f"Doctor/Caregiver Notes: {notes}\n"
+        medical_context += "Keep these conditions in mind but do not alarm the patient. If symptoms relate to these conditions, you may ask gently if they think it's related."
+
+    dynamic_prompt = BASE_SYSTEM_PROMPT + medical_context + history_block
 
     logger.info(f"[CALL] Initiating call to {payload.phone} | history={ctx.get('has_history')} | user={user_name}")
 
@@ -702,4 +727,162 @@ async def manual_notify(request: Request, api_key: str = Depends(get_api_key)):
         "risk_level": risk_level,
         "symptoms": symptoms,
     }
+
+
+# ===========================================================================
+# Onboarding & Profile Routes
+# ===========================================================================
+
+class ProfileSetupRequest(BaseModel):
+    firebase_uid: str
+    elder_name: str
+    elder_phone: str
+    elder_age: Optional[int] = None
+    medical_conditions: List[str] = []
+    medical_notes: str = ""
+    family_contacts: List[Dict[str, str]] = []
+
+@app.post("/setup-profile")
+async def setup_profile(req: ProfileSetupRequest, api_key: str = Depends(get_api_key)):
+    """Upsert profile and family contacts from the frontend onboarding."""
+    try:
+        user_id = upsert_user_profile(
+            firebase_uid=req.firebase_uid,
+            name=req.elder_name,
+            phone=req.elder_phone,
+            age=req.elder_age,
+            conditions=req.medical_conditions,
+            notes=req.medical_notes
+        )
+        if not user_id:
+            raise HTTPException(status_code=500, detail="Database error or PostgreSQL not active.")
+            
+        if req.family_contacts:
+            upsert_family_contacts(user_id, req.family_contacts)
+            
+        return {"status": "success", "user_id": user_id}
+    except Exception as e:
+        logger.error(f"Error in setup_profile: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/setup-profile")
+async def get_profile(firebase_uid: str, api_key: str = Depends(get_api_key)):
+    profile = get_user_profile(firebase_uid)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return profile
+
+class FamilyContactRequest(BaseModel):
+    firebase_uid: str
+    name: str
+    phone: str
+    relationship: str
+
+@app.post("/family-contacts")
+async def add_family_contact(req: FamilyContactRequest, api_key: str = Depends(get_api_key)):
+    """Add a single family contact."""
+    try:
+        profile = get_user_profile(req.firebase_uid)
+        if not profile:
+            raise HTTPException(status_code=404, detail="Elder profile not found")
+            
+        add_single_family_contact(str(profile["user_id"]), req.name, req.phone, req.relationship)
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Error adding family contact: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/family-contacts")
+async def get_family_contacts_route(firebase_uid: str, api_key: str = Depends(get_api_key)):
+    try:
+        profile = get_user_profile(firebase_uid)
+        if not profile:
+            raise HTTPException(status_code=404, detail="Elder profile not found")
+            
+        contacts = get_family_contacts(str(profile["user_id"]))
+        
+        # Format the response for frontend
+        formatted_contacts = []
+        for c in contacts:
+            formatted_contacts.append({
+                "id": str(c["user_id"]),
+                "name": c["name"],
+                "phone": c["phone"],
+                "relationship": c.get("relationship", "Other")
+            })
+        return formatted_contacts
+    except Exception as e:
+        logger.error(f"Error fetching family contacts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/family-contacts/{contact_id}")
+async def delete_family_contact_route(contact_id: str, api_key: str = Depends(get_api_key)):
+    try:
+        success = delete_family_contact(contact_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Contact not found")
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Error deleting family contact: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+import google.generativeai as genai
+
+@app.post("/upload-document")
+async def upload_document(
+    file: UploadFile = File(...), 
+    firebase_uid: str = Form(None),
+    api_key: str = Depends(get_api_key)
+):
+    """MVP file upload: save to local uploads directory and parse with Gemini."""
+    try:
+        upload_dir = os.path.join(os.path.dirname(__file__), "..", "uploads")
+        os.makedirs(upload_dir, exist_ok=True)
+        
+        # Create a unique filename
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        safe_filename = file.filename.replace(" ", "_")
+        unique_filename = f"{timestamp}_{safe_filename}"
+        file_path = os.path.join(upload_dir, unique_filename)
+        
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+            
+        extracted_notes = ""
+        gemini_key = os.environ.get("GEMINI_API_KEY")
+        if gemini_key and firebase_uid:
+            try:
+                genai.configure(api_key=gemini_key)
+                uploaded_file = genai.upload_file(path=file_path)
+                model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+                prompt = "Please extract the patient's medical history, current conditions, allergies, and any important medical notes from this document. Summarize it concisely."
+                response = model.generate_content([uploaded_file, prompt])
+                extracted_notes = response.text
+                
+                # Update the database
+                if extracted_notes:
+                    profile = get_user_profile(firebase_uid)
+                    if profile:
+                        existing_notes = profile.get("medical_notes") or ""
+                        new_notes = existing_notes + f"\n\n[Extracted from {file.filename}]:\n{extracted_notes}"
+                        upsert_user_profile(
+                            firebase_uid=firebase_uid,
+                            name=profile["name"],
+                            phone=profile["phone"],
+                            age=profile["age"],
+                            conditions=profile.get("medical_conditions") or [],
+                            notes=new_notes.strip()
+                        )
+            except Exception as gemini_err:
+                logger.error(f"Gemini parsing failed: {gemini_err}")
+                
+        return {
+            "status": "success", 
+            "filename": unique_filename, 
+            "path": file_path,
+            "parsed": bool(extracted_notes)
+        }
+    except Exception as e:
+        logger.error(f"Error uploading document: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
