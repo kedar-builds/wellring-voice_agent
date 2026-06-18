@@ -23,7 +23,7 @@ import logging
 import os
 import datetime
 from typing import Dict, Any, Optional
-from src.database import log_alert
+from src.database import log_alert, get_family_contacts
 from src.users import get_caregiver_phone, get_user
 
 logger = logging.getLogger(__name__)
@@ -265,44 +265,66 @@ def trigger_alerts_if_needed(
 
     # Resolve patient & caregiver info
     patient_name   = "the patient"
-    caregiver_name = None
-    caregiver_phone = get_caregiver_phone(user_id, CAREGIVER_PHONE)
-
+    family_contacts = []
+    
     if user_id:
         user = get_user(user_id)
         if user:
-            patient_name   = user.get("name", patient_name)
+            patient_name = user.get("name", patient_name)
+        
+        # Fetch all family contacts
+        contacts = get_family_contacts(user_id)
+        for contact in contacts:
+            if contact.get("phone"):
+                family_contacts.append({
+                    "name": contact.get("name"),
+                    "phone": contact.get("phone")
+                })
+                
+    # Fallback to caregiver phone if no family contacts found
+    if not family_contacts:
+        caregiver_phone = get_caregiver_phone(user_id, CAREGIVER_PHONE)
+        caregiver_name = None
+        if user_id and user:
             caregiver_name = user.get("caregiver_name") or None
-            # Prefer per-user caregiver_phone if present
             if user.get("caregiver_phone"):
                 caregiver_phone = user["caregiver_phone"]
+        
+        if caregiver_phone:
+            family_contacts.append({"name": caregiver_name, "phone": caregiver_phone})
 
-    if not caregiver_phone:
-        logger.warning("[NOTIFY] No caregiver phone found — skipping alert.")
+    if not family_contacts:
+        logger.warning("[NOTIFY] No caregiver/family phone found — skipping alert.")
         return
 
     if risk_level in ("HIGH", "CRITICAL"):
-        logger.info(f"[NOTIFY] {risk_level} alert → {caregiver_phone}")
-        send_whatsapp_alert(
-            interaction_id=interaction_id,
-            response_data=response_data,
-            to_phone=caregiver_phone,
-            patient_name=patient_name,
-            caregiver_name=caregiver_name,
-        )
+        for contact in family_contacts:
+            phone = contact["phone"]
+            name = contact["name"]
+            logger.info(f"[NOTIFY] {risk_level} alert → {phone}")
+            send_whatsapp_alert(
+                interaction_id=interaction_id,
+                response_data=response_data,
+                to_phone=phone,
+                patient_name=patient_name,
+                caregiver_name=name,
+            )
 
     elif os.environ.get("USE_ROUTINE_UPDATES", "false").lower() == "true":
         # Quiet daily update for low-risk check-ins
-        body = build_routine_update_message(
-            patient_name=patient_name,
-            caregiver_name=caregiver_name,
-            symptoms=response_data.get("symptoms", []),
-            risk_level=risk_level,
-        )
-        if USE_TWILIO:
-            _twilio_send(caregiver_phone, body)
-        else:
-            logger.info(f"[ROUTINE MOCK → {caregiver_phone}]\n{body}")
+        for contact in family_contacts:
+            phone = contact["phone"]
+            name = contact["name"]
+            body = build_routine_update_message(
+                patient_name=patient_name,
+                caregiver_name=name,
+                symptoms=response_data.get("symptoms", []),
+                risk_level=risk_level,
+            )
+            if USE_TWILIO:
+                _twilio_send(phone, body)
+            else:
+                logger.info(f"[ROUTINE MOCK → {phone}]\n{body}")
 
 
 def send_whatsapp_reminder(to_phone: str, body: str) -> bool:

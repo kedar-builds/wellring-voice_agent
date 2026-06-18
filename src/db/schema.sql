@@ -28,6 +28,7 @@
 
 CREATE TABLE IF NOT EXISTS users (
     user_id         UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
+    firebase_uid    TEXT            UNIQUE,
     name            TEXT            NOT NULL,
     age             INTEGER         CHECK (age > 0 AND age < 150),
     role            TEXT            NOT NULL DEFAULT 'elderly'
@@ -40,9 +41,11 @@ CREATE TABLE IF NOT EXISTS users (
     -- Medical baseline
     medical_conditions  TEXT[],          -- e.g. ARRAY['diabetes', 'hypertension']
     medications         TEXT[],
+    medical_notes       TEXT,            -- Unstructured notes
 
     -- Caregiver link: if this user IS a caregiver, point to their elderly user
     caregiver_for_user_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    relationship    TEXT,            -- How the caregiver is related to the elder
 
     -- Caregiver contact (denormalised for fast alert lookup)
     caregiver_name  TEXT,
