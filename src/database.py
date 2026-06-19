@@ -160,12 +160,17 @@ def init_db(db_path: Optional[str] = None) -> None:
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id                  TEXT PRIMARY KEY,
+            user_id             TEXT PRIMARY KEY,
+            firebase_uid        TEXT UNIQUE,
             name                TEXT NOT NULL,
+            phone               TEXT,
             age                 INTEGER,
             medical_conditions  TEXT,
-            caregiver_name      TEXT,
-            caregiver_phone     TEXT
+            medical_notes       TEXT,
+            role                TEXT,
+            caregiver_for_user_id TEXT,
+            relationship        TEXT,
+            updated_at          TEXT
         )
     """)
 
@@ -1110,9 +1115,30 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
                         conditions: List[str], notes: str) -> str:
     """Upsert the elder user's profile, returns the Postgres UUID."""
     if not _use_postgres() or not _PG_AVAILABLE:
-        # Fallback for SQLite/Supabase MVP: just raise or log
-        logger.warning("Profile onboarding currently requires PostgreSQL.")
-        return ""
+        # SQLite fallback
+        import uuid, json, datetime
+        db_path = _resolve_db_path(None)
+        user_id = str(uuid.uuid4())
+        now_str = datetime.datetime.utcnow().isoformat()
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes, role, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'elderly', ?)
+            ON CONFLICT(firebase_uid) DO UPDATE SET
+                name = excluded.name,
+                phone = excluded.phone,
+                age = excluded.age,
+                medical_conditions = excluded.medical_conditions,
+                medical_notes = excluded.medical_notes,
+                updated_at = excluded.updated_at
+        """, (user_id, firebase_uid, name, phone, age, json.dumps(conditions), notes, now_str))
+        conn.commit()
+        # Fetch actual user_id in case of update
+        cur.execute("SELECT user_id FROM users WHERE firebase_uid = ?", (firebase_uid,))
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else ""
         
     with get_pg_conn() as conn:
         with _pg_cursor(conn) as cur:
@@ -1164,7 +1190,27 @@ def get_user_by_phone(phone: str, db_path: Optional[str] = None) -> Optional[Dic
 def get_user_profile(firebase_uid: str) -> Optional[Dict[str, Any]]:
     """Retrieve an elder's profile by Firebase UID."""
     if not _use_postgres() or not _PG_AVAILABLE:
-        return None
+        import json
+        db_path = _resolve_db_path(None)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes
+            FROM users
+            WHERE firebase_uid = ? AND role = 'elderly'
+        """, (firebase_uid,))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return None
+        res = dict(row)
+        if res.get("medical_conditions"):
+            try:
+                res["medical_conditions"] = json.loads(res["medical_conditions"])
+            except:
+                res["medical_conditions"] = []
+        return res
         
     with get_pg_conn() as conn:
         with _pg_cursor(conn) as cur:
@@ -1179,6 +1225,18 @@ def get_user_profile(firebase_uid: str) -> Optional[Dict[str, Any]]:
 def upsert_family_contacts(elder_user_id: str, contacts: List[Dict[str, str]]) -> None:
     """Insert or update family caregiver contacts for an elder. This deletes existing contacts first for simplicity."""
     if not _use_postgres() or not _PG_AVAILABLE:
+        import uuid
+        db_path = _resolve_db_path(None)
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM users WHERE caregiver_for_user_id = ? AND role = 'caregiver'", (elder_user_id,))
+        for c in contacts:
+            cur.execute("""
+                INSERT INTO users (user_id, name, phone, role, caregiver_for_user_id, relationship)
+                VALUES (?, ?, ?, 'caregiver', ?, ?)
+            """, (str(uuid.uuid4()), c.get("name"), c.get("phone"), elder_user_id, c.get("relationship", "Other")))
+        conn.commit()
+        conn.close()
         return
         
     with get_pg_conn() as conn:
@@ -1221,7 +1279,18 @@ def add_single_family_contact(elder_user_id: str, name: str, phone: str, relatio
 def get_family_contacts(elder_user_id: str) -> List[Dict[str, Any]]:
     """Fetch family contacts linked to an elder."""
     if not _use_postgres() or not _PG_AVAILABLE:
-        return []
+        db_path = _resolve_db_path(None)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT user_id, name, phone, relationship
+            FROM users
+            WHERE caregiver_for_user_id = ? AND role = 'caregiver'
+        """, (elder_user_id,))
+        rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
         
     with get_pg_conn() as conn:
         with _pg_cursor(conn) as cur:
