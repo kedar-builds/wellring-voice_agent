@@ -9,8 +9,15 @@ for the LLM.
 
 import time
 import sqlite3
+import os
 import httpx
 import json
+
+from dotenv import load_dotenv
+load_dotenv()
+
+API_KEY = os.environ.get("WELLRING_API_KEY", "")
+API_HEADERS = {"X-API-Key": API_KEY}
 
 # These represent the exact JSON payloads that Llama 3 would output 
 # based on the user's spoken input.
@@ -78,7 +85,7 @@ def run_simulation():
         
         print("🔄 Sending to Render FastAPI /assess...")
         try:
-            r = httpx.post("https://wellring-backend.onrender.com/assess", json=scenario["mock_llm_json"], headers={"X-API-Key": "wellring-secure-2026"})
+            r = httpx.post("https://wellring-backend.onrender.com/assess", json=scenario["mock_llm_json"], headers=API_HEADERS)
             r.raise_for_status()
             data = r.json()
             
@@ -99,7 +106,7 @@ def run_simulation():
     print("\n\n🗄️  Remote API Verification - Fetching from Render /assessments:")
     print("=" * 80)
     try:
-        r = httpx.get("https://wellring-backend.onrender.com/assessments?limit=5", headers={"X-API-Key": "wellring-secure-2026"})
+        r = httpx.get("https://wellring-backend.onrender.com/assessments?limit=5", headers=API_HEADERS)
         r.raise_for_status()
         rows = r.json()
         

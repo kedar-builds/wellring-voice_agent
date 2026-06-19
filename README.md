@@ -6,26 +6,34 @@ An AI-powered, voice-first health assistant for elderly people. WellRing listens
 
 WellRing has evolved into a production-ready cloud platform:
 
-- **Voice Orchestration (Vapi):** Handles real-time WebRTC/telephony, utilizing **Deepgram** for ultra-fast Speech-to-Text and **Cartesia** for natural, low-latency Text-to-Speech.
-- **Intelligence (Gemini 1.5 Flash):** Replaced local LLMs with Google's Gemini API for flawless symptom extraction (using Structured Outputs) and empathetic conversational generation.
-- **Scoring Engine (FastAPI):** A decoupled backend that receives `AssessRequest` function calls from Vapi to calculate clinical risk (Low, Medium, High, Critical).
-- **Caregiver Dashboard (React + Vite):** A modern frontend where caregivers can view patient status, review assessment history, and even call the agent directly via the embedded Vapi Web SDK.
-- **Alerts (Twilio):** Automatically dispatches SMS or WhatsApp messages to caregivers when a high or critical risk is detected.
+- **Voice Orchestration (Bolna):** Handles real-time WebRTC/telephony via the Bolna AI agent infrastructure.
+- **Intelligence (LLM):** Powers the conversational assistant via Bolna, extracting structured symptoms and severity through tool calls.
+- **Scoring Engine (FastAPI):** A decoupled backend that receives `assess_health_risk` function calls from Bolna to calculate clinical risk (Low, Medium, High, Critical).
+- **Caregiver Dashboard (React + Vite):** A modern frontend (separate repo) where caregivers can view patient status, review assessment history, and manage reminders.
+- **Alerts (Twilio):** Automatically dispatches WhatsApp/SMS messages to caregivers when a high or critical risk is detected.
 
 ## 📂 Project Structure
 
 ```text
 wellring-voice_agent/
-├── frontend/              ← React Caregiver Dashboard
-│   ├── src/pages/         ← Dashboard, Patients, History
-│   ├── src/components/    ← UI Components (including Vapi VoiceWidget)
-│   └── package.json       
 ├── src/                   ← FastAPI Backend & Scoring Engine
-│   ├── main.py            ← Entrypoint (`POST /assess`)
-│   ├── notifications.py   ← Twilio / WhatsApp dispatch
-│   └── scoring_engine/    ← Risk calculation logic
-├── vapi_assistant.json    ← Vapi cloud blueprint
-├── voice_health.py        ← Local hardware testing script (Gemini)
+│   ├── main.py            ← Entrypoint (all routes, scheduler)
+│   ├── database.py        ← Multi-backend data access (PG, Supabase, SQLite)
+│   ├── notifications.py   ← Twilio WhatsApp/SMS dispatch
+│   ├── users.py           ← User profile lookups
+│   ├── scoring_engine/    ← Risk calculation logic
+│   │   ├── rules.py       ← Symptom weights & categories
+│   │   ├── scoring.py     ← Score calculation
+│   │   ├── alerts.py      ← Escalation actions
+│   │   └── baseline.py    ← Risk level thresholds
+│   └── db/                ← PostgreSQL schema & migration
+│       ├── schema.sql     ← Full DB schema (6 tables)
+│       └── migrate.py     ← Schema migration runner
+├── tests/                 ← Pytest test suite
+├── docs/                  ← Architecture & API docs
+├── vapi_assistant.json    ← Vapi cloud assistant blueprint
+├── voice_health.py        ← Local hardware testing script (Gemini + Whisper + Piper)
+├── simulate_demo.py       ← Demo scenario runner
 ├── .github/workflows/     ← CI/CD pipeline
 └── render.yaml            ← Backend deployment config
 ```
@@ -47,40 +55,31 @@ wellring-voice_agent/
    ```bash
    cp .env.example .env
    ```
-   *Fill in your Gemini API key and Twilio credentials.*
-4. Start the server:
+   *Fill in your API keys (Gemini, Twilio, Vapi) and set a strong `WELLRING_API_KEY`.*
+4. (Optional) Set up PostgreSQL and run the migration:
+   ```bash
+   # Set DATABASE_URL in .env first
+   python -m src.db.migrate
+   ```
+5. Start the server:
    ```bash
    uvicorn src.main:app --reload --port 8000
    ```
 
-### 2. Frontend Dashboard (React)
-
-1. Navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Copy the environment template:
-   ```bash
-   cp .env.example .env
-   ```
-   *Fill in your Vapi Client Key and Assistant ID.*
-4. Start the development server:
-   ```bash
-   npm run dev
-   ```
-
-### 3. Vapi Cloud Setup
+### 2. Bolna Cloud Setup
 
 To enable the actual voice calling functionality:
-1. Go to the [Vapi Dashboard](https://dashboard.vapi.ai/).
-2. Click **Create Assistant** and select **Import JSON**.
-3. Upload the `vapi_assistant.json` file from the root of this repository.
-4. Add your **Gemini** and **Cartesia** API keys to the Vapi Provider Settings.
-5. (Optional) Link a Twilio phone number to accept incoming phone calls.
+1. Go to the [Bolna AI Dashboard](https://bolna.ai).
+2. Create an Agent and configure your Prompts and Voice.
+3. Configure the `assess_health_risk` tool call to point to this backend.
+4. Update the headers in the tool server config to include `X-API-Key` matching your `WELLRING_API_KEY`.
+5. Link a Twilio phone number in Bolna if you wish to use a custom caller ID.
+
+### 3. Running Tests
+
+```bash
+python -m pytest -v
+```
 
 ## 🚨 Emergency Detection
 
@@ -91,4 +90,12 @@ The system automatically detects critical keywords during the conversation:
 - Unconscious
 - Stroke symptoms
 
-On detection, the Gemini model is instructed to immediately instruct the patient to call emergency services (112/911), while the backend simultaneously dispatches a critical SMS/WhatsApp alert to the assigned caregiver.
+On detection, the assistant is instructed to immediately tell the patient to call emergency services (112/911), while the backend simultaneously dispatches a critical WhatsApp/SMS alert to the assigned caregiver.
+
+## 🔐 Security
+
+- All API endpoints require authentication via the `X-API-Key` header.
+- Set `WELLRING_API_KEY` in your `.env` — the server will refuse to start without it.
+- CORS is restricted to known frontend domains.
+- File uploads are validated for allowed types (PDF, images only).
+- **Never commit `.env` to git.** Use `.env.example` as a template.

@@ -38,7 +38,13 @@ API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 def get_api_key(api_key_header: str = Security(api_key_header)):
-    expected_key = os.environ.get("WELLRING_API_KEY", "wellring-secure-2026")
+    expected_key = os.environ.get("WELLRING_API_KEY", "")
+    if not expected_key:
+        logger.warning("WELLRING_API_KEY not set — rejecting all requests.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server API key not configured"
+        )
     if api_key_header == expected_key:
         return api_key_header
     raise HTTPException(
@@ -52,9 +58,9 @@ from src.database import (
     add_reminder, get_reminders, delete_reminder, update_reminder_trigger,
     get_assessments_list, get_assessment_stats, get_user_health_context,
     upsert_user_profile, get_user_profile, upsert_family_contacts, get_family_contacts, delete_family_contact,
-    add_single_family_contact
+    add_single_family_contact, get_user_by_phone
 )
-from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp
+from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp, send_unanswered_call_alert
 
 # ---------------------------------------------------------------------------
 # Background Reminder Scheduler
@@ -104,6 +110,11 @@ async def run_reminder_scheduler():
                             if last_trig != current_date_str:
                                 should_trigger = True
                                 trigger_timestamp = current_date_str
+                        elif rem_freq == "weekly":
+                            current_week = now.strftime("%Y-W%W")
+                            if last_trig != current_week:
+                                should_trigger = True
+                                trigger_timestamp = current_week
                         elif rem_freq == "monthly":
                             current_month = now.strftime("%Y-%m")
                             if last_trig != current_month:
@@ -218,9 +229,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+ALLOWED_ORIGINS = [
+    "https://wellring-frontend.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -443,7 +463,7 @@ async def assess(request: Request, api_key: str = Depends(get_api_key)):
         "message": alert_result["message"],
         "steps": alert_result["steps"],
         "breakdown": score_result["breakdown"],
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z",
         "recording_url": recording_url,
     }
     
@@ -539,7 +559,12 @@ def get_assessment_stats_endpoint(api_key: str = Depends(get_api_key)):
 
 @app.get("/patients", tags=["Dashboard"])
 def get_patients(api_key: str = Depends(get_api_key)):
-    """Hardcoded for demo — replace with real DB later."""
+    """Returns all registered elderly patients from the database."""
+    from src.database import get_all_patients
+    patients = get_all_patients()
+    if patients:
+        return patients
+    # Fallback for when no DB patients exist (e.g. fresh SQLite)
     return [
         {
             "id": 1,
@@ -872,7 +897,7 @@ async def delete_family_contact_route(contact_id: str, api_key: str = Depends(ge
         logger.error(f"Error deleting family contact: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-import google.generativeai as genai
+from google import genai
 
 @app.post("/upload-document")
 async def upload_document(
@@ -881,6 +906,19 @@ async def upload_document(
     api_key: str = Depends(get_api_key)
 ):
     """MVP file upload: save to local uploads directory and parse with Gemini."""
+    # Validate file type
+    ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"}
+    ALLOWED_CONTENT_TYPES = {
+        "application/pdf", "image/png", "image/jpeg", "image/webp",
+        "image/tiff", "image/bmp",
+    }
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS and file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+
     try:
         upload_dir = os.path.join(os.path.dirname(__file__), "..", "uploads")
         os.makedirs(upload_dir, exist_ok=True)
@@ -898,11 +936,13 @@ async def upload_document(
         gemini_key = os.environ.get("GEMINI_API_KEY")
         if gemini_key and firebase_uid:
             try:
-                genai.configure(api_key=gemini_key)
-                uploaded_file = genai.upload_file(path=file_path)
-                model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+                client = genai.Client(api_key=gemini_key)
+                uploaded_file = client.files.upload(file=file_path)
                 prompt = "Please extract the patient's medical history, current conditions, allergies, and any important medical notes from this document. Summarize it concisely."
-                response = model.generate_content([uploaded_file, prompt])
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=[uploaded_file, prompt]
+                )
                 extracted_notes = response.text
                 
                 # Update the database
@@ -928,7 +968,76 @@ async def upload_document(
             "path": file_path,
             "parsed": bool(extracted_notes)
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error uploading document: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------------------------
+# Bolna Webhooks
+# ---------------------------------------------------------------------------
+
+@app.post("/bolna-webhook", tags=["Webhooks"])
+async def bolna_webhook(request: Request):
+    """
+    Handle webhook callbacks from Bolna.
+    If the call failed or was unanswered, notify family members.
+    """
+    try:
+        payload = await request.json()
+        logger.info(f"[WEBHOOK] Received Bolna webhook: {payload}")
+        
+        # Bolna sends the status or call_status, and sometimes an error_message
+        status = payload.get("status") or payload.get("call_status") or "unknown"
+        phone = payload.get("recipient_phone_number") or payload.get("phone_number") or payload.get("to")
+        
+        if not phone:
+            # Check if it's nested in something like execution_data or request
+            req_data = payload.get("request", {})
+            phone = req_data.get("recipient_phone_number") or req_data.get("phone_number")
+        
+        if not phone:
+            logger.warning("[WEBHOOK] Bolna payload did not contain a recognizable phone number.")
+            return {"status": "ok", "note": "missing phone"}
+
+        # If it's a failed or unanswered call, send a WhatsApp alert
+        if status in ("no-answer", "failed", "busy", "canceled", "error"):
+            logger.info(f"[WEBHOOK] Call to {phone} ended with status: {status}. Sending alert...")
+            
+            # Lookup the patient by phone to get family contacts
+            user_profile = get_user_by_phone(phone)
+            patient_name = user_profile.get("name", "your loved one") if user_profile else "your loved one"
+            
+            contacts = []
+            if user_profile and "user_id" in user_profile:
+                contacts = get_family_contacts(str(user_profile["user_id"]))
+            
+            if contacts:
+                # Send to all family contacts
+                for contact in contacts:
+                    contact_phone = contact.get("phone")
+                    contact_name = contact.get("name")
+                    if contact_phone:
+                        send_unanswered_call_alert(
+                            to_phone=contact_phone,
+                            patient_name=patient_name,
+                            caregiver_name=contact_name
+                        )
+            else:
+                # Fallback to default caregiver if no family contacts found
+                fallback_phone = os.environ.get("CAREGIVER_PHONE")
+                if fallback_phone:
+                    send_unanswered_call_alert(
+                        to_phone=fallback_phone,
+                        patient_name=patient_name,
+                        caregiver_name="Caregiver"
+                    )
+                else:
+                    logger.warning(f"[WEBHOOK] Could not find contacts for {phone} and no fallback phone set.")
+                    
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Error handling Bolna webhook: {e}")
+        return {"status": "error", "message": str(e)}
 
