@@ -8,3 +8,6 @@ frontend/
 audios/
 *.db
 .pytest_cache/
+*.onnx
+*.onnx.json
+memanto/
