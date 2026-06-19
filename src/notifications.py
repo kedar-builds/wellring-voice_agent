@@ -233,13 +233,42 @@ def send_whatsapp_alert(
 
     log_alert(
         interaction_id=interaction_id,
-        timestamp=datetime.datetime.utcnow().isoformat() + "Z",
+        timestamp=datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z",
         risk_level=risk_level,
         notification_type="whatsapp" if USE_WHATSAPP else "sms",
         status="sent" if sent else "failed",
         recipient_phone=to_phone,
         recipient_name=caregiver_name,
     )
+    return sent
+
+
+def send_unanswered_call_alert(
+    to_phone: str,
+    patient_name: str = "the patient",
+    caregiver_name: Optional[str] = None,
+) -> bool:
+    """
+    Send a WhatsApp alert to the caregiver when the patient misses an automated call.
+    """
+    greeting = f"Hi {caregiver_name}," if caregiver_name else "Hello,"
+    ts = datetime.datetime.now().strftime("%I:%M %p, %d %b %Y")
+    
+    body = (
+        f"⚠️ *WellRing Missed Call Alert*\n\n"
+        f"{greeting}\n\n"
+        f"Riley tried to call *{patient_name}* for their scheduled check-in at {ts}, but they did not answer the phone.\n\n"
+        f"Please try checking on them when you get a chance.\n\n"
+        f"— WellRing Team"
+    )
+
+    sent = False
+    if USE_TWILIO:
+        sent = _twilio_send(to_phone, body)
+    else:
+        logger.info(f"[WHATSAPP MOCK → {to_phone}]\n{body}")
+        sent = True
+
     return sent
 
 

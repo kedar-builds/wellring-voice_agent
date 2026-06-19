@@ -10,3 +10,6 @@ __pycache__/
 wellring.db
 audios/wellring.db
 ollama.log
+*.log
+backend.log
+uploads/

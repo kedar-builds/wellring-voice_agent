@@ -300,7 +300,7 @@ def _log_interaction_supabase(data: Dict[str, Any]) -> Optional[int]:
         return None
     try:
         res = supabase.table("interactions").insert({
-            "timestamp":     data.get("timestamp", datetime.datetime.utcnow().isoformat() + "Z"),
+            "timestamp":     data.get("timestamp", datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z"),
             "intent":        data.get("intent", ""),
             "symptoms":      data.get("symptoms", []),
             "severity":      data.get("severity", ""),
@@ -330,7 +330,7 @@ def _log_interaction_sqlite(data: Dict[str, Any], db_path: Optional[str]) -> int
             score, risk_level, category, action, message, user_id, recording_url
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        data.get("timestamp", datetime.datetime.utcnow().isoformat() + "Z"),
+        data.get("timestamp", datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z"),
         data.get("intent", ""),
         json.dumps(data.get("symptoms", [])),
         data.get("severity", ""),
@@ -370,7 +370,7 @@ def get_symptom_repeat_count(symptom: str, days: int = 3, db_path: Optional[str]
 
 
 def _symptom_count_pg(symptom: str, days: int, user_id: Optional[str]) -> int:
-    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days)
     sql = """
         SELECT COUNT(*) AS cnt
         FROM   assessments
@@ -393,7 +393,7 @@ def _symptom_count_supabase(symptom: str, days: int) -> int:
     if not supabase:
         return -1
     try:
-        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat() + "Z"
+        cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days)).isoformat() + "Z"
         res = (
             supabase.table("interactions")
             .select("id", count="exact")
@@ -546,7 +546,7 @@ def upsert_health_history(
     if not (_use_postgres() and _PG_AVAILABLE):
         return  # No-op for SQLite/Supabase
 
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.UTC)
     window_start = now - datetime.timedelta(days=window_days)
 
     sql = """
@@ -825,7 +825,7 @@ def _get_assessment_stats_supabase() -> Optional[Dict[str, Any]]:
     if not supabase:
         return None
     try:
-        today_start = datetime.datetime.utcnow().date().isoformat() + "T00:00:00Z"
+        today_start = datetime.datetime.now(datetime.UTC).date().isoformat() + "T00:00:00Z"
         res = supabase.table("interactions").select("risk_level").gte("timestamp", today_start).execute()
         
         counts = {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
@@ -907,7 +907,7 @@ def _get_assessment_stats_sqlite(db_path: Optional[str] = None) -> Dict[str, Any
             SUM(CASE WHEN risk_level = 'HIGH' THEN 1 ELSE 0 END) as high,
             SUM(CASE WHEN risk_level = 'CRITICAL' THEN 1 ELSE 0 END) as critical
         FROM interactions 
-        WHERE date(timestamp) = date('now', 'localtime')
+        WHERE date(timestamp) = date('now')
     """)
     row = cursor.fetchone()
     conn.close()
@@ -995,7 +995,7 @@ def _get_user_health_context_pg(phone: str, days: int) -> Dict[str, Any]:
     # Normalise: strip spaces / dashes so +91 90042 61186 == +919004261186
     phone_clean = phone.replace(" ", "").replace("-", "")
 
-    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days)
 
     # 1. Look up user by phone (try both raw and cleaned)
     user_sql = """
@@ -1071,7 +1071,7 @@ def _get_user_health_context_pg(phone: str, days: int) -> Dict[str, Any]:
                 summary: List[str] = []
 
                 # Group by day for "yesterday", "2 days ago" etc.
-                now_date = datetime.datetime.utcnow().date()
+                now_date = datetime.datetime.now(datetime.UTC).date()
                 day_buckets: Dict[int, List[str]] = {}
                 for row in rows:
                     if not row["assessed_at"]:
@@ -1137,6 +1137,29 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
             })
             row = cur.fetchone()
             return str(row["user_id"]) if row else ""
+
+def get_user_by_phone(phone: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Look up a user profile by their phone number."""
+    if _use_postgres() and _PG_AVAILABLE:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                cur.execute("SELECT * FROM users WHERE phone = %s", (phone,))
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+        return None
+    
+    # SQLite fallback
+    db_path = _resolve_db_path(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE phone = ?", (phone,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return None
 
 def get_user_profile(firebase_uid: str) -> Optional[Dict[str, Any]]:
     """Retrieve an elder's profile by Firebase UID."""
@@ -1222,3 +1245,66 @@ def delete_family_contact(contact_id: str) -> bool:
                 RETURNING user_id
             """, (contact_id,))
             return bool(cur.fetchone())
+
+
+# ===========================================================================
+# get_all_patients  (for /patients endpoint)
+# ===========================================================================
+
+def get_all_patients(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Retrieve all elderly patient profiles."""
+    if _use_postgres() and _PG_AVAILABLE:
+        return _get_all_patients_pg()
+    return _get_all_patients_sqlite(db_path)
+
+
+def _get_all_patients_pg() -> List[Dict[str, Any]]:
+    with get_pg_conn() as conn:
+        with _pg_cursor(conn) as cur:
+            cur.execute("""
+                SELECT user_id, name, age, phone, medical_conditions,
+                       medical_notes, caregiver_name, caregiver_phone
+                FROM users
+                WHERE role = 'elderly'
+                ORDER BY name
+            """)
+            rows = cur.fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        result.append({
+            "id": str(d["user_id"]),
+            "name": d.get("name", ""),
+            "age": d.get("age"),
+            "conditions": d.get("medical_conditions") or [],
+            "emergency_contact": d.get("caregiver_phone") or d.get("phone") or "",
+            "status": "active",
+        })
+    return result
+
+
+def _get_all_patients_sqlite(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    db_path = _resolve_db_path(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT name FROM sqlite_master WHERE type='table' AND name='users'
+    """)
+    if not cur.fetchone():
+        conn.close()
+        return []
+    cur.execute("SELECT * FROM users")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    result = []
+    for r in rows:
+        result.append({
+            "id": r.get("id", ""),
+            "name": r.get("name", ""),
+            "age": r.get("age"),
+            "conditions": r.get("medical_conditions", "").split(",") if r.get("medical_conditions") else [],
+            "emergency_contact": r.get("caregiver_phone", ""),
+            "status": "active",
+        })
+    return result

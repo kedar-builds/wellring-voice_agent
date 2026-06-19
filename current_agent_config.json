@@ -105,7 +105,7 @@
               "url": "https://wellring-backend.onrender.com/assess",
               "method": "POST",
               "headers": {
-                "X-API-Key": "***REMOVED***",
+                "X-API-Key": "{{WELLRING_API_KEY}}",
                 "Content-Type": "application/json"
               },
               "param": {
