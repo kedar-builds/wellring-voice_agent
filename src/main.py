@@ -224,6 +224,8 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+from fastapi.responses import JSONResponse
+
 app = FastAPI(
     title="WellRing Health Risk API",
     description=(
@@ -233,6 +235,19 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    import traceback
+    logger.exception("Unhandled exception occurred")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": str(exc),
+            "traceback": traceback.format_exception(type(exc), exc, exc.__traceback__)
+        }
+    )
+
 
 ALLOWED_ORIGINS = [
     "https://wellring-frontend.vercel.app",
