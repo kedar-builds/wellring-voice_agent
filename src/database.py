@@ -159,6 +159,18 @@ def init_pg_tables() -> None:
                         status              TEXT NOT NULL
                     )
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS reminders (
+                        id              SERIAL PRIMARY KEY,
+                        type            TEXT NOT NULL,
+                        title           TEXT NOT NULL,
+                        time            TEXT NOT NULL,
+                        frequency       TEXT NOT NULL,
+                        phone           TEXT NOT NULL,
+                        notes           TEXT,
+                        last_triggered  TEXT
+                    )
+                """)
         logger.info("[PG] PostgreSQL tables initialized (CREATE IF NOT EXISTS).")
     except Exception as e:
         logger.error(f"[PG] Failed to initialize Postgres tables: {e}")
