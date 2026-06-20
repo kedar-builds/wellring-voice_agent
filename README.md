@@ -99,3 +99,4 @@ On detection, the assistant is instructed to immediately tell the patient to cal
 - CORS is restricted to known frontend domains.
 - File uploads are validated for allowed types (PDF, images only).
 - **Never commit `.env` to git.** Use `.env.example` as a template.
+# SQLite fallback active - Sat Jun 20 11:16:46 PM IST 2026
