@@ -200,8 +200,45 @@ def init_db(db_path: Optional[str] = None) -> None:
     """)
 
     conn.commit()
+    # Migrate any pre-existing DB with old schema
+    _migrate_sqlite_schema(conn)
     conn.close()
     logger.info(f"SQLite database initialized at {db_path}")
+
+
+def _migrate_sqlite_schema(conn: sqlite3.Connection) -> None:
+    """Upgrade legacy 'users' table if it was created with the old schema."""
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(users)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+
+    # Columns that must exist in the new schema but may be absent in old DBs
+    needed_cols = {
+        "firebase_uid": "TEXT",
+        "phone": "TEXT",
+        "medical_notes": "TEXT",
+        "role": "TEXT",
+        "caregiver_for_user_id": "TEXT",
+        "relationship": "TEXT",
+        "updated_at": "TEXT",
+    }
+    for col, col_type in needed_cols.items():
+        if col not in existing_cols:
+            try:
+                cur.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
+                logger.info(f"[DB-MIGRATE] Added column '{col}' to users table")
+            except Exception as e:
+                logger.warning(f"[DB-MIGRATE] Could not add column '{col}': {e}")
+
+    # Rename legacy PK 'id' -> 'user_id' (SQLite 3.25+ supports RENAME COLUMN)
+    if "id" in existing_cols and "user_id" not in existing_cols:
+        try:
+            cur.execute("ALTER TABLE users RENAME COLUMN id TO user_id")
+            logger.info("[DB-MIGRATE] Renamed column 'id' -> 'user_id'")
+        except Exception as e:
+            logger.warning(f"[DB-MIGRATE] Could not rename id->user_id: {e}")
+
+    conn.commit()
 
 
 # ===========================================================================
