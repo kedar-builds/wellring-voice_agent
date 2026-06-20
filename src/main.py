@@ -211,7 +211,10 @@ async def lifespan(app: FastAPI):
     from src.database import init_pg_tables
     init_db()
     init_pg_tables()   # Creates PG tables if they don't exist (safe on each startup)
-    seed_demo_data()
+    try:
+        seed_demo_data()
+    except Exception as e:
+        logger.error(f"[SEED] Demo data seeding failed (non-fatal): {e}")
     scheduler_task = asyncio.create_task(run_reminder_scheduler())
     yield
     if scheduler_task:
