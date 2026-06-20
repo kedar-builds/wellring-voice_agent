@@ -115,63 +115,16 @@ def init_pg_tables() -> None:
     if not (_PG_AVAILABLE and os.environ.get("DATABASE_URL", "")):
         return
     try:
-        with get_pg_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        user_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                        firebase_uid        TEXT UNIQUE,
-                        name                TEXT NOT NULL,
-                        phone               TEXT,
-                        age                 INTEGER,
-                        medical_conditions  TEXT[],
-                        medical_notes       TEXT,
-                        role                TEXT DEFAULT 'elderly',
-                        caregiver_for_user_id UUID,
-                        relationship        TEXT,
-                        updated_at          TIMESTAMPTZ DEFAULT now()
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS interactions (
-                        id              SERIAL PRIMARY KEY,
-                        timestamp       TEXT NOT NULL,
-                        intent          TEXT NOT NULL,
-                        symptoms        TEXT NOT NULL,
-                        severity        TEXT NOT NULL,
-                        confidence      REAL NOT NULL,
-                        score           INTEGER NOT NULL,
-                        risk_level      TEXT NOT NULL,
-                        category        TEXT NOT NULL,
-                        action          TEXT NOT NULL,
-                        message         TEXT NOT NULL,
-                        user_id         TEXT,
-                        recording_url   TEXT
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS alerts_log (
-                        id                  SERIAL PRIMARY KEY,
-                        interaction_id      INTEGER,
-                        timestamp           TEXT NOT NULL,
-                        risk_level          TEXT NOT NULL,
-                        notification_type   TEXT NOT NULL,
-                        status              TEXT NOT NULL
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS reminders (
-                        id              SERIAL PRIMARY KEY,
-                        type            TEXT NOT NULL,
-                        title           TEXT NOT NULL,
-                        time            TEXT NOT NULL,
-                        frequency       TEXT NOT NULL,
-                        phone           TEXT NOT NULL,
-                        notes           TEXT,
-                        last_triggered  TEXT
-                    )
-                """)
-        logger.info("[PG] PostgreSQL tables initialized (CREATE IF NOT EXISTS).")
+        import pathlib
+        schema_path = pathlib.Path(__file__).parent / "db" / "schema.sql"
+        if schema_path.exists():
+            sql = schema_path.read_text()
+            with get_pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+            logger.info("[PG] PostgreSQL tables initialized using schema.sql.")
+        else:
+            logger.error(f"[PG] schema.sql not found at {schema_path}")
     except Exception as e:
         logger.error(f"[PG] Failed to initialize Postgres tables: {e}")
 
