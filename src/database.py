@@ -125,8 +125,57 @@ def init_pg_tables() -> None:
             logger.info("[PG] PostgreSQL tables initialized using schema.sql.")
         else:
             logger.error(f"[PG] schema.sql not found at {schema_path}")
+
+        # Self-healing migrations for column updates
+        columns_to_ensure = {
+            "users": [
+                ("firebase_uid", "TEXT UNIQUE"),
+                ("name", "TEXT NOT NULL DEFAULT 'Elderly'"),
+                ("age", "INTEGER"),
+                ("role", "TEXT NOT NULL DEFAULT 'elderly'"),
+                ("phone", "TEXT"),
+                ("email", "TEXT"),
+                ("medical_conditions", "TEXT[]"),
+                ("medications", "TEXT[]"),
+                ("medical_notes", "TEXT"),
+                ("caregiver_for_user_id", "UUID REFERENCES users(user_id) ON DELETE SET NULL"),
+                ("relationship", "TEXT"),
+                ("caregiver_name", "TEXT"),
+                ("caregiver_phone", "TEXT"),
+                ("caregiver_email", "TEXT"),
+                ("created_at", "TIMESTAMPTZ NOT NULL DEFAULT now()"),
+                ("updated_at", "TIMESTAMPTZ NOT NULL DEFAULT now()")
+            ],
+            "assessments": [
+                ("intent", "TEXT NOT NULL DEFAULT 'health_issue'"),
+                ("symptoms", "TEXT[] NOT NULL DEFAULT '{}'"),
+                ("severity", "TEXT NOT NULL DEFAULT 'low'"),
+                ("confidence", "NUMERIC(4,3) NOT NULL DEFAULT 1.000"),
+                ("score", "INTEGER NOT NULL DEFAULT 0"),
+                ("base_score", "INTEGER NOT NULL DEFAULT 0"),
+                ("risk_level", "TEXT NOT NULL DEFAULT 'LOW'"),
+                ("category", "TEXT NOT NULL DEFAULT 'GENERAL'"),
+                ("action", "TEXT NOT NULL DEFAULT 'monitor'"),
+                ("message", "TEXT NOT NULL DEFAULT ''"),
+                ("steps", "TEXT[] NOT NULL DEFAULT '{}'"),
+                ("breakdown", "TEXT[] NOT NULL DEFAULT '{}'"),
+                ("vapi_call_id", "TEXT"),
+                ("recording_url", "TEXT"),
+                ("assessed_at", "TIMESTAMPTZ NOT NULL DEFAULT now()")
+            ]
+        }
+        
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                for table, cols in columns_to_ensure.items():
+                    for col_name, col_type in cols:
+                        try:
+                            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
+                        except Exception as col_err:
+                            logger.warning(f"[PG] Could not add column {col_name} to table {table}: {col_err}")
+        logger.info("[PG] PostgreSQL columns verified and upgraded successfully.")
     except Exception as e:
-        logger.error(f"[PG] Failed to initialize Postgres tables: {e}")
+        logger.error(f"[PG] Failed to initialize/migrate Postgres tables: {e}")
 
 
 
