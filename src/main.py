@@ -208,7 +208,9 @@ scheduler_task = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scheduler_task
+    from src.database import init_pg_tables
     init_db()
+    init_pg_tables()   # Creates PG tables if they don't exist (safe on each startup)
     seed_demo_data()
     scheduler_task = asyncio.create_task(run_reminder_scheduler())
     yield
