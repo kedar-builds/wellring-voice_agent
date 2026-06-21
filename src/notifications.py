@@ -295,6 +295,7 @@ def trigger_alerts_if_needed(
     # Resolve patient & caregiver info
     patient_name   = "the patient"
     family_contacts = []
+    user = None  # define before conditional so fallback block can reference it
     
     if user_id:
         user = get_user(user_id)
@@ -314,10 +315,14 @@ def trigger_alerts_if_needed(
     if not family_contacts:
         caregiver_phone = get_caregiver_phone(user_id, CAREGIVER_PHONE)
         caregiver_name = None
-        if user_id and user:
+        if user:  # safe — always defined above
             caregiver_name = user.get("caregiver_name") or None
             if user.get("caregiver_phone"):
                 caregiver_phone = user["caregiver_phone"]
+        
+        # Last resort — always use the env var CAREGIVER_PHONE
+        if not caregiver_phone:
+            caregiver_phone = CAREGIVER_PHONE
         
         if caregiver_phone:
             family_contacts.append({"name": caregiver_name, "phone": caregiver_phone})
