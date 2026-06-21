@@ -344,7 +344,7 @@ def _log_interaction_pg(data: Dict[str, Any]) -> str:
     user_id = data.get("user_id")  # may be None if anonymous
 
     # If no user_id supplied, use (or create) the anonymous sentinel user
-    if not user_id:
+    if user_id in (None, "", "anonymous"):
         user_id = _ensure_anonymous_user_pg()
 
     sql = """
