@@ -363,6 +363,93 @@ def health():
     return HealthResponse(status="ok", version="1.0.0")
 
 
+def process_assessment_data(
+    intent: str,
+    symptoms: list[str],
+    severity: str,
+    confidence: float,
+    user_id: str | None,
+    recording_url: str | None,
+) -> dict:
+    """Core logic to normalize symptoms, calculate score, log interaction, and trigger alerts."""
+    # Normalize severity
+    severity_lower = severity.lower().strip()
+    if severity_lower not in {"low", "medium", "high", "critical"}:
+        severity_lower = "medium"
+
+    # Normalize symptoms
+    normalized_symptoms = []
+    for s in symptoms:
+        s_norm = s.lower().strip().replace(" ", "_").replace("-", "_")
+        # Direct aliases
+        if s_norm == "dizzy":
+            s_norm = "dizziness"
+        elif s_norm == "fall":
+            s_norm = "fall_detected"
+        elif s_norm == "stroke":
+            s_norm = "stroke_symptoms"
+        elif s_norm in ("short_of_breath", "difficulty_breathing", "breathing_difficulty"):
+            s_norm = "breathing_problem"
+        
+        # Add if it matches a valid symptom key in SYMPTOM_WEIGHTS
+        if s_norm in SYMPTOM_WEIGHTS:
+            normalized_symptoms.append(s_norm)
+        else:
+            # Check for partial matches
+            matched = False
+            for valid_key in SYMPTOM_WEIGHTS.keys():
+                if valid_key in s_norm or s_norm in valid_key:
+                    normalized_symptoms.append(valid_key)
+                    matched = True
+                    break
+            if not matched:
+                normalized_symptoms.append(s)
+
+    try:
+        # Build history counts for each symptom from the last 3 days
+        history_counts = {
+            s: get_symptom_repeat_count(s, days=3)
+            for s in normalized_symptoms
+        }
+
+        score_result = calculate_score(
+            symptoms=normalized_symptoms,
+            severity=severity_lower,
+            confidence=confidence,
+            history_counts=history_counts,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    alert_result = determine_action(score_result["score"], confidence)
+
+    response_data = {
+        "score": score_result["score"],
+        "base_score": score_result["base_score"],
+        "confidence": score_result["confidence"],
+        "risk_level": score_result["risk_level"],
+        "category": score_result["category"],
+        "symptoms": score_result["symptoms"],
+        "severity": score_result.get("severity", severity_lower),
+        "action": alert_result["action"],
+        "message": alert_result["message"],
+        "steps": alert_result["steps"],
+        "breakdown": score_result["breakdown"],
+        "timestamp": datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z",
+        "recording_url": recording_url,
+    }
+    
+    # Log interaction to database
+    log_data = response_data.copy()
+    log_data["intent"] = intent
+    log_data["user_id"] = user_id
+    interaction_id = log_interaction(log_data)
+    
+    # Trigger alerts if necessary
+    trigger_alerts_if_needed(interaction_id, response_data, user_id)
+    
+    return response_data
+
 @app.post("/assess", tags=["Risk Assessment"])
 async def assess(request: Request, api_key: str = Depends(get_api_key)):
     """
@@ -420,81 +507,14 @@ async def assess(request: Request, api_key: str = Depends(get_api_key)):
         except Exception as err:
             raise HTTPException(status_code=422, detail=str(err))
 
-    # Normalize symptoms (Vapi LLM may output symptoms with spaces or minor spelling variations)
-    normalized_symptoms = []
-    for s in symptoms:
-        s_norm = s.lower().strip().replace(" ", "_").replace("-", "_")
-        # Direct aliases
-        if s_norm == "dizzy":
-            s_norm = "dizziness"
-        elif s_norm == "fall":
-            s_norm = "fall_detected"
-        elif s_norm == "stroke":
-            s_norm = "stroke_symptoms"
-        elif s_norm in ("short_of_breath", "difficulty_breathing", "breathing_difficulty"):
-            s_norm = "breathing_problem"
-        
-        # Add if it matches a valid symptom key in SYMPTOM_WEIGHTS
-        if s_norm in SYMPTOM_WEIGHTS:
-            normalized_symptoms.append(s_norm)
-        else:
-            # Check for partial matches
-            matched = False
-            for valid_key in SYMPTOM_WEIGHTS.keys():
-                if valid_key in s_norm or s_norm in valid_key:
-                    normalized_symptoms.append(valid_key)
-                    matched = True
-                    break
-            if not matched:
-                normalized_symptoms.append(s)
-
-    # Normalize severity
-    severity_lower = severity.lower().strip()
-    if severity_lower not in {"low", "medium", "high", "critical"}:
-        severity_lower = "medium"
-
-    try:
-        # Build history counts for each symptom from the last 3 days
-        history_counts = {
-            s: get_symptom_repeat_count(s, days=3)
-            for s in normalized_symptoms
-        }
-
-        score_result = calculate_score(
-            symptoms=normalized_symptoms,
-            severity=severity_lower,
-            confidence=confidence,
-            history_counts=history_counts,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-    alert_result = determine_action(score_result["score"], confidence)
-
-    response_data = {
-        "score": score_result["score"],
-        "base_score": score_result["base_score"],
-        "confidence": score_result["confidence"],
-        "risk_level": score_result["risk_level"],
-        "category": score_result["category"],
-        "symptoms": score_result["symptoms"],
-        "severity": score_result.get("severity", severity_lower),
-        "action": alert_result["action"],
-        "message": alert_result["message"],
-        "steps": alert_result["steps"],
-        "breakdown": score_result["breakdown"],
-        "timestamp": datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z",
-        "recording_url": recording_url,
-    }
-    
-    # Log interaction to database
-    log_data = response_data.copy()
-    log_data["intent"] = intent
-    log_data["user_id"] = user_id
-    interaction_id = log_interaction(log_data)
-    
-    # Trigger alerts if necessary
-    trigger_alerts_if_needed(interaction_id, response_data, user_id)
+    response_data = process_assessment_data(
+        intent=intent,
+        symptoms=symptoms,
+        severity=severity,
+        confidence=confidence,
+        user_id=user_id,
+        recording_url=recording_url
+    )
 
     # Return structure based on who called it
     if is_vapi:
@@ -1055,7 +1075,52 @@ async def bolna_webhook(request: Request):
                     )
                 else:
                     logger.warning(f"[WEBHOOK] Could not find contacts for {phone} and no fallback phone set.")
-                    
+        
+        elif status in ("completed", "success", "done"):
+            # A successful call might have extracted health data
+            def _find_extraction_data(data):
+                if isinstance(data, dict):
+                    if "extraction_data" in data:
+                        return data["extraction_data"]
+                    if "extraction_details" in data:
+                        return data["extraction_details"]
+                    if "symptoms" in data and "severity" in data:
+                        return data # Data is flat
+                    for k, v in data.items():
+                        res = _find_extraction_data(v)
+                        if res:
+                            return res
+                elif isinstance(data, list):
+                    for item in data:
+                        res = _find_extraction_data(item)
+                        if res:
+                            return res
+                return None
+            
+            extracted = _find_extraction_data(payload)
+            if extracted:
+                logger.info(f"[WEBHOOK] Found extraction data from successful call: {extracted}")
+                symptoms = extracted.get("symptoms", [])
+                if isinstance(symptoms, str):
+                    symptoms = [symptoms]
+                severity = extracted.get("severity", "medium")
+                intent = extracted.get("intent", "health_check")
+                
+                user_profile = get_user_by_phone(phone)
+                user_id = str(user_profile["user_id"]) if user_profile and "user_id" in user_profile else None
+                
+                # Let the assessment logic evaluate it and send alerts if needed
+                process_assessment_data(
+                    intent=intent,
+                    symptoms=symptoms,
+                    severity=severity,
+                    confidence=1.0,
+                    user_id=user_id,
+                    recording_url=None
+                )
+            else:
+                logger.info(f"[WEBHOOK] Call completed, but no extraction data found.")
+
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"[WEBHOOK] Error handling Bolna webhook: {e}")
