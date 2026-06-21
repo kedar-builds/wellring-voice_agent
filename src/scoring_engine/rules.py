@@ -19,14 +19,48 @@ from typing import Dict
 # Values represent how much risk that symptom contributes to the total score.
 
 SYMPTOM_WEIGHTS: Dict[str, int] = {
-    "dizziness":          20,
-    "fever":              15,
-    "medicine_missed":    10,
-    "fall_detected":      60,
-    "chest_pain":         50,
-    "breathing_problem":  40,
-    "unconscious":       100,
+    # ---- CRITICAL / EMERGENCY (score ≥61 alone → HIGH/CRITICAL, send WhatsApp) ----
+    "unconscious":        100,
     "stroke_symptoms":   100,
+    "chest_pain":         65,   # always HIGH — chest pain is always an emergency
+
+    "fall_detected":      60,
+    "breathing_problem":  61,   # always HIGH — breathing difficulty is always serious
+
+    "severe_bleeding":    70,
+    "heart_palpitation":  50,
+    "high_fever":         45,   # fever ≥ 103°F — needs family alert
+
+    # ---- MODERATE (need more symptoms or high severity to reach HIGH) ----
+    "dizziness":          25,
+    "fever":              15,   # mild/normal fever — LOW alone
+    "vomiting":           20,
+    "nausea":             10,
+    "weakness":           15,
+    "swelling":           20,
+    "dehydration":        25,
+    "confusion":          35,   # confusion alone can reach MEDIUM
+    "high_blood_pressure": 30,
+    "low_blood_pressure":  30,
+    "blood_sugar_issue":   30,
+
+    # ---- MINOR (almost never reach HIGH alone → NO WhatsApp) ----
+    "headache":           10,
+    "body_pain":          10,
+    "joint_pain":         10,
+    "mild_fever":          8,
+    "cough":               8,
+    "cold":                5,
+    "sore_throat":         5,
+    "stomach_pain":       12,
+    "acidity":             8,
+    "constipation":        5,
+    "fatigue":            10,
+    "back_pain":          10,
+    "medicine_missed":    10,
+    "sleep_problem":       5,
+    "anxiety":            12,
+    "appetite_loss":       8,
 }
 
 # ---------------------------------------------------------------------------
@@ -52,14 +86,44 @@ SEVERITY_BONUS: Dict[str, int] = {
 # Future categories can be added here without touching scoring logic.
 
 SYMPTOM_CATEGORIES: Dict[str, str] = {
-    "chest_pain":         "CARDIAC",
-    "unconscious":        "CARDIAC",
-    "breathing_problem":  "RESPIRATORY",
-    "fall_detected":      "FALL",
-    "medicine_missed":    "MEDICATION",
-    "stroke_symptoms":    "NEUROLOGICAL",
-    "dizziness":          "NEUROLOGICAL",
-    "fever":              "GENERAL",
+    # Emergency
+    "chest_pain":           "CARDIAC",
+    "unconscious":          "CARDIAC",
+    "heart_palpitation":    "CARDIAC",
+    "severe_bleeding":      "CARDIAC",
+    "stroke_symptoms":      "NEUROLOGICAL",
+    "confusion":            "NEUROLOGICAL",
+    "breathing_problem":    "RESPIRATORY",
+    "fall_detected":        "FALL",
+    # Moderate
+    "high_fever":           "GENERAL",
+    "dizziness":            "NEUROLOGICAL",
+    "vomiting":             "GENERAL",
+    "nausea":               "GENERAL",
+    "weakness":             "GENERAL",
+    "swelling":             "GENERAL",
+    "dehydration":          "GENERAL",
+    "high_blood_pressure":  "CARDIAC",
+    "low_blood_pressure":   "CARDIAC",
+    "blood_sugar_issue":    "GENERAL",
+    # Minor
+    "fever":                "GENERAL",
+    "headache":             "GENERAL",
+    "body_pain":            "GENERAL",
+    "joint_pain":           "GENERAL",
+    "mild_fever":           "GENERAL",
+    "cough":                "RESPIRATORY",
+    "cold":                 "GENERAL",
+    "sore_throat":          "GENERAL",
+    "stomach_pain":         "GENERAL",
+    "acidity":              "GENERAL",
+    "constipation":         "GENERAL",
+    "fatigue":              "GENERAL",
+    "back_pain":            "GENERAL",
+    "medicine_missed":      "MEDICATION",
+    "sleep_problem":        "GENERAL",
+    "anxiety":              "GENERAL",
+    "appetite_loss":        "GENERAL",
 }
 
 # Priority order when resolving multiple categories (highest = most urgent)

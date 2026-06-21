@@ -377,20 +377,94 @@ def process_assessment_data(
     if severity_lower not in {"low", "medium", "high", "critical"}:
         severity_lower = "medium"
 
-    # Normalize symptoms
+    # Normalize symptoms — map any variation from Bolna LLM to canonical keys
+    _ALIASES = {
+        # Breathing
+        "dizzy": "dizziness",
+        "fall": "fall_detected",
+        "fallen": "fall_detected",
+        "stroke": "stroke_symptoms",
+        "short_of_breath": "breathing_problem",
+        "difficulty_breathing": "breathing_problem",
+        "breathing_difficulty": "breathing_problem",
+        "breathlessness": "breathing_problem",
+        "cant_breathe": "breathing_problem",
+        "cannot_breathe": "breathing_problem",
+        "shortness_of_breath": "breathing_problem",
+        # Chest
+        "chest_tightness": "chest_pain",
+        "chest_pressure": "chest_pain",
+        "heart_pain": "chest_pain",
+        "heart_attack": "chest_pain",
+        # Fever
+        "high_temperature": "high_fever",
+        "very_high_fever": "high_fever",
+        "103_fever": "high_fever",
+        "104_fever": "high_fever",
+        "mild_temperature": "mild_fever",
+        "low_grade_fever": "mild_fever",
+        "temperature": "fever",
+        # Pain
+        "pain": "body_pain",
+        "body_ache": "body_pain",
+        "bodyache": "body_pain",
+        "muscle_pain": "body_pain",
+        "muscle_ache": "body_pain",
+        "joint_ache": "joint_pain",
+        "knee_pain": "joint_pain",
+        "back_ache": "back_pain",
+        "lower_back_pain": "back_pain",
+        "headache_severe": "headache",
+        "head_pain": "headache",
+        # GI
+        "vomit": "vomiting",
+        "throwing_up": "vomiting",
+        "puking": "vomiting",
+        "nauseous": "nausea",
+        "stomach_ache": "stomach_pain",
+        "stomach_cramps": "stomach_pain",
+        "indigestion": "acidity",
+        "gas": "acidity",
+        # Cardiac/BP
+        "palpitation": "heart_palpitation",
+        "palpitations": "heart_palpitation",
+        "irregular_heartbeat": "heart_palpitation",
+        "bp_high": "high_blood_pressure",
+        "high_bp": "high_blood_pressure",
+        "low_bp": "low_blood_pressure",
+        "bp_low": "low_blood_pressure",
+        "sugar_high": "blood_sugar_issue",
+        "sugar_low": "blood_sugar_issue",
+        "diabetes_issue": "blood_sugar_issue",
+        # General
+        "tired": "fatigue",
+        "tiredness": "fatigue",
+        "exhausted": "fatigue",
+        "exhaustion": "fatigue",
+        "weak": "weakness",
+        "loss_of_appetite": "appetite_loss",
+        "not_eating": "appetite_loss",
+        "swollen": "swelling",
+        "cold_and_cough": "cold",
+        "runny_nose": "cold",
+        "throat_pain": "sore_throat",
+        "forgot_medicine": "medicine_missed",
+        "missed_tablet": "medicine_missed",
+        "not_sleeping": "sleep_problem",
+        "insomnia": "sleep_problem",
+        "unconsciousness": "unconscious",
+        "fainted": "unconscious",
+        "fainting": "unconscious",
+        "passed_out": "unconscious",
+        "bleeding": "severe_bleeding",
+    }
+
     normalized_symptoms = []
     for s in symptoms:
         s_norm = s.lower().strip().replace(" ", "_").replace("-", "_")
-        # Direct aliases
-        if s_norm == "dizzy":
-            s_norm = "dizziness"
-        elif s_norm == "fall":
-            s_norm = "fall_detected"
-        elif s_norm == "stroke":
-            s_norm = "stroke_symptoms"
-        elif s_norm in ("short_of_breath", "difficulty_breathing", "breathing_difficulty"):
-            s_norm = "breathing_problem"
-        
+        # Apply direct alias map first
+        s_norm = _ALIASES.get(s_norm, s_norm)
+
         # Add if it matches a valid symptom key in SYMPTOM_WEIGHTS
         if s_norm in SYMPTOM_WEIGHTS:
             normalized_symptoms.append(s_norm)
