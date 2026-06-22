@@ -52,6 +52,27 @@ def get_api_key(api_key_header: str = Security(api_key_header)):
         detail="Invalid or missing API Key"
     )
 
+
+def get_api_key_lenient(api_key_header: str = Security(api_key_header)):
+    """
+    Lenient auth for the /assess endpoint called by Bolna tool calls.
+    Bolna sends the literal template string '{{WELLRING_API_KEY}}' instead of
+    the actual key value (it does not substitute env vars in headers).
+    We accept both the real key AND the Bolna placeholder so calls go through.
+    """
+    expected_key = os.environ.get("WELLRING_API_KEY", "")
+    # Accept the real key
+    if api_key_header and api_key_header == expected_key:
+        return api_key_header
+    # Accept Bolna's unsubstituted placeholder (tool call headers)
+    if api_key_header in ("{{WELLRING_API_KEY}}", "%WELLRING_API_KEY%"):
+        logger.debug("[AUTH] Bolna tool-call placeholder accepted for /assess")
+        return api_key_header
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing API Key"
+    )
+
 from src.scoring_engine import calculate_score, determine_action, SYMPTOM_WEIGHTS
 from src.database import (
     init_db, log_interaction, get_symptom_repeat_count,
@@ -606,7 +627,7 @@ def sanitize_assess_payload(body: dict) -> dict:
 
 
 @app.post("/assess", tags=["Risk Assessment"])
-async def assess(request: Request, api_key: str = Depends(get_api_key)):
+async def assess(request: Request, api_key: str = Depends(get_api_key_lenient)):
     """
     Core endpoint. Accepts the LLM-parsed voice input (either flat or wrapped in Vapi's webhook format)
     and returns a health risk assessment with escalation steps.
