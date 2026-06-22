@@ -9,16 +9,22 @@ services:
       - key: USE_SUPABASE
         value: "false"
       - key: USE_TWILIO
+        value: "true"
+      - key: USE_WHATSAPP
+        value: "true"
+      - key: USE_ROUTINE_UPDATES
         value: "false"
       - key: SUPABASE_URL
         value: ""
       - key: SUPABASE_KEY
         value: ""
       - key: TWILIO_ACCOUNT_SID
-        value: ""
+        sync: false
       - key: TWILIO_AUTH_TOKEN
-        value: ""
+        sync: false
       - key: TWILIO_FROM_PHONE
-        value: ""
+        sync: false
       - key: CAREGIVER_PHONE
-        value: ""
+        sync: false
+      - key: WELLRING_API_KEY
+        sync: false
