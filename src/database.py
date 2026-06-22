@@ -143,6 +143,8 @@ def init_pg_tables() -> None:
                 ("caregiver_name", "TEXT"),
                 ("caregiver_phone", "TEXT"),
                 ("caregiver_email", "TEXT"),
+                ("voice_id", "TEXT"),
+                ("tts_provider", "TEXT NOT NULL DEFAULT 'elevenlabs'"),
                 ("created_at", "TIMESTAMPTZ NOT NULL DEFAULT now()"),
                 ("updated_at", "TIMESTAMPTZ NOT NULL DEFAULT now()")
             ],
@@ -161,6 +163,8 @@ def init_pg_tables() -> None:
                 ("breakdown", "TEXT[] NOT NULL DEFAULT '{}'"),
                 ("vapi_call_id", "TEXT"),
                 ("recording_url", "TEXT"),
+                ("transcript", "TEXT"),
+                ("emotion_analysis", "TEXT"),
                 ("assessed_at", "TIMESTAMPTZ NOT NULL DEFAULT now()")
             ]
         }
@@ -227,7 +231,9 @@ def init_db(db_path: Optional[str] = None) -> None:
             action          TEXT    NOT NULL,
             message         TEXT    NOT NULL,
             user_id         TEXT,
-            recording_url   TEXT
+            recording_url   TEXT,
+            transcript      TEXT,
+            emotion_analysis TEXT
         )
     """)
 
@@ -243,6 +249,8 @@ def init_db(db_path: Optional[str] = None) -> None:
             role                TEXT,
             caregiver_for_user_id TEXT,
             relationship        TEXT,
+            voice_id            TEXT,
+            tts_provider        TEXT,
             updated_at          TEXT
         )
     """)
@@ -311,6 +319,16 @@ def _migrate_sqlite_schema(conn: sqlite3.Connection) -> None:
         except Exception as e:
             logger.warning(f"[DB-MIGRATE] Could not rename id->user_id: {e}")
 
+    # Add transcript column to interactions if missing
+    cur.execute("PRAGMA table_info(interactions)")
+    existing_int_cols = {row[1] for row in cur.fetchall()}
+    if "transcript" not in existing_int_cols:
+        try:
+            cur.execute("ALTER TABLE interactions ADD COLUMN transcript TEXT")
+            logger.info("[DB-MIGRATE] Added column 'transcript' to interactions table")
+        except Exception as e:
+            logger.warning(f"[DB-MIGRATE] Could not add column 'transcript' to interactions: {e}")
+
     conn.commit()
 
 
@@ -351,11 +369,11 @@ def _log_interaction_pg(data: Dict[str, Any]) -> str:
         INSERT INTO assessments (
             user_id, intent, symptoms, severity, confidence,
             score, base_score, risk_level, category, action,
-            message, steps, breakdown, vapi_call_id, recording_url
+            message, steps, breakdown, vapi_call_id, recording_url, transcript, emotion_analysis
         ) VALUES (
             %(user_id)s, %(intent)s, %(symptoms)s, %(severity)s, %(confidence)s,
             %(score)s, %(base_score)s, %(risk_level)s, %(category)s, %(action)s,
-            %(message)s, %(steps)s, %(breakdown)s, %(vapi_call_id)s, %(recording_url)s
+            %(message)s, %(steps)s, %(breakdown)s, %(vapi_call_id)s, %(recording_url)s, %(transcript)s, %(emotion_analysis)s
         )
         RETURNING assessment_id
     """
@@ -375,6 +393,8 @@ def _log_interaction_pg(data: Dict[str, Any]) -> str:
         "breakdown":     data.get("breakdown", []),
         "vapi_call_id":  data.get("vapi_call_id"),
         "recording_url": data.get("recording_url"),
+        "transcript":    data.get("transcript"),
+        "emotion_analysis": data.get("emotion_analysis"),
     }
 
     with get_pg_conn() as conn:
@@ -427,6 +447,8 @@ def _log_interaction_supabase(data: Dict[str, Any]) -> Optional[int]:
             "message":       data.get("message", ""),
             "user_id":       data.get("user_id"),
             "recording_url": data.get("recording_url"),
+            "transcript":    data.get("transcript"),
+            "emotion_analysis": data.get("emotion_analysis"),
         }).execute()
         if res.data:
             return res.data[0]["id"]
@@ -442,8 +464,8 @@ def _log_interaction_sqlite(data: Dict[str, Any], db_path: Optional[str]) -> int
     cur.execute("""
         INSERT INTO interactions (
             timestamp, intent, symptoms, severity, confidence,
-            score, risk_level, category, action, message, user_id, recording_url
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            score, risk_level, category, action, message, user_id, recording_url, transcript, emotion_analysis
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data.get("timestamp", datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z"),
         data.get("intent", ""),
@@ -457,6 +479,8 @@ def _log_interaction_sqlite(data: Dict[str, Any], db_path: Optional[str]) -> int
         data.get("message", ""),
         data.get("user_id"),
         data.get("recording_url"),
+        data.get("transcript"),
+        data.get("emotion_analysis"),
     ))
     row_id = cur.lastrowid
     conn.commit()
@@ -1222,7 +1246,8 @@ def _get_user_health_context_pg(phone: str, days: int) -> Dict[str, Any]:
 # ===========================================================================
 
 def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[int], 
-                        conditions: List[str], notes: str) -> str:
+                        conditions: List[str], notes: str,
+                        voice_id: Optional[str] = None, tts_provider: str = "elevenlabs") -> str:
     """Upsert the elder user's profile, returns the Postgres UUID."""
     if not _use_postgres() or not _PG_AVAILABLE:
         # SQLite fallback
@@ -1233,16 +1258,18 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO users (user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes, role, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'elderly', ?)
+            INSERT INTO users (user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes, role, voice_id, tts_provider, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'elderly', ?, ?, ?)
             ON CONFLICT(firebase_uid) DO UPDATE SET
                 name = excluded.name,
                 phone = excluded.phone,
                 age = excluded.age,
                 medical_conditions = excluded.medical_conditions,
                 medical_notes = excluded.medical_notes,
+                voice_id = excluded.voice_id,
+                tts_provider = excluded.tts_provider,
                 updated_at = excluded.updated_at
-        """, (user_id, firebase_uid, name, phone, age, json.dumps(conditions), notes, now_str))
+        """, (user_id, firebase_uid, name, phone, age, json.dumps(conditions), notes, voice_id, tts_provider, now_str))
         conn.commit()
         # Fetch actual user_id in case of update
         cur.execute("SELECT user_id FROM users WHERE firebase_uid = ?", (firebase_uid,))
@@ -1253,14 +1280,16 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
     with get_pg_conn() as conn:
         with _pg_cursor(conn) as cur:
             cur.execute("""
-                INSERT INTO users (firebase_uid, name, phone, age, medical_conditions, medical_notes, role)
-                VALUES (%(uid)s, %(name)s, %(phone)s, %(age)s, %(conds)s, %(notes)s, 'elderly')
+                INSERT INTO users (firebase_uid, name, phone, age, medical_conditions, medical_notes, role, voice_id, tts_provider)
+                VALUES (%(uid)s, %(name)s, %(phone)s, %(age)s, %(conds)s, %(notes)s, 'elderly', %(voice_id)s, %(tts_provider)s)
                 ON CONFLICT (firebase_uid) DO UPDATE SET
                     name = EXCLUDED.name,
                     phone = EXCLUDED.phone,
                     age = EXCLUDED.age,
                     medical_conditions = EXCLUDED.medical_conditions,
                     medical_notes = EXCLUDED.medical_notes,
+                    voice_id = EXCLUDED.voice_id,
+                    tts_provider = EXCLUDED.tts_provider,
                     updated_at = now()
                 RETURNING user_id
             """, {
@@ -1269,7 +1298,9 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
                 "phone": phone,
                 "age": age,
                 "conds": conditions,
-                "notes": notes
+                "notes": notes,
+                "voice_id": voice_id,
+                "tts_provider": tts_provider
             })
             row = cur.fetchone()
             return str(row["user_id"]) if row else ""
@@ -1306,7 +1337,7 @@ def get_user_profile(firebase_uid: str) -> Optional[Dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("""
-            SELECT user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes
+            SELECT user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes, voice_id, tts_provider
             FROM users
             WHERE firebase_uid = ? AND role = 'elderly'
         """, (firebase_uid,))
@@ -1325,7 +1356,7 @@ def get_user_profile(firebase_uid: str) -> Optional[Dict[str, Any]]:
     with get_pg_conn() as conn:
         with _pg_cursor(conn) as cur:
             cur.execute("""
-                SELECT user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes
+                SELECT user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes, voice_id, tts_provider
                 FROM users
                 WHERE firebase_uid = %s AND role = 'elderly'
             """, (firebase_uid,))

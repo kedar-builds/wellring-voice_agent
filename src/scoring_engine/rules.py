@@ -24,12 +24,12 @@ SYMPTOM_WEIGHTS: Dict[str, int] = {
     "stroke_symptoms":   100,
     "chest_pain":         65,   # always HIGH — chest pain is always an emergency
 
-    "fall_detected":      60,
-    "breathing_problem":  61,   # always HIGH — breathing difficulty is always serious
+    "fall_detected":      65,   # always HIGH
+    "breathing_problem":  65,   # always HIGH
 
     "severe_bleeding":    70,
-    "heart_palpitation":  50,
-    "high_fever":         45,   # fever ≥ 103°F — needs family alert
+    "heart_palpitation":  61,   # always HIGH
+    "high_fever":         61,   # fever ≥ 103°F — always HIGH
 
     # ---- MODERATE (need more symptoms or high severity to reach HIGH) ----
     "dizziness":          25,
