@@ -172,3 +172,22 @@ def test_mixed_valid_and_unknown_symptoms(client):
     assert data["symptoms"] == ["dizziness"]
     # Score >= 20 (dizziness base weight), history may make it higher
     assert data["score"] >= 20
+
+
+def test_robust_parsing_for_stringified_params(client):
+    """Verify that stringified fields and lists from templates are correctly sanitized."""
+    r = client.post("/assess", json={
+        "intent": "%(intent)s",
+        "symptoms": "['fever', 'breathing_problem']",
+        "severity": " HIGH ",
+        "confidence": "0.95",
+        "user_id": "%(user_id)s"
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert "fever" in data["symptoms"]
+    assert "breathing_problem" in data["symptoms"]
+    assert data["severity"] == "high"
+    assert data["confidence"] == 0.95
+
+
