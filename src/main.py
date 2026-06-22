@@ -528,6 +528,83 @@ def process_assessment_data(
     
     return response_data
 
+def sanitize_assess_payload(body: dict) -> dict:
+    """
+    Cleans up parameters sent to /assess, handling stringified arrays/numbers/booleans 
+    that might be formatted as strings by LLM tool templates (e.g. Bolna).
+    """
+    sanitized = body.copy()
+
+    # 1. Parse symptoms
+    if "symptoms" in sanitized:
+        symptoms_raw = sanitized["symptoms"]
+        if isinstance(symptoms_raw, str):
+            symptoms_str = symptoms_raw.strip()
+            # If it's a template placeholder
+            if symptoms_str.startswith("%") or not symptoms_str:
+                sanitized["symptoms"] = []
+            else:
+                # Remove brackets if present
+                if symptoms_str.startswith("[") and symptoms_str.endswith("]"):
+                    symptoms_str = symptoms_str[1:-1]
+                
+                # Split by comma
+                parts = symptoms_str.split(",")
+                symptoms_list = []
+                for p in parts:
+                    p_clean = p.strip().strip("'").strip('"')
+                    if p_clean:
+                        symptoms_list.append(p_clean)
+                sanitized["symptoms"] = symptoms_list
+        elif isinstance(symptoms_raw, list):
+            sanitized["symptoms"] = [str(s).strip() for s in symptoms_raw if s]
+
+    # 2. Parse confidence
+    if "confidence" in sanitized:
+        confidence_raw = sanitized["confidence"]
+        if isinstance(confidence_raw, str):
+            confidence_str = confidence_raw.strip()
+            if confidence_str.startswith("%") or not confidence_str:
+                sanitized["confidence"] = 1.0
+            else:
+                try:
+                    sanitized["confidence"] = float(confidence_str)
+                except (ValueError, TypeError):
+                    pass
+
+    # 3. Clean user_id
+    if "user_id" in sanitized:
+        user_id_raw = sanitized["user_id"]
+        if isinstance(user_id_raw, str):
+            user_id_clean = user_id_raw.strip()
+            if not user_id_clean or user_id_clean.startswith("%") or user_id_clean == "None":
+                sanitized["user_id"] = None
+            else:
+                sanitized["user_id"] = user_id_clean
+
+    # 4. Clean severity
+    if "severity" in sanitized:
+        severity_raw = sanitized["severity"]
+        if isinstance(severity_raw, str):
+            sev = severity_raw.strip()
+            if sev.startswith("%"):
+                sanitized["severity"] = "medium"
+            else:
+                sanitized["severity"] = sev
+
+    # 5. Clean intent
+    if "intent" in sanitized:
+        intent_raw = sanitized["intent"]
+        if isinstance(intent_raw, str):
+            intent_clean = intent_raw.strip()
+            if intent_clean.startswith("%"):
+                sanitized["intent"] = "health_issue"
+            else:
+                sanitized["intent"] = intent_clean
+
+    return sanitized
+
+
 @app.post("/assess", tags=["Risk Assessment"])
 async def assess(request: Request, api_key: str = Depends(get_api_key)):
     """
@@ -563,6 +640,9 @@ async def assess(request: Request, api_key: str = Depends(get_api_key)):
                     except Exception:
                         pass
                 
+                # Sanitize the arguments
+                args = sanitize_assess_payload(args)
+                
                 # Extract fields from Vapi tool call arguments
                 intent = args.get("intent", "health_issue")
                 symptoms = args.get("symptoms", [])
@@ -575,7 +655,8 @@ async def assess(request: Request, api_key: str = Depends(get_api_key)):
     else:
         # Standard direct AssessRequest payload
         try:
-            payload = AssessRequest(**body)
+            sanitized_body = sanitize_assess_payload(body)
+            payload = AssessRequest(**sanitized_body)
             intent = payload.intent
             symptoms = payload.symptoms
             severity = payload.severity
@@ -827,21 +908,40 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
         }
     }
 
-    if voice_id:
-        bolna_payload["agent_config"] = {
-            "tasks": [
-                {
-                    "tools_config": {
-                        "synthesizer": {
-                            "provider": tts_provider,
-                            "provider_config": {
-                                "voice_id": voice_id
-                            }
+    # Define the dynamic agent_config to pass the patient's user_id to the risk assessment tool
+    user_id_val = ""
+    if user_profile and user_profile.get("user_id"):
+        user_id_val = str(user_profile.get("user_id"))
+
+    task_config = {
+        "tools_config": {
+            "api_tools": {
+                "tools_params": {
+                    "assess_health_risk": {
+                        "param": {
+                            "intent": "%(intent)s",
+                            "symptoms": "%(symptoms)s",
+                            "severity": "%(severity)s",
+                            "confidence": "%(confidence)s",
+                            "user_id": user_id_val
                         }
                     }
                 }
-            ]
+            }
         }
+    }
+
+    if voice_id:
+        task_config["tools_config"]["synthesizer"] = {
+            "provider": tts_provider,
+            "provider_config": {
+                "voice_id": voice_id
+            }
+        }
+
+    bolna_payload["agent_config"] = {
+        "tasks": [task_config]
+    }
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(

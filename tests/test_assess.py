@@ -83,8 +83,9 @@ def test_medium_risk_dizziness(client):
     r = client.post("/assess", json=DIZZINESS_PAYLOAD)
     assert r.status_code == 200
     data = r.json()
-    # score = (20 + 10_bonus) * 0.90 = 27 → LOW  (first occurrence, no history)
-    assert data["risk_level"] == "LOW"
+    # score = (25 + 10_bonus) * 0.90 = 31.5 -> 31 -> MEDIUM (first occurrence, no history)
+    assert data["risk_level"] == "MEDIUM"
+    assert data["action"] == "follow_up_questions"
     assert data["category"] == "NEUROLOGICAL"
 
 
