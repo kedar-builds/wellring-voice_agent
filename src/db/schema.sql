@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS users (
     caregiver_phone TEXT,
     caregiver_email TEXT,
 
+    -- Voice Cloning
+    voice_id        TEXT,
+    tts_provider    TEXT            NOT NULL DEFAULT 'elevenlabs',
+
     -- Timestamps
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now()
@@ -93,6 +97,8 @@ CREATE TABLE IF NOT EXISTS assessments (
     -- Vapi metadata
     vapi_call_id    TEXT,
     recording_url   TEXT,
+    transcript      TEXT,
+    emotion_analysis TEXT,
 
     -- Timestamp
     assessed_at     TIMESTAMPTZ     NOT NULL DEFAULT now()

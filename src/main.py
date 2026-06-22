@@ -132,7 +132,7 @@ async def run_reminder_scheduler():
                 
                 if should_trigger:
                     logger.info(f"Triggering reminder {rem_id} ({rem_title}) for {rem_phone}")
-                    if rem_type == "call":
+                    if rem_type in ("call", "family_call"):
                         body = f"📞 WellRing check-in call is ringing you now..."
                         send_whatsapp_reminder(rem_phone, body)
                         try:
@@ -260,7 +260,7 @@ ALLOWED_ORIGINS = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -365,12 +365,14 @@ def health():
 
 def process_assessment_data(
     intent: str,
-    symptoms: list[str],
+    symptoms: List[str],
     severity: str,
     confidence: float,
-    user_id: str | None,
-    recording_url: str | None,
-) -> dict:
+    user_id: Optional[str] = None,
+    recording_url: Optional[str] = None,
+    transcript: Optional[str] = None,
+    emotion_analysis: Optional[str] = None,
+) -> Dict[str, Any]:
     """Core logic to normalize symptoms, calculate score, log interaction, and trigger alerts."""
     # Normalize severity
     severity_lower = severity.lower().strip()
@@ -511,6 +513,8 @@ def process_assessment_data(
         "breakdown": score_result["breakdown"],
         "timestamp": datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z",
         "recording_url": recording_url,
+        "transcript": transcript,
+        "emotion_analysis": emotion_analysis,
     }
     
     # Log interaction to database
@@ -740,16 +744,18 @@ BOLNA_AGENT_ID = os.environ.get("BOLNA_AGENT_ID", "ab32d1ed-a6ae-4581-a712-c7f5e
 BASE_SYSTEM_PROMPT = """You are Riley, a warm and caring health assistant from WellRing calling to check on an elderly patient.
 
 Your role:
-- Greet the patient by name if known, then gently ask how they are feeling
+- HIPAA IDENTITY VERIFICATION (CRITICAL): Start the call by saying EXACTLY: "Hello, am I speaking to [elder_name]?" Do not proceed until they confirm they are the correct person. If they say no, or refuse to confirm after 2 attempts, say "I must only speak to the patient for privacy reasons. Have a good day." and immediately HANG UP.
+- If their identity is confirmed, gently ask how they are feeling.
 - If they had symptoms recently, ask a specific follow-up (e.g. "Yesterday you mentioned fever — has your temperature come down?")
-- Listen carefully for any new or worsening symptoms
+- Listen carefully for any new or worsening symptoms.
 - If they mention chest pain, difficulty breathing, stroke symptoms, or unconsciousness — immediately say: "This sounds urgent. Please call emergency services at 112 right now. I will also alert your caregiver."
-- After talking, call the assess_health_risk tool to log the outcome
+- After talking, call the assess_health_risk tool to log the outcome.
 
 Speaking style:
-- Speak in short, simple, warm sentences
-- Never use medical jargon
-- Be patient — they may speak slowly"""
+- Speak in short, simple, warm sentences.
+- Never use medical jargon.
+- Be patient — they may speak slowly.
+- CRITICAL: When the conversation is naturally finished and you have gathered the required info, you MUST say a clear goodbye and immediately HANG UP the call to end it. Do not leave the line open."""
 
 
 class CallRequest(BaseModel):
@@ -801,9 +807,14 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
             medical_context += f"Doctor/Caregiver Notes: {notes}\n"
         medical_context += "Keep these conditions in mind but do not alarm the patient. If symptoms relate to these conditions, you may ask gently if they think it's related."
 
-    dynamic_prompt = BASE_SYSTEM_PROMPT + medical_context + history_block
+    dynamic_prompt = BASE_SYSTEM_PROMPT.replace("[elder_name]", user_name) + medical_context + history_block
 
-    logger.info(f"[CALL] Initiating call to {payload.phone} | history={ctx.get('has_history')} | user={user_name}")
+    # Fetch user profile to get Voice Cloning settings
+    user_profile = get_user_by_phone(payload.phone)
+    voice_id = user_profile.get("voice_id") if user_profile else None
+    tts_provider = user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
+
+    logger.info(f"[CALL] Initiating call to {payload.phone} | history={ctx.get('has_history')} | user={user_name} | voice_id={voice_id}")
 
     # 3. Call Bolna API
     bolna_payload = {
@@ -815,6 +826,22 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
             }
         }
     }
+
+    if voice_id:
+        bolna_payload["agent_config"] = {
+            "tasks": [
+                {
+                    "tools_config": {
+                        "synthesizer": {
+                            "provider": tts_provider,
+                            "provider_config": {
+                                "voice_id": voice_id
+                            }
+                        }
+                    }
+                }
+            ]
+        }
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
@@ -926,6 +953,8 @@ class ProfileSetupRequest(BaseModel):
     medical_conditions: List[str] = []
     medical_notes: str = ""
     family_contacts: List[Dict[str, str]] = []
+    voice_id: Optional[str] = None
+    tts_provider: Optional[str] = "elevenlabs"
 
 @app.post("/setup-profile")
 async def setup_profile(req: ProfileSetupRequest, api_key: str = Depends(get_api_key)):
@@ -937,7 +966,9 @@ async def setup_profile(req: ProfileSetupRequest, api_key: str = Depends(get_api
             phone=req.elder_phone,
             age=req.elder_age,
             conditions=req.medical_conditions,
-            notes=req.medical_notes
+            notes=req.medical_notes,
+            voice_id=req.voice_id,
+            tts_provider=req.tts_provider
         )
         if not user_id:
             raise HTTPException(status_code=500, detail="Database error or PostgreSQL not active.")
@@ -1089,6 +1120,52 @@ async def upload_document(
         raise HTTPException(status_code=500, detail=str(e))
 
 # ---------------------------------------------------------------------------
+# Emotion Analysis
+# ---------------------------------------------------------------------------
+
+async def analyze_emotion_from_audio(recording_url: str) -> str:
+    """Download audio and use Gemini to analyze the patient's tone."""
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key or not recording_url:
+        return ""
+        
+    try:
+        import tempfile
+        from google import genai
+        
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(recording_url)
+            if resp.status_code != 200:
+                return ""
+                
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
+            tmp_file.write(resp.content)
+            tmp_path = tmp_file.name
+            
+        client = genai.Client(api_key=gemini_key)
+        uploaded_file = client.files.upload(file=tmp_path)
+        
+        prompt = (
+            "Listen to this audio call between an AI agent and an elderly patient. "
+            "Analyze the tone of the patient's voice. Do they sound distressed, in pain, "
+            "confused, anxious, or calm? Reply with exactly one emotion emoji, followed by a short 1-sentence explanation. "
+            "For example: '😟 The patient's voice sounds shaky and tired, indicating mild distress.' or "
+            "'😊 The patient sounds calm and relaxed.' If they sound in pain, say "
+            "'😖 The patient's voice indicates physical discomfort.'"
+        )
+        
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[uploaded_file, prompt]
+        )
+        
+        os.remove(tmp_path)
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Error analyzing emotion: {e}")
+        return ""
+
+# ---------------------------------------------------------------------------
 # Bolna Webhooks
 # ---------------------------------------------------------------------------
 
@@ -1171,6 +1248,44 @@ async def bolna_webhook(request: Request):
                             return res
                 return None
             
+            def _find_transcript(data):
+                if isinstance(data, dict):
+                    if "transcript" in data:
+                        return data["transcript"]
+                    if "messages" in data:
+                        return data["messages"]
+                    for k, v in data.items():
+                        res = _find_transcript(v)
+                        if res:
+                            return res
+                elif isinstance(data, list):
+                    for item in data:
+                        res = _find_transcript(item)
+                        if res:
+                            return res
+                return None
+            
+            raw_transcript = _find_transcript(payload)
+            formatted_transcript = ""
+            if raw_transcript:
+                if isinstance(raw_transcript, list):
+                    lines = []
+                    for msg in raw_transcript:
+                        if isinstance(msg, dict):
+                            role = msg.get("role", "unknown")
+                            content = msg.get("content", "")
+                            lines.append(f"**{role.capitalize()}**: {content}")
+                    formatted_transcript = "\n\n".join(lines)
+                elif isinstance(raw_transcript, str):
+                    formatted_transcript = raw_transcript
+                    
+            recording_url = payload.get("recording_url")
+            
+            # Analyze emotion if we have an audio recording URL
+            emotion_analysis = ""
+            if recording_url:
+                emotion_analysis = await analyze_emotion_from_audio(recording_url)
+
             extracted = _find_extraction_data(payload)
             if extracted:
                 logger.info(f"[WEBHOOK] Found extraction data from successful call: {extracted}")
@@ -1190,9 +1305,25 @@ async def bolna_webhook(request: Request):
                     severity=severity,
                     confidence=1.0,
                     user_id=user_id,
-                    recording_url=None
+                    recording_url=recording_url,
+                    transcript=formatted_transcript if formatted_transcript else None,
+                    emotion_analysis=emotion_analysis
                 )
             else:
+                # Still log the interaction with just the transcript if available
+                if formatted_transcript:
+                    user_profile = get_user_by_phone(phone)
+                    user_id = str(user_profile["user_id"]) if user_profile and "user_id" in user_profile else None
+                    process_assessment_data(
+                        intent="health_check",
+                        symptoms=[],
+                        severity="low",
+                        confidence=1.0,
+                        user_id=user_id,
+                        recording_url=recording_url,
+                        transcript=formatted_transcript,
+                        emotion_analysis=emotion_analysis
+                    )
                 logger.info(f"[WEBHOOK] Call completed, but no extraction data found.")
 
         return {"status": "ok"}

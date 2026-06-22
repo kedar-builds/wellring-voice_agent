@@ -49,7 +49,7 @@ def get_user(user_id: str, db_path: Optional[str] = None) -> Optional[Dict[str, 
     # Return rows as dicts
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     conn.close()
 
