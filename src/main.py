@@ -1411,12 +1411,9 @@ Transcript:
         # Try 2.5-flash first; fall back to 2.0-flash if it's overloaded
         try:
             response = await asyncio.to_thread(_call, "gemini-2.5-flash")
-        except Exception as e503:
-            if "503" in str(e503) or "UNAVAILABLE" in str(e503):
-                logger.warning("gemini-2.5-flash overloaded, retrying with gemini-2.0-flash...")
-                response = await asyncio.to_thread(_call, "gemini-2.0-flash")
-            else:
-                raise
+        except Exception as e:
+            logger.warning(f"gemini-2.5-flash failed ({e}), retrying with gemini-2.0-flash...")
+            response = await asyncio.to_thread(_call, "gemini-2.0-flash")
         data = json.loads(response.text)
         return {
             "symptoms": data.get("symptoms", []),
@@ -1446,10 +1443,6 @@ async def bolna_webhook(request: Request):
             req_data = payload.get("request", {})
             phone = req_data.get("recipient_phone_number") or req_data.get("phone_number")
         
-        if not phone:
-            logger.warning("[WEBHOOK] Bolna payload did not contain a recognizable phone number.")
-            return {"status": "ok", "note": "missing phone"}
-
         # If it's a failed or unanswered call, send a WhatsApp alert
         if status in ("no-answer", "failed", "busy", "canceled", "error"):
             logger.info(f"[WEBHOOK] Call to {phone} ended with status: {status}. Sending alert...")
