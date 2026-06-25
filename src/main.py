@@ -844,21 +844,25 @@ def remove_reminder(reminder_id: int, api_key: str = Depends(get_api_key)):
 BOLNA_API_KEY = os.environ.get("BOLNA_API_KEY", "")
 BOLNA_AGENT_ID = os.environ.get("BOLNA_AGENT_ID", "ab32d1ed-a6ae-4581-a712-c7f5e235f9f0")
 
-BASE_SYSTEM_PROMPT = """You are Riley, a warm and caring health assistant from WellRing calling to check on an elderly patient.
+BASE_SYSTEM_PROMPT = """You are Riley, a warm and caring health assistant from WellRing calling to check on an elderly patient named [elder_name].
 
-Your role:
-- HIPAA IDENTITY VERIFICATION (CRITICAL): Start the call by saying EXACTLY: "Hello, am I speaking to [elder_name]?" Do not proceed until they confirm they are the correct person. If they say no, or refuse to confirm after 2 attempts, say "I must only speak to the patient for privacy reasons. Have a good day." and immediately HANG UP.
-- If their identity is confirmed, gently ask how they are feeling.
-- If they had symptoms recently, ask a specific follow-up (e.g. "Yesterday you mentioned fever — has your temperature come down?")
-- Listen carefully for any new or worsening symptoms.
-- If they mention chest pain, difficulty breathing, stroke symptoms, or unconsciousness — immediately say: "This sounds urgent. Please call emergency services at 112 right now. I will also alert your caregiver."
-- After talking, call the assess_health_risk tool to log the outcome.
+Your goal is to have a friendly 2-3 minute health check-in conversation.
 
-Speaking style:
-- Speak in short, simple, warm sentences.
-- Never use medical jargon.
-- Be patient — they may speak slowly.
-- CRITICAL: When the conversation is naturally finished and you have gathered the required info, you MUST say a clear goodbye and immediately HANG UP the call to end it. Do not leave the line open."""
+How to run the call:
+- Start by saying: "Hello! This is Riley calling from WellRing. Am I speaking with [elder_name]?"
+- Once they respond (any response), warmly greet them and ask how they are feeling today.
+- Ask gently about their sleep, appetite, energy levels, and any aches or pains.
+- If they mention any symptoms, listen carefully and ask one follow-up question.
+- If they mention chest pain, difficulty breathing, or a fall — say: "That sounds serious. Please call 112 right away, and I will also let your family know."
+- After gathering health info, call the assess_health_risk tool to log the outcome.
+- End the call warmly: "Thank you for chatting with me today. Take care and have a good day!"
+
+Rules:
+- Keep responses SHORT — one or two sentences maximum.
+- Be warm, slow, and patient. They may take time to respond.
+- NEVER hang up abruptly. Always say a warm goodbye before ending.
+- Do NOT end the call until you have asked at least 2-3 health questions.
+- If there is silence, gently say "Are you still there?" and wait."""
 
 
 class CallRequest(BaseModel):
@@ -879,8 +883,16 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     if not BOLNA_API_KEY:
         raise HTTPException(status_code=500, detail="BOLNA_API_KEY not configured")
 
+    # Normalize phone: strip spaces/dashes, prepend +91 for 10-digit Indian numbers
+    raw_phone = str(payload.phone).strip().replace(' ', '').replace('-', '')
+    if raw_phone.startswith('0'):
+        raw_phone = '+91' + raw_phone[1:]
+    elif not raw_phone.startswith('+') and len(raw_phone) == 10:
+        raw_phone = '+91' + raw_phone
+    normalized_phone = raw_phone
+
     # 1. Fetch health context from DB
-    ctx = get_user_health_context(payload.phone, days=7)
+    ctx = get_user_health_context(normalized_phone, days=7)
     user_name = payload.user_name or ctx.get("user_name", "there")
 
     # 2. Build personalised prompt
@@ -920,62 +932,56 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     logger.info(f"[CALL] Initiating call to {payload.phone} | history={ctx.get('has_history')} | user={user_name} | voice_id={voice_id}")
 
     # 3. Call Bolna API
-    bolna_payload = {
-        "agent_id": BOLNA_AGENT_ID,
-        "recipient_phone_number": payload.phone,
-        "agent_prompts": {
-            "task_1": {
-                "system_prompt": dynamic_prompt
-            }
-        }
-    }
-
-    # Define the dynamic agent_config to pass the patient's user_id to the risk assessment tool
-    user_id_val = ""
-    if user_profile and user_profile.get("user_id"):
-        user_id_val = str(user_profile.get("user_id"))
-
-    task_config = {
-        "tools_config": {
-            "api_tools": {
-                "tools_params": {
-                    "assess_health_risk": {
-                        "param": {
-                            "intent": "%(intent)s",
-                            "symptoms": "%(symptoms)s",
-                            "severity": "%(severity)s",
-                            "confidence": "%(confidence)s",
-                            "user_id": user_id_val
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if voice_id:
-        task_config["tools_config"]["synthesizer"] = {
-            "provider": tts_provider,
-            "provider_config": {
-                "voice_id": voice_id
-            }
-        }
-
-    bolna_payload["agent_config"] = {
-        "tasks": [task_config],
-        "engine": {
-            "transcription": {
-                "interruption_threshold": 1,
-                "generate_precise_transcript": True
-            },
-            "response_latency": {
-                "endpointing_ms": 200,
-                "linear_delay_ms": 50
-            }
-        }
-    }
-
+    user_id_val = str(user_profile.get("user_id", "")) if user_profile else ""
+    
     async with httpx.AsyncClient(timeout=30) as client:
+        # GET the agent config first to avoid resetting any permanent defaults
+        agent_resp = await client.get(
+            f"https://api.bolna.ai/agent/{BOLNA_AGENT_ID}",
+            headers={"Authorization": f"Bearer {BOLNA_API_KEY}"}
+        )
+        if agent_resp.status_code == 200:
+            agent_config = agent_resp.json()
+            if "agent_prompts" not in agent_config:
+                agent_config["agent_prompts"] = {"task_1": {}}
+            agent_config["agent_prompts"]["task_1"]["system_prompt"] = dynamic_prompt
+            
+            if voice_id and "tasks" in agent_config and len(agent_config["tasks"]) > 0:
+                try:
+                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider_config"]["voice_id"] = voice_id
+                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider"] = tts_provider
+                except KeyError:
+                    pass
+            
+            # Make sure hangup_after_silence is reasonably long
+            try:
+                agent_config["tasks"][0]["task_config"]["hangup_after_silence"] = 30
+            except KeyError:
+                pass
+                
+            bolna_payload = {
+                "agent_id": BOLNA_AGENT_ID,
+                "recipient_phone_number": normalized_phone,
+                "agent_config": agent_config,
+                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
+            }
+        else:
+            logger.warning(f"Failed to fetch agent config: {agent_resp.text}")
+            # Fallback
+            bolna_payload = {
+                "agent_id": BOLNA_AGENT_ID,
+                "recipient_phone_number": normalized_phone,
+                "agent_prompts": {
+                    "task_1": {
+                        "system_prompt": dynamic_prompt
+                    }
+                },
+                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
+            }
+            
+        if user_id_val:
+            bolna_payload["metadata"] = {"user_id": user_id_val}
+
         resp = await client.post(
             "https://api.bolna.ai/call",
             headers={
@@ -998,7 +1004,7 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     return {
         "status": "queued",
         "run_id": resp_data.get("run_id") or resp_data.get("execution_id"),
-        "phone": payload.phone,
+        "phone": normalized_phone,
         "user_name": user_name,
         "has_history": ctx.get("has_history", False),
         "history_summary": ctx.get("summary_lines", []),
@@ -1012,6 +1018,14 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
     """
     if not BOLNA_API_KEY:
         raise RuntimeError("BOLNA_API_KEY not configured")
+
+    # Normalize phone number (add +91 for 10-digit Indian numbers)
+    raw = str(phone).strip().replace(' ', '').replace('-', '')
+    if raw.startswith('0'):
+        raw = '+91' + raw[1:]
+    elif not raw.startswith('+') and len(raw) == 10:
+        raw = '+91' + raw
+    phone = raw
 
     ctx = get_user_health_context(phone, days=7)
     resolved_name = user_name or ctx.get("user_name", "there")
@@ -1048,49 +1062,47 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
     tts_provider = user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
     user_id_val = str(user_profile["user_id"]) if user_profile and user_profile.get("user_id") else ""
 
-    bolna_payload: Dict[str, Any] = {
-        "agent_id": BOLNA_AGENT_ID,
-        "recipient_phone_number": phone,
-        "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
-    }
-    task_config: Dict[str, Any] = {
-        "tools_config": {
-            "api_tools": {
-                "tools_params": {
-                    "assess_health_risk": {
-                        "param": {
-                            "intent": "%(intent)s",
-                            "symptoms": "%(symptoms)s",
-                            "severity": "%(severity)s",
-                            "confidence": "%(confidence)s",
-                            "user_id": user_id_val,
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if voice_id:
-        task_config["tools_config"]["synthesizer"] = {
-            "provider": tts_provider,
-            "provider_config": {"voice_id": voice_id},
-        }
-    bolna_payload["agent_config"] = {
-        "tasks": [task_config],
-        "engine": {
-            "transcription": {
-                "interruption_threshold": 1,
-                "generate_precise_transcript": True
-            },
-            "response_latency": {
-                "endpointing_ms": 200,
-                "linear_delay_ms": 50
-            }
-        }
-    }
-
     logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
     async with httpx.AsyncClient(timeout=30) as client:
+        agent_resp = await client.get(
+            f"https://api.bolna.ai/agent/{BOLNA_AGENT_ID}",
+            headers={"Authorization": f"Bearer {BOLNA_API_KEY}"}
+        )
+        if agent_resp.status_code == 200:
+            agent_config = agent_resp.json()
+            if "agent_prompts" not in agent_config:
+                agent_config["agent_prompts"] = {"task_1": {}}
+            agent_config["agent_prompts"]["task_1"]["system_prompt"] = dynamic_prompt
+            
+            if voice_id and "tasks" in agent_config and len(agent_config["tasks"]) > 0:
+                try:
+                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider_config"]["voice_id"] = voice_id
+                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider"] = tts_provider
+                except KeyError:
+                    pass
+            
+            try:
+                agent_config["tasks"][0]["task_config"]["hangup_after_silence"] = 30
+            except KeyError:
+                pass
+                
+            bolna_payload: Dict[str, Any] = {
+                "agent_id": BOLNA_AGENT_ID,
+                "recipient_phone_number": phone,
+                "agent_config": agent_config,
+                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
+            }
+        else:
+            bolna_payload = {
+                "agent_id": BOLNA_AGENT_ID,
+                "recipient_phone_number": phone,
+                "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
+                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
+            }
+            
+        if user_id_val:
+            bolna_payload["metadata"] = {"user_id": user_id_val}
+
         resp = await client.post(
             "https://api.bolna.ai/call",
             headers={"Authorization": f"Bearer {BOLNA_API_KEY}", "Content-Type": "application/json"},
