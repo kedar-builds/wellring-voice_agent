@@ -1,43 +1,32 @@
 import os
+import sys
 from dotenv import load_dotenv
 
-# Load env vars before importing main
 load_dotenv()
 
-# Force Twilio to be ON for this script
-os.environ["USE_TWILIO"] = "true"
-os.environ["USE_WHATSAPP"] = "true"
-os.environ["CAREGIVER_PHONE"] = "+918421971145"
+from src.notifications import send_whatsapp_alert
 
-from src.database import init_db, init_pg_tables
-from src.main import process_assessment_data
+recipient = "+918421971145"
 
-import logging
-logging.basicConfig(level=logging.INFO)
+print(f"Sending WhatsApp alert to {recipient}...")
+response_data = {
+    "risk_level": "CRITICAL",
+    "score": 236,
+    "symptoms": ["Chest Pain", "Breathing Problem"],
+    "action": "Notify Caregiver And Emergency Services",
+    "steps": [
+        "Call emergency services immediately (112 / local emergency number).",
+        "Notify registered caregiver via SMS and push notification.",
+        "Keep the user calm and on the line.",
+        "Do NOT let the user move unless instructed by emergency services."
+    ]
+}
 
-def test_whatsapp():
-    init_db()
-    init_pg_tables()
-    print("="*60)
-    print("🚑 Simulating Severe Health Assessment (Breathing Problem)")
-    print("="*60)
-    
-    try:
-        result = process_assessment_data(
-            intent="health_issue",
-            symptoms=["breathing_problem", "high_fever"],
-            severity="critical",
-            confidence=0.99,
-            user_id=None,
-            recording_url=None
-        )
-        print(f"\n📊 Assessment Result:")
-        print(f"   Risk Level: {result['risk_level']} (Score: {result['score']})")
-        print(f"   Category  : {result['category']}")
-        print(f"   Action    : {result['action']}")
-        print(f"\n📲 WhatsApp trigger initiated! Check your phone.")
-    except Exception as e:
-        print(f"\n❌ Error triggering WhatsApp: {e}")
-
-if __name__ == "__main__":
-    test_whatsapp()
+success = send_whatsapp_alert(
+    interaction_id="test_id_123",
+    response_data=response_data,
+    to_phone=recipient,
+    patient_name="the patient",
+    caregiver_name="Caregiver"
+)
+print(f"Success: {success}")

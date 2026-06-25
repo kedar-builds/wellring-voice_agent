@@ -30,7 +30,10 @@ import asyncio
 import logging
 import sqlite3
 import json
+import re
 import httpx
+from google import genai
+from google.genai import types
 
 logger = logging.getLogger(__name__)
 
@@ -157,8 +160,7 @@ async def run_reminder_scheduler():
                         body = f"📞 WellRing check-in call is ringing you now..."
                         send_whatsapp_reminder(rem_phone, body)
                         try:
-                            req = CallRequest(phone=rem_phone, user_name=None)
-                            await initiate_call(req, api_key="internal")
+                            await _do_bolna_call(phone=rem_phone, user_name=None)
                         except Exception as e:
                             logger.error(f"Error initiating voice call for reminder: {e}")
                         update_reminder_trigger(rem_id, trigger_timestamp)
@@ -261,13 +263,11 @@ app = FastAPI(
 async def global_exception_handler(request: Request, exc: Exception):
     import traceback
     logger.exception("Unhandled exception occurred")
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": str(exc),
-            "traceback": traceback.format_exception(type(exc), exc, exc.__traceback__)
-        }
-    )
+    _debug = os.environ.get("DEBUG", "false").lower() == "true"
+    content: Dict[str, Any] = {"error": str(exc)}
+    if _debug:
+        content["traceback"] = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    return JSONResponse(status_code=500, content=content)
 
 
 ALLOWED_ORIGINS = [
@@ -384,7 +384,7 @@ def health():
     return HealthResponse(status="ok", version="1.0.0")
 
 
-def process_assessment_data(
+async def process_assessment_data(
     intent: str,
     symptoms: List[str],
     severity: str,
@@ -504,10 +504,11 @@ def process_assessment_data(
 
     try:
         # Build history counts for each symptom from the last 3 days
-        history_counts = {
-            s: get_symptom_repeat_count(s, days=3)
-            for s in normalized_symptoms
-        }
+        # Use asyncio.to_thread to avoid blocking the event loop with sync DB calls
+        history_counts = {}
+        for s in normalized_symptoms:
+            count = await asyncio.to_thread(get_symptom_repeat_count, s, 3)
+            history_counts[s] = count
 
         score_result = calculate_score(
             symptoms=normalized_symptoms,
@@ -538,15 +539,15 @@ def process_assessment_data(
         "emotion_analysis": emotion_analysis,
     }
     
-    # Log interaction to database
+    # Log interaction to database (blocking I/O — run off the event loop)
     log_data = response_data.copy()
     log_data["intent"] = intent
     log_data["user_id"] = user_id
-    interaction_id = log_interaction(log_data)
-    
-    # Trigger alerts if necessary
-    trigger_alerts_if_needed(interaction_id, response_data, user_id)
-    
+    interaction_id = await asyncio.to_thread(log_interaction, log_data)
+
+    # Trigger alerts if necessary (also contains blocking I/O)
+    await asyncio.to_thread(trigger_alerts_if_needed, interaction_id, response_data, user_id)
+
     return response_data
 
 def sanitize_assess_payload(body: dict) -> dict:
@@ -687,7 +688,7 @@ async def assess(request: Request, api_key: str = Depends(get_api_key_lenient)):
         except Exception as err:
             raise HTTPException(status_code=422, detail=str(err))
 
-    response_data = process_assessment_data(
+    response_data = await process_assessment_data(
         intent=intent,
         symptoms=symptoms,
         severity=severity,
@@ -994,6 +995,89 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
         "prompt_preview": dynamic_prompt[:300] + "..."
     }
 
+async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
+    """
+    Internal helper — executes the Bolna outbound call logic without going through
+    the FastAPI route. Called by the reminder scheduler to avoid the Depends() chain.
+    """
+    if not BOLNA_API_KEY:
+        raise RuntimeError("BOLNA_API_KEY not configured")
+
+    ctx = get_user_health_context(phone, days=7)
+    resolved_name = user_name or ctx.get("user_name", "there")
+
+    history_block = ""
+    if ctx.get("has_history") and ctx.get("summary_lines"):
+        lines = ctx["summary_lines"]
+        history_block = (
+            "\n\nIMPORTANT — This patient's recent health history:\n"
+            + "\n".join(f"  \u2022 {line}" for line in lines)
+            + "\n\nStart the call by warmly asking a specific follow-up about the most recent symptoms listed above."
+        )
+    else:
+        history_block = (
+            "\n\nThis is a routine wellness check. No recent health history found. "
+            "Start by asking: 'How have you been feeling lately?'"
+        )
+
+    medical_context = ""
+    conditions = ctx.get("medical_conditions")
+    notes = ctx.get("medical_notes")
+    if conditions or notes:
+        medical_context = "\n\nPATIENT MEDICAL CONTEXT:\n"
+        if conditions:
+            medical_context += f"Medical Conditions: {', '.join(conditions)}\n"
+        if notes:
+            medical_context += f"Doctor/Caregiver Notes: {notes}\n"
+        medical_context += "Keep these conditions in mind but do not alarm the patient."
+
+    dynamic_prompt = BASE_SYSTEM_PROMPT.replace("[elder_name]", resolved_name) + medical_context + history_block
+
+    user_profile = get_user_by_phone(phone)
+    voice_id = user_profile.get("voice_id") if user_profile else None
+    tts_provider = user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
+    user_id_val = str(user_profile["user_id"]) if user_profile and user_profile.get("user_id") else ""
+
+    bolna_payload: Dict[str, Any] = {
+        "agent_id": BOLNA_AGENT_ID,
+        "recipient_phone_number": phone,
+        "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
+    }
+    task_config: Dict[str, Any] = {
+        "tools_config": {
+            "api_tools": {
+                "tools_params": {
+                    "assess_health_risk": {
+                        "param": {
+                            "intent": "%(intent)s",
+                            "symptoms": "%(symptoms)s",
+                            "severity": "%(severity)s",
+                            "confidence": "%(confidence)s",
+                            "user_id": user_id_val,
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if voice_id:
+        task_config["tools_config"]["synthesizer"] = {
+            "provider": tts_provider,
+            "provider_config": {"voice_id": voice_id},
+        }
+    bolna_payload["agent_config"] = {"tasks": [task_config]}
+
+    logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://api.bolna.ai/call",
+            headers={"Authorization": f"Bearer {BOLNA_API_KEY}", "Content-Type": "application/json"},
+            json=bolna_payload,
+        )
+    if resp.status_code not in (200, 201, 202):
+        raise RuntimeError(f"Bolna API returned {resp.status_code}: {resp.text}")
+    return resp.json()
+
 
 # ---------------------------------------------------------------------------
 # WhatsApp Test & Notification Endpoints
@@ -1163,7 +1247,7 @@ async def delete_family_contact_route(contact_id: str, api_key: str = Depends(ge
         logger.error(f"Error deleting family contact: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-from google import genai
+# genai already imported at module top
 
 @app.post("/upload-document")
 async def upload_document(
@@ -1188,10 +1272,11 @@ async def upload_document(
     try:
         upload_dir = os.path.join(os.path.dirname(__file__), "..", "uploads")
         os.makedirs(upload_dir, exist_ok=True)
-        
-        # Create a unique filename
+
+        # Create a safe filename — strip path components and dangerous characters
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        safe_filename = file.filename.replace(" ", "_")
+        raw_name = os.path.basename(file.filename or "upload")  # strip any directory component
+        safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name)  # allow only safe chars
         unique_filename = f"{timestamp}_{safe_filename}"
         file_path = os.path.join(upload_dir, unique_filename)
         
@@ -1252,34 +1337,33 @@ async def analyze_emotion_from_audio(recording_url: str) -> str:
         
     try:
         import tempfile
-        from google import genai
-        
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(recording_url)
+
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            resp = await http_client.get(recording_url)
             if resp.status_code != 200:
                 return ""
-                
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
             tmp_file.write(resp.content)
             tmp_path = tmp_file.name
-            
-        client = genai.Client(api_key=gemini_key)
-        uploaded_file = client.files.upload(file=tmp_path)
-        
+
+        gemini_client = genai.Client(api_key=gemini_key)
+        uploaded_file = gemini_client.files.upload(file=tmp_path)
+
         prompt = (
             "Listen to this audio call between an AI agent and an elderly patient. "
             "Analyze the tone of the patient's voice. Do they sound distressed, in pain, "
             "confused, anxious, or calm? Reply with exactly one emotion emoji, followed by a short 1-sentence explanation. "
-            "For example: '😟 The patient's voice sounds shaky and tired, indicating mild distress.' or "
-            "'😊 The patient sounds calm and relaxed.' If they sound in pain, say "
-            "'😖 The patient's voice indicates physical discomfort.'"
+            "For example: '\U0001f61f The patient's voice sounds shaky and tired, indicating mild distress.' or "
+            "'\U0001f60a The patient sounds calm and relaxed.' If they sound in pain, say "
+            "'\U0001f616 The patient's voice indicates physical discomfort.'"
         )
-        
-        response = client.models.generate_content(
+
+        response = gemini_client.models.generate_content(
             model="gemini-2.0-flash",
             contents=[uploaded_file, prompt]
         )
-        
+
         os.remove(tmp_path)
         return response.text.strip()
     except Exception as e:
@@ -1289,6 +1373,59 @@ async def analyze_emotion_from_audio(recording_url: str) -> str:
 # ---------------------------------------------------------------------------
 # Bolna Webhooks
 # ---------------------------------------------------------------------------
+
+async def analyze_transcript_for_health_issues(transcript: str) -> dict:
+    """Uses Gemini to extract symptoms, severity, and intent from the full call transcript."""
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        logger.warning("No GEMINI_API_KEY for transcript analysis.")
+        return {"symptoms": [], "severity": "low", "intent": "health_check"}
+
+    prompt = f"""
+Analyze the following conversation transcript between a health assistant and a patient.
+Extract the following information:
+1. symptoms: A list of medical symptoms or complaints the patient mentioned (e.g. ["chest pain", "fever"]). Empty list if none.
+2. severity: The overall risk severity of the condition ('low', 'medium', 'high', 'critical'). Critical/high if emergency symptoms like chest pain or breathing issues are present.
+3. intent: The primary intent of the call (e.g. 'health_check', 'emergency').
+
+Respond ONLY with a valid JSON object matching this exact schema:
+{{
+  "symptoms": ["string"],
+  "severity": "string",
+  "intent": "string"
+}}
+
+Transcript:
+{transcript}
+"""
+    try:
+        def _call(model_name: str):
+            client = genai.Client(api_key=gemini_key)
+            return client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                )
+            )
+        # Try 2.5-flash first; fall back to 2.0-flash if it's overloaded
+        try:
+            response = await asyncio.to_thread(_call, "gemini-2.5-flash")
+        except Exception as e503:
+            if "503" in str(e503) or "UNAVAILABLE" in str(e503):
+                logger.warning("gemini-2.5-flash overloaded, retrying with gemini-2.0-flash...")
+                response = await asyncio.to_thread(_call, "gemini-2.0-flash")
+            else:
+                raise
+        data = json.loads(response.text)
+        return {
+            "symptoms": data.get("symptoms", []),
+            "severity": data.get("severity", "low").lower(),
+            "intent": data.get("intent", "health_check")
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing transcript with Gemini: {e}")
+        return {"symptoms": [], "severity": "low", "intent": "health_check"}
 
 @app.post("/bolna-webhook", tags=["Webhooks"])
 async def bolna_webhook(request: Request):
@@ -1408,19 +1545,41 @@ async def bolna_webhook(request: Request):
                 emotion_analysis = await analyze_emotion_from_audio(recording_url)
 
             extracted = _find_extraction_data(payload)
-            if extracted:
-                logger.info(f"[WEBHOOK] Found extraction data from successful call: {extracted}")
+            
+            symptoms = []
+            severity = "low"
+            intent = "health_check"
+
+            if formatted_transcript:
+                logger.info("[WEBHOOK] Analyzing transcript with Gemini for health issues...")
+                analysis = await analyze_transcript_for_health_issues(formatted_transcript)
+                symptoms = analysis.get("symptoms", [])
+                severity = analysis.get("severity", "low")
+                intent = analysis.get("intent", "health_check")
+                
+                # Fallback to Bolna extraction if Gemini found nothing
+                if extracted and not symptoms:
+                    bolna_symptoms = extracted.get("symptoms", [])
+                    if isinstance(bolna_symptoms, str): bolna_symptoms = [bolna_symptoms]
+                    symptoms = bolna_symptoms
+                    severity = extracted.get("severity", severity)
+                    intent = extracted.get("intent", intent)
+            elif extracted:
+                logger.info(f"[WEBHOOK] No transcript, using Bolna extraction data: {extracted}")
                 symptoms = extracted.get("symptoms", [])
                 if isinstance(symptoms, str):
                     symptoms = [symptoms]
                 severity = extracted.get("severity", "medium")
                 intent = extracted.get("intent", "health_check")
-                
+            else:
+                logger.info(f"[WEBHOOK] Call completed, but no extraction data or transcript found.")
+
+            # If we have any data to process (either from transcript, or Bolna extracted)
+            if formatted_transcript or extracted:
                 user_profile = get_user_by_phone(phone)
                 user_id = str(user_profile["user_id"]) if user_profile and "user_id" in user_profile else None
                 
-                # Let the assessment logic evaluate it and send alerts if needed
-                process_assessment_data(
+                await process_assessment_data(
                     intent=intent,
                     symptoms=symptoms,
                     severity=severity,
@@ -1430,22 +1589,6 @@ async def bolna_webhook(request: Request):
                     transcript=formatted_transcript if formatted_transcript else None,
                     emotion_analysis=emotion_analysis
                 )
-            else:
-                # Still log the interaction with just the transcript if available
-                if formatted_transcript:
-                    user_profile = get_user_by_phone(phone)
-                    user_id = str(user_profile["user_id"]) if user_profile and "user_id" in user_profile else None
-                    process_assessment_data(
-                        intent="health_check",
-                        symptoms=[],
-                        severity="low",
-                        confidence=1.0,
-                        user_id=user_id,
-                        recording_url=recording_url,
-                        transcript=formatted_transcript,
-                        emotion_analysis=emotion_analysis
-                    )
-                logger.info(f"[WEBHOOK] Call completed, but no extraction data found.")
 
         return {"status": "ok"}
     except Exception as e:
