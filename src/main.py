@@ -935,49 +935,19 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     user_id_val = str(user_profile.get("user_id", "")) if user_profile else ""
     
     async with httpx.AsyncClient(timeout=30) as client:
-        # GET the agent config first to avoid resetting any permanent defaults
-        agent_resp = await client.get(
-            f"https://api.bolna.ai/agent/{BOLNA_AGENT_ID}",
-            headers={"Authorization": f"Bearer {BOLNA_API_KEY}"}
-        )
-        if agent_resp.status_code == 200:
-            agent_config = agent_resp.json()
-            if "agent_prompts" not in agent_config:
-                agent_config["agent_prompts"] = {"task_1": {}}
-            agent_config["agent_prompts"]["task_1"]["system_prompt"] = dynamic_prompt
-            
-            if voice_id and "tasks" in agent_config and len(agent_config["tasks"]) > 0:
-                try:
-                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider_config"]["voice_id"] = voice_id
-                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider"] = tts_provider
-                except KeyError:
-                    pass
-            
-            # Make sure hangup_after_silence is reasonably long
-            try:
-                agent_config["tasks"][0]["task_config"]["hangup_after_silence"] = 30
-            except KeyError:
-                pass
-                
-            bolna_payload = {
-                "agent_id": BOLNA_AGENT_ID,
-                "recipient_phone_number": normalized_phone,
-                "agent_config": agent_config,
-                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
-            }
-        else:
-            logger.warning(f"Failed to fetch agent config: {agent_resp.text}")
-            # Fallback
-            bolna_payload = {
-                "agent_id": BOLNA_AGENT_ID,
-                "recipient_phone_number": normalized_phone,
-                "agent_prompts": {
-                    "task_1": {
-                        "system_prompt": dynamic_prompt
-                    }
-                },
-                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
-            }
+        # We only pass the specific prompts and webhook overrides we need.
+        # Passing the entire fetched agent_config causes immediate call drops due to conflicting metadata (e.g. id, created_at).
+        bolna_payload = {
+            "agent_id": BOLNA_AGENT_ID,
+            "recipient_phone_number": normalized_phone,
+            "agent_prompts": {
+                "task_1": {
+                    "system_prompt": dynamic_prompt
+                }
+            },
+            "webhook": "https://wellring-backend.onrender.com/bolna-webhook",
+            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
+        }
             
         if user_id_val:
             bolna_payload["metadata"] = {"user_id": user_id_val}
@@ -1064,41 +1034,13 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
 
     logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
     async with httpx.AsyncClient(timeout=30) as client:
-        agent_resp = await client.get(
-            f"https://api.bolna.ai/agent/{BOLNA_AGENT_ID}",
-            headers={"Authorization": f"Bearer {BOLNA_API_KEY}"}
-        )
-        if agent_resp.status_code == 200:
-            agent_config = agent_resp.json()
-            if "agent_prompts" not in agent_config:
-                agent_config["agent_prompts"] = {"task_1": {}}
-            agent_config["agent_prompts"]["task_1"]["system_prompt"] = dynamic_prompt
-            
-            if voice_id and "tasks" in agent_config and len(agent_config["tasks"]) > 0:
-                try:
-                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider_config"]["voice_id"] = voice_id
-                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider"] = tts_provider
-                except KeyError:
-                    pass
-            
-            try:
-                agent_config["tasks"][0]["task_config"]["hangup_after_silence"] = 30
-            except KeyError:
-                pass
-                
-            bolna_payload: Dict[str, Any] = {
-                "agent_id": BOLNA_AGENT_ID,
-                "recipient_phone_number": phone,
-                "agent_config": agent_config,
-                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
-            }
-        else:
-            bolna_payload = {
-                "agent_id": BOLNA_AGENT_ID,
-                "recipient_phone_number": phone,
-                "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
-                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
-            }
+        bolna_payload: Dict[str, Any] = {
+            "agent_id": BOLNA_AGENT_ID,
+            "recipient_phone_number": phone,
+            "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
+            "webhook": "https://wellring-backend.onrender.com/bolna-webhook",
+            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
+        }
             
         if user_id_val:
             bolna_payload["metadata"] = {"user_id": user_id_val}
