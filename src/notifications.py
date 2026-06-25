@@ -135,9 +135,9 @@ def build_routine_update_message(
 
     if symptoms:
         sym_str = ", ".join(s.replace("_", " ").title() for s in symptoms)
-        health_line = f"They mentioned: {sym_str}. Everything looks manageable."
+        health_line = f"Yeah, {patient_name} has minor complaints ({sym_str}) but is generally fine and doing well."
     else:
-        health_line = "They reported feeling okay today. No serious concerns."
+        health_line = f"Yeah, {patient_name} is fine and doing well."
 
     msg = (
         f"{emoji} *WellRing Daily Update*\n\n"
@@ -344,7 +344,7 @@ def trigger_alerts_if_needed(
                 caregiver_name=name,
             )
 
-    elif os.environ.get("USE_ROUTINE_UPDATES", "false").lower() == "true":
+    else:
         # Quiet daily update for low-risk check-ins
         for contact in family_contacts:
             phone = contact["phone"]

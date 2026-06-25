@@ -962,7 +962,17 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
         }
 
     bolna_payload["agent_config"] = {
-        "tasks": [task_config]
+        "tasks": [task_config],
+        "engine": {
+            "transcription": {
+                "interruption_threshold": 1,
+                "generate_precise_transcript": True
+            },
+            "response_latency": {
+                "endpointing_ms": 200,
+                "linear_delay_ms": 50
+            }
+        }
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -1065,7 +1075,19 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
             "provider": tts_provider,
             "provider_config": {"voice_id": voice_id},
         }
-    bolna_payload["agent_config"] = {"tasks": [task_config]}
+    bolna_payload["agent_config"] = {
+        "tasks": [task_config],
+        "engine": {
+            "transcription": {
+                "interruption_threshold": 1,
+                "generate_precise_transcript": True
+            },
+            "response_latency": {
+                "endpointing_ms": 200,
+                "linear_delay_ms": 50
+            }
+        }
+    }
 
     logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
     async with httpx.AsyncClient(timeout=30) as client:
