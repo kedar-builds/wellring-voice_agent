@@ -1456,17 +1456,28 @@ async def bolna_webhook(request: Request):
         payload = await request.json()
         logger.info(f"[WEBHOOK] Received Bolna webhook: {payload}")
         
-        # Bolna sends the status or call_status, and sometimes an error_message
-        status = payload.get("status") or payload.get("call_status") or "unknown"
-        phone = payload.get("recipient_phone_number") or payload.get("phone_number") or payload.get("to")
-        
-        if not phone:
-            # Check if it's nested in something like execution_data or request
-            req_data = payload.get("request", {})
-            phone = req_data.get("recipient_phone_number") or req_data.get("phone_number")
+        def _find_key(data, target_keys):
+            if isinstance(data, dict):
+                for k in target_keys:
+                    if k in data and data[k]:
+                        return data[k]
+                for k, v in data.items():
+                    res = _find_key(v, target_keys)
+                    if res:
+                        return res
+            elif isinstance(data, list):
+                for item in data:
+                    res = _find_key(item, target_keys)
+                    if res:
+                        return res
+            return None
+
+        # Robustly find status and phone from deeply nested Bolna payloads
+        status = _find_key(payload, ["status", "call_status"]) or "unknown"
+        phone = _find_key(payload, ["recipient_phone_number", "phone_number", "to"])
         
         # If it's a failed or unanswered call, send a WhatsApp alert
-        if status in ("no-answer", "failed", "busy", "canceled", "error"):
+        if status in ("no-answer", "no_answer", "failed", "busy", "canceled", "error", "unanswered", "not-answered", "not_answered"):
             logger.info(f"[WEBHOOK] Call to {phone} ended with status: {status}. Sending alert...")
             
             # Lookup the patient by phone to get family contacts
