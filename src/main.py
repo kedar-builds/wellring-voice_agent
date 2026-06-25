@@ -1598,7 +1598,32 @@ async def bolna_webhook(request: Request):
                 severity = extracted.get("severity", "medium")
                 intent = extracted.get("intent", "health_check")
             else:
-                logger.info(f"[WEBHOOK] Call completed, but no extraction data or transcript found.")
+                logger.info(f"[WEBHOOK] Call completed, but no extraction data or transcript found. Treating as missed call.")
+                user_profile = get_user_by_phone(phone)
+                patient_name = user_profile.get("name", "your loved one") if user_profile else "your loved one"
+                
+                contacts = []
+                if user_profile and "user_id" in user_profile:
+                    contacts = get_family_contacts(str(user_profile["user_id"]))
+                
+                if contacts:
+                    for contact in contacts:
+                        contact_phone = contact.get("phone")
+                        contact_name = contact.get("name")
+                        if contact_phone:
+                            send_unanswered_call_alert(
+                                to_phone=contact_phone,
+                                patient_name=patient_name,
+                                caregiver_name=contact_name
+                            )
+                else:
+                    fallback_phone = os.environ.get("CAREGIVER_PHONE")
+                    if fallback_phone:
+                        send_unanswered_call_alert(
+                            to_phone=fallback_phone,
+                            patient_name=patient_name,
+                            caregiver_name="Caregiver"
+                        )
 
             # If we have any data to process (either from transcript, or Bolna extracted)
             if formatted_transcript or extracted:
