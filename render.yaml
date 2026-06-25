@@ -6,18 +6,17 @@ services:
     plan: free
     branch: atharva-voice-work
     envVars:
-      - key: USE_SUPABASE
-        value: "false"
-      - key: USE_TWILIO
-        value: "true"
-      - key: USE_WHATSAPP
-        value: "true"
-      - key: USE_ROUTINE_UPDATES
-        value: "false"
-      - key: SUPABASE_URL
-        value: ""
-      - key: SUPABASE_KEY
-        value: ""
+      # --- Required secrets (set in Render dashboard, never committed) ---
+      - key: WELLRING_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: BOLNA_API_KEY
+        sync: false
+      - key: BOLNA_AGENT_ID
+        sync: false
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN
@@ -26,5 +25,21 @@ services:
         sync: false
       - key: CAREGIVER_PHONE
         sync: false
-      - key: WELLRING_API_KEY
-        sync: false
+
+      # --- Feature flags (safe to commit) ---
+      - key: USE_SUPABASE
+        value: "false"
+      - key: USE_TWILIO
+        value: "true"
+      - key: USE_WHATSAPP
+        value: "true"
+      - key: USE_ROUTINE_UPDATES
+        value: "false"
+      - key: DEBUG
+        value: "false"
+
+      # --- Supabase (disabled by default) ---
+      - key: SUPABASE_URL
+        value: ""
+      - key: SUPABASE_KEY
+        value: ""

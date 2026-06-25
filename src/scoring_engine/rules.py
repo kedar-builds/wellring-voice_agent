@@ -138,15 +138,16 @@ CATEGORY_PRIORITY: Dict[str, int] = {
 }
 
 # ---------------------------------------------------------------------------
-# NOTE — Future: Repeated-Symptom History Multiplier
+# Repeated-Symptom History Multiplier (implemented in scoring.py)
 # ---------------------------------------------------------------------------
-# When a user reports the same symptom on consecutive days, the risk should
-# escalate. Suggested logic (not yet implemented):
+# When a user reports the same symptom on consecutive days the risk escalates
+# via the history_counts multiplier in calculate_score():
 #
-#   day 1 → score = base_score * 1.0
-#   day 2 → score = base_score * 1.5
-#   day 3 → score = base_score * 2.0
+#   repeat_count 0 → multiplier = 1.0  (first occurrence)
+#   repeat_count 1 → multiplier = 1.2
+#   repeat_count 2 → multiplier = 1.4
+#   repeat_count N → multiplier = min(1.0 + N * 0.2, 2.0)  (capped at 2×)
 #
-# This requires a persistent session store (e.g. Redis or SQLite) keyed on
-# user_id + symptom. Tag this with: TODO(history-escalation)
+# history_counts is populated from the database (get_symptom_repeat_count)
+# before scoring, keyed on symptom + optional user_id.
 
