@@ -1063,31 +1063,11 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
 
     logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
     async with httpx.AsyncClient(timeout=30) as client:
-        task_config = {
-            "tools_config": {
-                "api_tools": {
-                    "tools_params": {
-                        "assess_health_risk": {
-                            "param": {
-                                "intent": "%(intent)s",
-                                "symptoms": "%(symptoms)s",
-                                "severity": "%(severity)s",
-                                "confidence": "%(confidence)s",
-                                "user_id": user_id_val
-                            }
-                        }
-                    }
-                }
-            }
-        }
         bolna_payload: Dict[str, Any] = {
             "agent_id": BOLNA_AGENT_ID,
             "recipient_phone_number": phone,
             "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
-            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook",
-            "agent_config": {
-                "tasks": [task_config]
-            }
+            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
         }
             
         if user_id_val:
