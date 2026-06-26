@@ -937,6 +937,23 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     async with httpx.AsyncClient(timeout=30) as client:
         # We only pass the specific prompts and webhook overrides we need.
         # Passing the entire fetched agent_config causes immediate call drops due to conflicting metadata (e.g. id, created_at).
+        task_config = {
+            "tools_config": {
+                "api_tools": {
+                    "tools_params": {
+                        "assess_health_risk": {
+                            "param": {
+                                "intent": "%(intent)s",
+                                "symptoms": "%(symptoms)s",
+                                "severity": "%(severity)s",
+                                "confidence": "%(confidence)s",
+                                "user_id": user_id_val
+                            }
+                        }
+                    }
+                }
+            }
+        }
         bolna_payload = {
             "agent_id": BOLNA_AGENT_ID,
             "recipient_phone_number": normalized_phone,
@@ -945,8 +962,20 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
                     "system_prompt": dynamic_prompt
                 }
             },
-            "webhook": "https://wellring-backend.onrender.com/bolna-webhook",
-            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
+            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook",
+            "agent_config": {
+                "tasks": [task_config],
+                "engine": {
+                    "transcription": {
+                        "interruption_threshold": 1,
+                        "generate_precise_transcript": True
+                    },
+                    "response_latency": {
+                        "endpointing_ms": 200,
+                        "linear_delay_ms": 50
+                    }
+                }
+            }
         }
             
         if user_id_val:
@@ -1034,12 +1063,31 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
 
     logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
     async with httpx.AsyncClient(timeout=30) as client:
+        task_config = {
+            "tools_config": {
+                "api_tools": {
+                    "tools_params": {
+                        "assess_health_risk": {
+                            "param": {
+                                "intent": "%(intent)s",
+                                "symptoms": "%(symptoms)s",
+                                "severity": "%(severity)s",
+                                "confidence": "%(confidence)s",
+                                "user_id": user_id_val
+                            }
+                        }
+                    }
+                }
+            }
+        }
         bolna_payload: Dict[str, Any] = {
             "agent_id": BOLNA_AGENT_ID,
             "recipient_phone_number": phone,
             "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
-            "webhook": "https://wellring-backend.onrender.com/bolna-webhook",
-            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
+            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook",
+            "agent_config": {
+                "tasks": [task_config]
+            }
         }
             
         if user_id_val:
