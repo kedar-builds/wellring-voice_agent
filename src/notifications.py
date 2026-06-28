@@ -345,20 +345,35 @@ def trigger_alerts_if_needed(
             )
 
     else:
-        # Quiet daily update for low-risk check-ins
+        # Routine update for LOW/MEDIUM check-ins — always notify family
+        # that the elder answered and completed the check-in.
         for contact in family_contacts:
             phone = contact["phone"]
             name = contact["name"]
+            logger.info(f"[NOTIFY] {risk_level} routine update → {phone}")
             body = build_routine_update_message(
                 patient_name=patient_name,
                 caregiver_name=name,
                 symptoms=response_data.get("symptoms", []),
                 risk_level=risk_level,
             )
+            sent = False
             if USE_TWILIO:
-                _twilio_send(phone, body)
+                sent = _twilio_send(phone, body)
             else:
                 logger.info(f"[ROUTINE MOCK → {phone}]\n{body}")
+                sent = True  # treat mock as success
+
+            # Always log the routine notification so it's traceable
+            log_alert(
+                interaction_id=interaction_id,
+                timestamp=datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z",
+                risk_level=risk_level,
+                notification_type="whatsapp" if USE_WHATSAPP else "sms",
+                status="sent" if sent else "failed",
+                recipient_phone=phone,
+                recipient_name=name,
+            )
 
 
 def send_whatsapp_reminder(to_phone: str, body: str) -> bool:
