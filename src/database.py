@@ -1518,3 +1518,212 @@ def _get_all_patients_sqlite(db_path: Optional[str] = None) -> List[Dict[str, An
             "status": "active",
         })
     return result
+
+
+# ===========================================================================
+# Call Timeline  (conversation history keyed by phone number)
+# ===========================================================================
+
+def _make_diary_line(name: str, symptoms: List[str], risk_level: str, message: str) -> str:
+    """
+    Convert raw assessment data into a natural, human-readable diary sentence.
+
+    Examples:
+        "Mr. Sharma was feeling good and well"
+        "Mr. Sharma was experiencing fever and headache"
+        "Mr. Sharma reported chest pain — urgent attention needed"
+    """
+    name = name or "the patient"
+    risk = (risk_level or "LOW").upper()
+    syms = [s.strip().replace("_", " ") for s in (symptoms or []) if s]
+
+    if risk == "CRITICAL":
+        if syms:
+            return f"{name} reported {', '.join(syms[:3])} — emergency attention required"
+        return f"{name} had a critical health event — emergency attention required"
+
+    if risk == "HIGH":
+        if syms:
+            return f"{name} reported {', '.join(syms[:3])} — caregiver was notified"
+        return f"{name} had a high-risk health event — caregiver was notified"
+
+    if risk == "MEDIUM":
+        if syms:
+            return f"{name} was experiencing {', '.join(syms[:3])}"
+        return f"{name} had some discomfort — routine monitoring advised"
+
+    # LOW
+    if syms:
+        return f"{name} mentioned {', '.join(syms[:2])} but was otherwise doing okay"
+    return f"{name} was feeling good and well"
+
+
+def get_call_timeline(phone: str, limit: int = 365) -> List[Dict[str, Any]]:
+    """
+    Fetch the full conversation/call history for an elder by phone number.
+
+    Returns a list ordered oldest → newest, each entry containing:
+        assessment_id  — unique ID
+        date           — "1 Jan 2026"
+        time           — "10:00 AM"
+        diary_line     — human-readable sentence: "Mr. Sharma was feeling good"
+        risk_level     — LOW / MEDIUM / HIGH / CRITICAL
+        symptoms       — list of symptom strings
+        score          — integer risk score
+    """
+    if _use_postgres() and _PG_AVAILABLE:
+        return _get_call_timeline_pg(phone, limit)
+    return _get_call_timeline_sqlite(phone, limit)
+
+
+def _get_call_timeline_pg(phone: str, limit: int) -> List[Dict[str, Any]]:
+    """PostgreSQL implementation."""
+    phone_clean = phone.replace(" ", "").replace("-", "")
+
+    user_sql = """
+        SELECT user_id, name
+        FROM   users
+        WHERE  phone = %(phone)s OR phone = %(phone_clean)s
+        LIMIT  1
+    """
+    assess_sql = """
+        SELECT assessment_id, assessed_at, symptoms, risk_level,
+               score, message, severity
+        FROM   assessments
+        WHERE  user_id = %(user_id)s
+        ORDER  BY assessed_at ASC
+        LIMIT  %(limit)s
+    """
+
+    try:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                cur.execute(user_sql, {"phone": phone, "phone_clean": phone_clean})
+                user_row = cur.fetchone()
+                if not user_row:
+                    return []
+                user_id   = str(user_row["user_id"])
+                user_name = user_row["name"] or "the patient"
+
+                cur.execute(assess_sql, {"user_id": user_id, "limit": limit})
+                rows = cur.fetchall()
+
+        result = []
+        for r in rows:
+            ts = r["assessed_at"]
+            if ts is None:
+                continue
+            # Convert timezone-aware timestamp to IST for display
+            ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+            ts_ist = ts.astimezone(ist) if ts.tzinfo else ts
+
+            symptoms = list(r["symptoms"] or [])
+            risk     = r["risk_level"] or "LOW"
+            score    = r["score"] or 0
+            msg      = r["message"] or ""
+
+            result.append({
+                "assessment_id": str(r["assessment_id"]),
+                "date":          ts_ist.strftime("%-d %b %Y"),        # "1 Jan 2026"
+                "time":          ts_ist.strftime("%-I:%M %p"),         # "10:00 AM"
+                "iso_timestamp": ts_ist.isoformat(),
+                "diary_line":    _make_diary_line(user_name, symptoms, risk, msg),
+                "risk_level":    risk,
+                "symptoms":      symptoms,
+                "score":         score,
+                "elder_name":    user_name,
+            })
+        return result
+
+    except Exception as exc:
+        logger.error(f"[TIMELINE] Postgres query failed: {exc}")
+        return []
+
+
+def _get_call_timeline_sqlite(phone: str, limit: int, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """SQLite fallback — looks up user by phone, then queries interactions table."""
+    db_path = _resolve_db_path(db_path)
+    phone_clean = phone.replace(" ", "").replace("-", "")
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        # Find user by phone
+        cur.execute(
+            "SELECT user_id, name FROM users WHERE phone = ? OR phone = ? LIMIT 1",
+            (phone, phone_clean),
+        )
+        user_row = cur.fetchone()
+
+        if user_row:
+            user_id   = str(user_row["user_id"])
+            user_name = user_row["name"] or "the patient"
+            cur.execute(
+                """
+                SELECT id, timestamp, symptoms, risk_level, score, message
+                FROM   interactions
+                WHERE  user_id = ?
+                ORDER  BY timestamp ASC
+                LIMIT  ?
+                """,
+                (user_id, limit),
+            )
+        else:
+            # Fallback: no user filter, return all interactions
+            user_name = "the patient"
+            cur.execute(
+                """
+                SELECT id, timestamp, symptoms, risk_level, score, message
+                FROM   interactions
+                ORDER  BY timestamp ASC
+                LIMIT  ?
+                """,
+                (limit,),
+            )
+
+        rows = cur.fetchall()
+        conn.close()
+
+        result = []
+        for r in rows:
+            ts_raw = r["timestamp"] or ""
+            try:
+                # Parse ISO string — strip trailing Z for fromisoformat compat
+                ts = datetime.datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+                ts_ist = ts.astimezone(ist)
+                date_str = ts_ist.strftime("%-d %b %Y")
+                time_str = ts_ist.strftime("%-I:%M %p")
+                iso_str  = ts_ist.isoformat()
+            except Exception:
+                date_str = ts_raw[:10]
+                time_str = ts_raw[11:16]
+                iso_str  = ts_raw
+
+            try:
+                symptoms = json.loads(r["symptoms"] or "[]")
+            except Exception:
+                symptoms = []
+
+            risk  = r["risk_level"] or "LOW"
+            score = r["score"] or 0
+            msg   = r["message"] or ""
+
+            result.append({
+                "assessment_id": str(r["id"]),
+                "date":          date_str,
+                "time":          time_str,
+                "iso_timestamp": iso_str,
+                "diary_line":    _make_diary_line(user_name, symptoms, risk, msg),
+                "risk_level":    risk,
+                "symptoms":      symptoms,
+                "score":         score,
+                "elder_name":    user_name,
+            })
+        return result
+
+    except Exception as exc:
+        logger.error(f"[TIMELINE] SQLite query failed: {exc}")
+        return []

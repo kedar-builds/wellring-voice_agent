@@ -82,10 +82,9 @@ from src.database import (
     add_reminder, get_reminders, delete_reminder, update_reminder_trigger,
     get_assessments_list, get_assessment_stats, get_user_health_context,
     upsert_user_profile, get_user_profile, upsert_family_contacts, get_family_contacts, delete_family_contact,
-    add_single_family_contact, get_user_by_phone, get_call_timeline
+    add_single_family_contact, get_user_by_phone
 )
 from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp, send_unanswered_call_alert
-from src.watchdog import run_watchdog
 
 # ---------------------------------------------------------------------------
 # Background Reminder Scheduler
@@ -228,11 +227,10 @@ def seed_demo_data():
             logger.info("Demo reminders seeded successfully.")
 
 scheduler_task = None
-watchdog_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global scheduler_task, watchdog_task
+    global scheduler_task
     from src.database import init_pg_tables
     init_db()
     init_pg_tables()   # Creates PG tables if they don't exist (safe on each startup)
@@ -241,16 +239,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"[SEED] Demo data seeding failed (non-fatal): {e}")
     scheduler_task = asyncio.create_task(run_reminder_scheduler())
-    watchdog_task = asyncio.create_task(run_watchdog())  # 🧠 Nemotron system watchdog
     yield
-    # ---- shutdown ----
-    for task in (scheduler_task, watchdog_task):
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+    if scheduler_task:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
 
 from fastapi.responses import JSONResponse
 
@@ -783,35 +778,6 @@ def get_assessment_stats_endpoint(api_key: str = Depends(get_api_key)):
     return get_assessment_stats()
 
 
-@app.get("/timeline", tags=["Timeline"])
-def get_call_timeline_endpoint(
-    phone: str,
-    limit: int = 365,
-    api_key: str = Depends(get_api_key),
-):
-    """
-    Return the full call/conversation history for an elder by phone number.
-
-    Each entry has:
-      - date        : human-readable date  ("1 Jan 2026")
-      - time        : human-readable time  ("10:00 AM")
-      - diary_line  : natural sentence     ("Mr. Sharma was feeling good")
-      - risk_level  : LOW / MEDIUM / HIGH / CRITICAL
-      - symptoms    : list of symptoms
-      - score       : integer risk score
-
-    Results are ordered oldest → newest so the frontend can group by date.
-    """
-    if not phone:
-        raise HTTPException(status_code=422, detail="phone query parameter is required")
-    entries = get_call_timeline(phone=phone, limit=limit)
-    return {
-        "phone":   phone,
-        "total":   len(entries),
-        "entries": entries,
-    }
-
-
 @app.get("/patients", tags=["Dashboard"])
 def get_patients(api_key: str = Depends(get_api_key)):
     """Returns all registered elderly patients from the database."""
@@ -969,48 +935,49 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     user_id_val = str(user_profile.get("user_id", "")) if user_profile else ""
     
     async with httpx.AsyncClient(timeout=30) as client:
-        # We only pass the specific prompts and webhook overrides we need.
-        # Passing the entire fetched agent_config causes immediate call drops due to conflicting metadata (e.g. id, created_at).
-        task_config = {
-            "tools_config": {
-                "api_tools": {
-                    "tools_params": {
-                        "assess_health_risk": {
-                            "param": {
-                                "intent": "%(intent)s",
-                                "symptoms": "%(symptoms)s",
-                                "severity": "%(severity)s",
-                                "confidence": "%(confidence)s",
-                                "user_id": user_id_val
-                            }
-                        }
-                    }
-                }
+        # GET the agent config first to avoid resetting any permanent defaults
+        agent_resp = await client.get(
+            f"https://api.bolna.ai/agent/{BOLNA_AGENT_ID}",
+            headers={"Authorization": f"Bearer {BOLNA_API_KEY}"}
+        )
+        if agent_resp.status_code == 200:
+            agent_config = agent_resp.json()
+            if "agent_prompts" not in agent_config:
+                agent_config["agent_prompts"] = {"task_1": {}}
+            agent_config["agent_prompts"]["task_1"]["system_prompt"] = dynamic_prompt
+            
+            if voice_id and "tasks" in agent_config and len(agent_config["tasks"]) > 0:
+                try:
+                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider_config"]["voice_id"] = voice_id
+                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider"] = tts_provider
+                except KeyError:
+                    pass
+            
+            # Make sure hangup_after_silence is reasonably long
+            try:
+                agent_config["tasks"][0]["task_config"]["hangup_after_silence"] = 30
+            except KeyError:
+                pass
+                
+            bolna_payload = {
+                "agent_id": BOLNA_AGENT_ID,
+                "recipient_phone_number": normalized_phone,
+                "agent_config": agent_config,
+                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
             }
-        }
-        bolna_payload = {
-            "agent_id": BOLNA_AGENT_ID,
-            "recipient_phone_number": normalized_phone,
-            "agent_prompts": {
-                "task_1": {
-                    "system_prompt": dynamic_prompt
-                }
-            },
-            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook",
-            "agent_config": {
-                "tasks": [task_config],
-                "engine": {
-                    "transcription": {
-                        "interruption_threshold": 1,
-                        "generate_precise_transcript": True
-                    },
-                    "response_latency": {
-                        "endpointing_ms": 200,
-                        "linear_delay_ms": 50
+        else:
+            logger.warning(f"Failed to fetch agent config: {agent_resp.text}")
+            # Fallback
+            bolna_payload = {
+                "agent_id": BOLNA_AGENT_ID,
+                "recipient_phone_number": normalized_phone,
+                "agent_prompts": {
+                    "task_1": {
+                        "system_prompt": dynamic_prompt
                     }
-                }
+                },
+                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
             }
-        }
             
         if user_id_val:
             bolna_payload["metadata"] = {"user_id": user_id_val}
@@ -1097,12 +1064,41 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
 
     logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
     async with httpx.AsyncClient(timeout=30) as client:
-        bolna_payload: Dict[str, Any] = {
-            "agent_id": BOLNA_AGENT_ID,
-            "recipient_phone_number": phone,
-            "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
-            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
-        }
+        agent_resp = await client.get(
+            f"https://api.bolna.ai/agent/{BOLNA_AGENT_ID}",
+            headers={"Authorization": f"Bearer {BOLNA_API_KEY}"}
+        )
+        if agent_resp.status_code == 200:
+            agent_config = agent_resp.json()
+            if "agent_prompts" not in agent_config:
+                agent_config["agent_prompts"] = {"task_1": {}}
+            agent_config["agent_prompts"]["task_1"]["system_prompt"] = dynamic_prompt
+            
+            if voice_id and "tasks" in agent_config and len(agent_config["tasks"]) > 0:
+                try:
+                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider_config"]["voice_id"] = voice_id
+                    agent_config["tasks"][0]["tools_config"]["synthesizer"]["provider"] = tts_provider
+                except KeyError:
+                    pass
+            
+            try:
+                agent_config["tasks"][0]["task_config"]["hangup_after_silence"] = 30
+            except KeyError:
+                pass
+                
+            bolna_payload: Dict[str, Any] = {
+                "agent_id": BOLNA_AGENT_ID,
+                "recipient_phone_number": phone,
+                "agent_config": agent_config,
+                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
+            }
+        else:
+            bolna_payload = {
+                "agent_id": BOLNA_AGENT_ID,
+                "recipient_phone_number": phone,
+                "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
+                "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
+            }
             
         if user_id_val:
             bolna_payload["metadata"] = {"user_id": user_id_val}

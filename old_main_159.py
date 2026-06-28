@@ -82,10 +82,9 @@ from src.database import (
     add_reminder, get_reminders, delete_reminder, update_reminder_trigger,
     get_assessments_list, get_assessment_stats, get_user_health_context,
     upsert_user_profile, get_user_profile, upsert_family_contacts, get_family_contacts, delete_family_contact,
-    add_single_family_contact, get_user_by_phone, get_call_timeline
+    add_single_family_contact, get_user_by_phone
 )
 from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp, send_unanswered_call_alert
-from src.watchdog import run_watchdog
 
 # ---------------------------------------------------------------------------
 # Background Reminder Scheduler
@@ -228,11 +227,10 @@ def seed_demo_data():
             logger.info("Demo reminders seeded successfully.")
 
 scheduler_task = None
-watchdog_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global scheduler_task, watchdog_task
+    global scheduler_task
     from src.database import init_pg_tables
     init_db()
     init_pg_tables()   # Creates PG tables if they don't exist (safe on each startup)
@@ -241,16 +239,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"[SEED] Demo data seeding failed (non-fatal): {e}")
     scheduler_task = asyncio.create_task(run_reminder_scheduler())
-    watchdog_task = asyncio.create_task(run_watchdog())  # 🧠 Nemotron system watchdog
     yield
-    # ---- shutdown ----
-    for task in (scheduler_task, watchdog_task):
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+    if scheduler_task:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
 
 from fastapi.responses import JSONResponse
 
@@ -783,35 +778,6 @@ def get_assessment_stats_endpoint(api_key: str = Depends(get_api_key)):
     return get_assessment_stats()
 
 
-@app.get("/timeline", tags=["Timeline"])
-def get_call_timeline_endpoint(
-    phone: str,
-    limit: int = 365,
-    api_key: str = Depends(get_api_key),
-):
-    """
-    Return the full call/conversation history for an elder by phone number.
-
-    Each entry has:
-      - date        : human-readable date  ("1 Jan 2026")
-      - time        : human-readable time  ("10:00 AM")
-      - diary_line  : natural sentence     ("Mr. Sharma was feeling good")
-      - risk_level  : LOW / MEDIUM / HIGH / CRITICAL
-      - symptoms    : list of symptoms
-      - score       : integer risk score
-
-    Results are ordered oldest → newest so the frontend can group by date.
-    """
-    if not phone:
-        raise HTTPException(status_code=422, detail="phone query parameter is required")
-    entries = get_call_timeline(phone=phone, limit=limit)
-    return {
-        "phone":   phone,
-        "total":   len(entries),
-        "entries": entries,
-    }
-
-
 @app.get("/patients", tags=["Dashboard"])
 def get_patients(api_key: str = Depends(get_api_key)):
     """Returns all registered elderly patients from the database."""
@@ -878,25 +844,21 @@ def remove_reminder(reminder_id: int, api_key: str = Depends(get_api_key)):
 BOLNA_API_KEY = os.environ.get("BOLNA_API_KEY", "")
 BOLNA_AGENT_ID = os.environ.get("BOLNA_AGENT_ID", "ab32d1ed-a6ae-4581-a712-c7f5e235f9f0")
 
-BASE_SYSTEM_PROMPT = """You are Riley, a warm and caring health assistant from WellRing calling to check on an elderly patient named [elder_name].
+BASE_SYSTEM_PROMPT = """You are Riley, a warm and caring health assistant from WellRing calling to check on an elderly patient.
 
-Your goal is to have a friendly 2-3 minute health check-in conversation.
+Your role:
+- HIPAA IDENTITY VERIFICATION (CRITICAL): Start the call by saying EXACTLY: "Hello, am I speaking to [elder_name]?" Do not proceed until they confirm they are the correct person. If they say no, or refuse to confirm after 2 attempts, say "I must only speak to the patient for privacy reasons. Have a good day." and immediately HANG UP.
+- If their identity is confirmed, gently ask how they are feeling.
+- If they had symptoms recently, ask a specific follow-up (e.g. "Yesterday you mentioned fever — has your temperature come down?")
+- Listen carefully for any new or worsening symptoms.
+- If they mention chest pain, difficulty breathing, stroke symptoms, or unconsciousness — immediately say: "This sounds urgent. Please call emergency services at 112 right now. I will also alert your caregiver."
+- After talking, call the assess_health_risk tool to log the outcome.
 
-How to run the call:
-- Start by saying: "Hello! This is Riley calling from WellRing. Am I speaking with [elder_name]?"
-- Once they respond (any response), warmly greet them and ask how they are feeling today.
-- Ask gently about their sleep, appetite, energy levels, and any aches or pains.
-- If they mention any symptoms, listen carefully and ask one follow-up question.
-- If they mention chest pain, difficulty breathing, or a fall — say: "That sounds serious. Please call 112 right away, and I will also let your family know."
-- After gathering health info, call the assess_health_risk tool to log the outcome.
-- End the call warmly: "Thank you for chatting with me today. Take care and have a good day!"
-
-Rules:
-- Keep responses SHORT — one or two sentences maximum.
-- Be warm, slow, and patient. They may take time to respond.
-- NEVER hang up abruptly. Always say a warm goodbye before ending.
-- Do NOT end the call until you have asked at least 2-3 health questions.
-- If there is silence, gently say "Are you still there?" and wait."""
+Speaking style:
+- Speak in short, simple, warm sentences.
+- Never use medical jargon.
+- Be patient — they may speak slowly.
+- CRITICAL: When the conversation is naturally finished and you have gathered the required info, you MUST say a clear goodbye and immediately HANG UP the call to end it. Do not leave the line open."""
 
 
 class CallRequest(BaseModel):
@@ -917,16 +879,8 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     if not BOLNA_API_KEY:
         raise HTTPException(status_code=500, detail="BOLNA_API_KEY not configured")
 
-    # Normalize phone: strip spaces/dashes, prepend +91 for 10-digit Indian numbers
-    raw_phone = str(payload.phone).strip().replace(' ', '').replace('-', '')
-    if raw_phone.startswith('0'):
-        raw_phone = '+91' + raw_phone[1:]
-    elif not raw_phone.startswith('+') and len(raw_phone) == 10:
-        raw_phone = '+91' + raw_phone
-    normalized_phone = raw_phone
-
     # 1. Fetch health context from DB
-    ctx = get_user_health_context(normalized_phone, days=7)
+    ctx = get_user_health_context(payload.phone, days=7)
     user_name = payload.user_name or ctx.get("user_name", "there")
 
     # 2. Build personalised prompt
@@ -966,55 +920,62 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     logger.info(f"[CALL] Initiating call to {payload.phone} | history={ctx.get('has_history')} | user={user_name} | voice_id={voice_id}")
 
     # 3. Call Bolna API
-    user_id_val = str(user_profile.get("user_id", "")) if user_profile else ""
-    
-    async with httpx.AsyncClient(timeout=30) as client:
-        # We only pass the specific prompts and webhook overrides we need.
-        # Passing the entire fetched agent_config causes immediate call drops due to conflicting metadata (e.g. id, created_at).
-        task_config = {
-            "tools_config": {
-                "api_tools": {
-                    "tools_params": {
-                        "assess_health_risk": {
-                            "param": {
-                                "intent": "%(intent)s",
-                                "symptoms": "%(symptoms)s",
-                                "severity": "%(severity)s",
-                                "confidence": "%(confidence)s",
-                                "user_id": user_id_val
-                            }
+    bolna_payload = {
+        "agent_id": BOLNA_AGENT_ID,
+        "recipient_phone_number": payload.phone,
+        "agent_prompts": {
+            "task_1": {
+                "system_prompt": dynamic_prompt
+            }
+        }
+    }
+
+    # Define the dynamic agent_config to pass the patient's user_id to the risk assessment tool
+    user_id_val = ""
+    if user_profile and user_profile.get("user_id"):
+        user_id_val = str(user_profile.get("user_id"))
+
+    task_config = {
+        "tools_config": {
+            "api_tools": {
+                "tools_params": {
+                    "assess_health_risk": {
+                        "param": {
+                            "intent": "%(intent)s",
+                            "symptoms": "%(symptoms)s",
+                            "severity": "%(severity)s",
+                            "confidence": "%(confidence)s",
+                            "user_id": user_id_val
                         }
                     }
                 }
             }
         }
-        bolna_payload = {
-            "agent_id": BOLNA_AGENT_ID,
-            "recipient_phone_number": normalized_phone,
-            "agent_prompts": {
-                "task_1": {
-                    "system_prompt": dynamic_prompt
-                }
-            },
-            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook",
-            "agent_config": {
-                "tasks": [task_config],
-                "engine": {
-                    "transcription": {
-                        "interruption_threshold": 1,
-                        "generate_precise_transcript": True
-                    },
-                    "response_latency": {
-                        "endpointing_ms": 200,
-                        "linear_delay_ms": 50
-                    }
-                }
+    }
+
+    if voice_id:
+        task_config["tools_config"]["synthesizer"] = {
+            "provider": tts_provider,
+            "provider_config": {
+                "voice_id": voice_id
             }
         }
-            
-        if user_id_val:
-            bolna_payload["metadata"] = {"user_id": user_id_val}
 
+    bolna_payload["agent_config"] = {
+        "tasks": [task_config],
+        "engine": {
+            "transcription": {
+                "interruption_threshold": 1,
+                "generate_precise_transcript": True
+            },
+            "response_latency": {
+                "endpointing_ms": 200,
+                "linear_delay_ms": 50
+            }
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             "https://api.bolna.ai/call",
             headers={
@@ -1037,7 +998,7 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     return {
         "status": "queued",
         "run_id": resp_data.get("run_id") or resp_data.get("execution_id"),
-        "phone": normalized_phone,
+        "phone": payload.phone,
         "user_name": user_name,
         "has_history": ctx.get("has_history", False),
         "history_summary": ctx.get("summary_lines", []),
@@ -1051,14 +1012,6 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
     """
     if not BOLNA_API_KEY:
         raise RuntimeError("BOLNA_API_KEY not configured")
-
-    # Normalize phone number (add +91 for 10-digit Indian numbers)
-    raw = str(phone).strip().replace(' ', '').replace('-', '')
-    if raw.startswith('0'):
-        raw = '+91' + raw[1:]
-    elif not raw.startswith('+') and len(raw) == 10:
-        raw = '+91' + raw
-    phone = raw
 
     ctx = get_user_health_context(phone, days=7)
     resolved_name = user_name or ctx.get("user_name", "there")
@@ -1095,18 +1048,49 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
     tts_provider = user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
     user_id_val = str(user_profile["user_id"]) if user_profile and user_profile.get("user_id") else ""
 
+    bolna_payload: Dict[str, Any] = {
+        "agent_id": BOLNA_AGENT_ID,
+        "recipient_phone_number": phone,
+        "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
+    }
+    task_config: Dict[str, Any] = {
+        "tools_config": {
+            "api_tools": {
+                "tools_params": {
+                    "assess_health_risk": {
+                        "param": {
+                            "intent": "%(intent)s",
+                            "symptoms": "%(symptoms)s",
+                            "severity": "%(severity)s",
+                            "confidence": "%(confidence)s",
+                            "user_id": user_id_val,
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if voice_id:
+        task_config["tools_config"]["synthesizer"] = {
+            "provider": tts_provider,
+            "provider_config": {"voice_id": voice_id},
+        }
+    bolna_payload["agent_config"] = {
+        "tasks": [task_config],
+        "engine": {
+            "transcription": {
+                "interruption_threshold": 1,
+                "generate_precise_transcript": True
+            },
+            "response_latency": {
+                "endpointing_ms": 200,
+                "linear_delay_ms": 50
+            }
+        }
+    }
+
     logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
     async with httpx.AsyncClient(timeout=30) as client:
-        bolna_payload: Dict[str, Any] = {
-            "agent_id": BOLNA_AGENT_ID,
-            "recipient_phone_number": phone,
-            "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
-            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
-        }
-            
-        if user_id_val:
-            bolna_payload["metadata"] = {"user_id": user_id_val}
-
         resp = await client.post(
             "https://api.bolna.ai/call",
             headers={"Authorization": f"Bearer {BOLNA_API_KEY}", "Content-Type": "application/json"},
@@ -1614,32 +1598,7 @@ async def bolna_webhook(request: Request):
                 severity = extracted.get("severity", "medium")
                 intent = extracted.get("intent", "health_check")
             else:
-                logger.info(f"[WEBHOOK] Call completed, but no extraction data or transcript found. Treating as missed call.")
-                user_profile = get_user_by_phone(phone)
-                patient_name = user_profile.get("name", "your loved one") if user_profile else "your loved one"
-                
-                contacts = []
-                if user_profile and "user_id" in user_profile:
-                    contacts = get_family_contacts(str(user_profile["user_id"]))
-                
-                if contacts:
-                    for contact in contacts:
-                        contact_phone = contact.get("phone")
-                        contact_name = contact.get("name")
-                        if contact_phone:
-                            send_unanswered_call_alert(
-                                to_phone=contact_phone,
-                                patient_name=patient_name,
-                                caregiver_name=contact_name
-                            )
-                else:
-                    fallback_phone = os.environ.get("CAREGIVER_PHONE")
-                    if fallback_phone:
-                        send_unanswered_call_alert(
-                            to_phone=fallback_phone,
-                            patient_name=patient_name,
-                            caregiver_name="Caregiver"
-                        )
+                logger.info(f"[WEBHOOK] Call completed, but no extraction data or transcript found.")
 
             # If we have any data to process (either from transcript, or Bolna extracted)
             if formatted_transcript or extracted:
