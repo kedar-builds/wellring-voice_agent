@@ -4,7 +4,7 @@ services:
     runtime: docker
     region: ohio
     plan: free
-    branch: atharva-voice-work
+    branch: main
     envVars:
       # --- Required secrets (set in Render dashboard, never committed) ---
       - key: WELLRING_API_KEY
