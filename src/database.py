@@ -1405,8 +1405,18 @@ def upsert_family_contacts(elder_user_id: str, contacts: List[Dict[str, str]]) -
 def add_single_family_contact(elder_user_id: str, name: str, phone: str, relationship: str) -> None:
     """Add a single family contact without deleting existing ones."""
     if not _use_postgres() or not _PG_AVAILABLE:
+        import uuid
+        db_path = _resolve_db_path(None)
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (user_id, name, phone, role, caregiver_for_user_id, relationship)
+            VALUES (?, ?, ?, 'caregiver', ?, ?)
+        """, (str(uuid.uuid4()), name, phone, elder_user_id, relationship))
+        conn.commit()
+        conn.close()
         return
-        
+
     with get_pg_conn() as conn:
         with _pg_cursor(conn) as cur:
             cur.execute("""
@@ -1447,8 +1457,15 @@ def get_family_contacts(elder_user_id: str) -> List[Dict[str, Any]]:
 def delete_family_contact(contact_id: str) -> bool:
     """Delete a specific family contact."""
     if not _use_postgres() or not _PG_AVAILABLE:
-        return False
-        
+        db_path = _resolve_db_path(None)
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM users WHERE user_id = ? AND role = 'caregiver'", (contact_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        conn.close()
+        return deleted
+
     with get_pg_conn() as conn:
         with _pg_cursor(conn) as cur:
             cur.execute("""
