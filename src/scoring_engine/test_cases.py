@@ -24,11 +24,13 @@ from src.scoring_engine.scoring import calculate_score
 from src.scoring_engine.alerts  import determine_action
 from src.scoring_engine.baseline import RiskLevel
 
+from typing import Any, Dict, List
+
 # ---------------------------------------------------------------------------
 # Test case definitions
 # ---------------------------------------------------------------------------
 
-TEST_CASES = [
+TEST_CASES: List[Dict[str, Any]] = [
     # ── Case 1: Mild dizziness, low confidence ─────────────────────────────
     {
         "id":                1,

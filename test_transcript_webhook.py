@@ -1,4 +1,3 @@
-import os
 import asyncio
 from dotenv import load_dotenv
 
@@ -25,7 +24,7 @@ async def test_transcript():
     print("\nSending to Gemini 2.5 Flash...")
     result = await analyze_transcript_for_health_issues(transcript)
     
-    print(f"\n📊 Extracted Data:")
+    print("\n📊 Extracted Data:")
     print(f"   Symptoms: {result['symptoms']}")
     print(f"   Severity: {result['severity']}")
     print(f"   Intent  : {result['intent']}")

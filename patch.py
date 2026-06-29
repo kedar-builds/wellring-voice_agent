@@ -1,4 +1,3 @@
-import sys
 
 def modify():
     path = "src/main.py"

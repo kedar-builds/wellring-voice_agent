@@ -11,7 +11,7 @@ Escalation ladder:
     CRITICAL (101+)   → notify_caregiver_and_emergency_services
 """
 
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 from .baseline import RiskLevel, get_risk_level
 

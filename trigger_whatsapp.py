@@ -1,4 +1,3 @@
-import asyncio
 from src.main import process_assessment_data
 import os
 

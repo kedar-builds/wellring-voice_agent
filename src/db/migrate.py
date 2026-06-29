@@ -30,7 +30,7 @@ def migrate() -> None:
 
     sql = SCHEMA_FILE.read_text()
 
-    print(f"[MIGRATE] Connecting to PostgreSQL …")
+    print("[MIGRATE] Connecting to PostgreSQL …")
     conn = psycopg2.connect(database_url)
     conn.autocommit = True
     cursor = conn.cursor()

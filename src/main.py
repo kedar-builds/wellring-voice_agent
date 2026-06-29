@@ -28,7 +28,6 @@ import datetime
 import os
 import asyncio
 import logging
-import sqlite3
 import json
 import re
 import httpx
@@ -158,7 +157,7 @@ async def run_reminder_scheduler():
                 if should_trigger:
                     logger.info(f"Triggering reminder {rem_id} ({rem_title}) for {rem_phone}")
                     if rem_type in ("call", "family_call"):
-                        body = f"📞 WellRing check-in call is ringing you now..."
+                        body = "📞 WellRing check-in call is ringing you now..."
                         send_whatsapp_reminder(rem_phone, body)
                         try:
                             await _do_bolna_call(phone=rem_phone, user_name=None)
@@ -934,7 +933,7 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     if ctx.get("has_history") and ctx.get("summary_lines"):
         lines = ctx["summary_lines"]
         history_block = (
-            f"\n\nIMPORTANT — This patient's recent health history:\n"
+            "\n\nIMPORTANT — This patient's recent health history:\n"
             + "\n".join(f"  • {line}" for line in lines)
             + "\n\nStart the call by warmly asking a specific follow-up about the most recent symptoms listed above."
         )
@@ -961,7 +960,7 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     # Fetch user profile to get Voice Cloning settings
     user_profile = get_user_by_phone(payload.phone)
     voice_id = user_profile.get("voice_id") if user_profile else None
-    tts_provider = user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
+    user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
 
     logger.info(f"[CALL] Initiating call to {payload.phone} | history={ctx.get('has_history')} | user={user_name} | voice_id={voice_id}")
 
@@ -1091,8 +1090,8 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
     dynamic_prompt = BASE_SYSTEM_PROMPT.replace("[elder_name]", resolved_name) + medical_context + history_block
 
     user_profile = get_user_by_phone(phone)
-    voice_id = user_profile.get("voice_id") if user_profile else None
-    tts_provider = user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
+    user_profile.get("voice_id") if user_profile else None
+    user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
     user_id_val = str(user_profile["user_id"]) if user_profile and user_profile.get("user_id") else ""
 
     logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
@@ -1211,7 +1210,7 @@ async def setup_profile(req: ProfileSetupRequest, api_key: str = Depends(get_api
             conditions=req.medical_conditions,
             notes=req.medical_notes,
             voice_id=req.voice_id,
-            tts_provider=req.tts_provider
+            tts_provider=req.tts_provider or "elevenlabs"
         )
         if not user_id:
             raise HTTPException(status_code=500, detail="Database error or PostgreSQL not active.")
@@ -1332,7 +1331,7 @@ async def upload_document(
                     model="gemini-2.0-flash",
                     contents=[uploaded_file, prompt]
                 )
-                extracted_notes = response.text
+                extracted_notes = response.text or ""
                 
                 # Update the database
                 if extracted_notes:
@@ -1403,7 +1402,7 @@ async def analyze_emotion_from_audio(recording_url: str) -> str:
         )
 
         os.remove(tmp_path)
-        return response.text.strip()
+        return (response.text or "").strip()
     except Exception as e:
         logger.error(f"Error analyzing emotion: {e}")
         return ""
@@ -1602,7 +1601,8 @@ async def bolna_webhook(request: Request):
                 # Fallback to Bolna extraction if Gemini found nothing
                 if extracted and not symptoms:
                     bolna_symptoms = extracted.get("symptoms", [])
-                    if isinstance(bolna_symptoms, str): bolna_symptoms = [bolna_symptoms]
+                    if isinstance(bolna_symptoms, str):
+                        bolna_symptoms = [bolna_symptoms]
                     symptoms = bolna_symptoms
                     severity = extracted.get("severity", severity)
                     intent = extracted.get("intent", intent)
@@ -1614,7 +1614,7 @@ async def bolna_webhook(request: Request):
                 severity = extracted.get("severity", "medium")
                 intent = extracted.get("intent", "health_check")
             else:
-                logger.info(f"[WEBHOOK] Call completed, but no extraction data or transcript found. Treating as missed call.")
+                logger.info("[WEBHOOK] Call completed, but no extraction data or transcript found. Treating as missed call.")
                 user_profile = get_user_by_phone(phone)
                 patient_name = user_profile.get("name", "your loved one") if user_profile else "your loved one"
                 

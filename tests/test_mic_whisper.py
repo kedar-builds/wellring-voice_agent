@@ -2,7 +2,6 @@ import sounddevice as sd
 import soundfile as sf
 import whisper
 import time
-import numpy as np
 
 # Settings
 DURATION = 8  # increased to 8 seconds

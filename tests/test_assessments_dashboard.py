@@ -8,9 +8,7 @@ Tests for:
 4. users.get_user SQLite and Postgres paths
 """
 
-import pytest
 import datetime
-import json
 from unittest.mock import patch, MagicMock
 from src.database import log_interaction
 from src.users import get_user

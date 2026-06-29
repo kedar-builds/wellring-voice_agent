@@ -6,7 +6,6 @@ from either Supabase or the local SQLite database.
 """
 
 import sqlite3
-import os
 import logging
 from typing import Optional, Dict, Any
 from src.database import (
@@ -39,7 +38,7 @@ def get_user(user_id: str, db_path: Optional[str] = None) -> Optional[Dict[str, 
             try:
                 res = supabase.table("users").select("*").eq("id", user_id).execute()
                 if res.data and len(res.data) > 0:
-                    return res.data[0]
+                    return dict(res.data[0]) # type: ignore
             except Exception as e:
                 logger.error(f"Supabase get_user failed: {e}. Falling back to SQLite.")
 

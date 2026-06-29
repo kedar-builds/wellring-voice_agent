@@ -451,7 +451,7 @@ def _log_interaction_supabase(data: Dict[str, Any]) -> Optional[int]:
             "emotion_analysis": data.get("emotion_analysis"),
         }).execute()
         if res.data:
-            return res.data[0]["id"]
+            return int(res.data[0]["id"]) # type: ignore
     except Exception as exc:
         logger.error(f"Supabase insert failed: {exc}. Falling back to SQLite.")
     return None
@@ -485,7 +485,7 @@ def _log_interaction_sqlite(data: Dict[str, Any], db_path: Optional[str]) -> int
     row_id = cur.lastrowid
     conn.commit()
     conn.close()
-    return row_id
+    return int(row_id) if row_id else 0
 
 
 # ===========================================================================
@@ -535,7 +535,7 @@ def _symptom_count_supabase(symptom: str, days: int) -> int:
         cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days)).isoformat() + "Z"
         res = (
             supabase.table("interactions")
-            .select("id", count="exact")
+            .select("id", count="exact") # type: ignore
             .gte("timestamp", cutoff)
             .contains("symptoms", [symptom])
             .execute()
@@ -790,7 +790,7 @@ def add_reminder(
     row_id = cur.lastrowid
     conn.commit()
     conn.close()
-    return row_id
+    return int(row_id) if row_id else 0
 
 
 def get_reminders(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -868,7 +868,7 @@ def _get_assessments_pg(limit: int = 50, risk_level: Optional[str] = None) -> Li
                recording_url
         FROM assessments
     """
-    params = []
+    params: List[Any] = []
     if risk_level:
         sql += " WHERE risk_level = %s"
         params.append(risk_level.upper())
@@ -944,10 +944,10 @@ def _get_assessments_supabase(limit: int = 50, risk_level: Optional[str] = None)
         
         result = []
         for r in (res.data or []):
-            r_dict = dict(r)
+            r_dict = dict(r) # type: ignore
             if isinstance(r_dict.get("symptoms"), str):
                 try:
-                    r_dict["symptoms"] = json.loads(r_dict["symptoms"])
+                    r_dict["symptoms"] = json.loads(str(r_dict["symptoms"]))
                 except Exception:
                     pass
             elif r_dict.get("symptoms") is None:
@@ -969,7 +969,7 @@ def _get_assessment_stats_supabase() -> Optional[Dict[str, Any]]:
         
         counts = {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
         for r in (res.data or []):
-            rl = str(r.get("risk_level") or "").upper()
+            rl = str(dict(r).get("risk_level", "")).upper() # type: ignore
             counts["total_today"] += 1
             if rl == "LOW":
                 counts["low"] += 1
@@ -1004,7 +1004,7 @@ def _get_assessments_sqlite(limit: int = 50, risk_level: Optional[str] = None, d
     
     if risk_level:
         query = "SELECT * FROM interactions WHERE risk_level = ? ORDER BY timestamp DESC LIMIT ?"
-        params = [risk_level.upper(), limit]
+        params = [risk_level.upper(), limit] # type: ignore
     
     cursor.execute(query, params)
     rows = cursor.fetchall()
@@ -1251,7 +1251,9 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
     """Upsert the elder user's profile, returns the Postgres UUID."""
     if not _use_postgres() or not _PG_AVAILABLE:
         # SQLite fallback
-        import uuid, json, datetime
+        import uuid
+        import json
+        import datetime
         db_path = _resolve_db_path(None)
         user_id = str(uuid.uuid4())
         now_str = datetime.datetime.utcnow().isoformat()
@@ -1349,7 +1351,7 @@ def get_user_profile(firebase_uid: str) -> Optional[Dict[str, Any]]:
         if res.get("medical_conditions"):
             try:
                 res["medical_conditions"] = json.loads(res["medical_conditions"])
-            except:
+            except Exception:
                 res["medical_conditions"] = []
         return res
         

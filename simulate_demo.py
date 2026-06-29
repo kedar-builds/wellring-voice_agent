@@ -8,10 +8,8 @@ for the LLM.
 """
 
 import time
-import sqlite3
 import os
 import httpx
-import json
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -90,11 +88,11 @@ def run_simulation():
             data = r.json()
             
             print("-" * 50)
-            print(f"📊 Assessment Result:")
+            print("📊 Assessment Result:")
             print(f"   • Risk Level: {data['risk_level']} (Score: {data['score']})")
             print(f"   • Category  : {data['category']}")
             print(f"   • Action    : {data['action']}")
-            print(f"\n🤖 System Directive to TTS:")
+            print("\n🤖 System Directive to TTS:")
             print(f"   \"{data['message']}\"")
             print(f"   Steps: {data['steps']}")
             print("-" * 50)
