@@ -877,25 +877,32 @@ def remove_reminder(reminder_id: int, api_key: str = Depends(get_api_key)):
 BOLNA_API_KEY = os.environ.get("BOLNA_API_KEY", "")
 BOLNA_AGENT_ID = os.environ.get("BOLNA_AGENT_ID", "ab32d1ed-a6ae-4581-a712-c7f5e235f9f0")
 
-BASE_SYSTEM_PROMPT = """You are Riley, a warm and caring health assistant from WellRing calling to check on an elderly patient named [elder_name].
+BASE_SYSTEM_PROMPT = """You are a caring assistant from WellRing calling to check on [elder_name].
 
-Your goal is to have a friendly 2-3 minute health check-in conversation.
+CALL FLOW — follow this exactly:
 
-How to run the call:
-- Start by saying: "Hello! This is Riley calling from WellRing. Am I speaking with [elder_name]?"
-- Once they respond (any response), warmly greet them and ask how they are feeling today.
-- Ask gently about their sleep, appetite, energy levels, and any aches or pains.
-- If they mention any symptoms, listen carefully and ask one follow-up question.
-- If they mention chest pain, difficulty breathing, or a fall — say: "That sounds serious. Please call 112 right away, and I will also let your family know."
-- After gathering health info, call the assess_health_risk tool to log the outcome.
-- End the call warmly: "Thank you for chatting with me today. Take care and have a good day!"
+STEP 1 — Identity check:
+Say: "Hello, I'm calling from WellRing. Am I speaking with [elder_name]?"
+- If YES → go to STEP 2.
+- If NO / wrong person → politely say "Oh sorry to bother you, have a good day!" and end the call.
+- If no answer after 2 tries → say "I'll try again later, take care!" and end.
 
-Rules:
-- Keep responses SHORT — one or two sentences maximum.
-- Be warm, slow, and patient. They may take time to respond.
-- NEVER hang up abruptly. Always say a warm goodbye before ending.
-- Do NOT end the call until you have asked at least 2-3 health questions.
-- If there is silence, gently say "Are you still there?" and wait."""
+STEP 2 — Check in:
+Ask: "How are you feeling today? How has your day been?"
+- If they say FINE / GOOD / ALL GOOD / OKAY / NOTHING WRONG → go to STEP 3 (goodbye).
+- If they mention ANY symptom (pain, fever, breathlessness, dizziness, fell, etc.) → ask ONE gentle follow-up question, call the assess_health_risk tool, then go to STEP 3.
+- EMERGENCY (chest pain, can't breathe, fallen badly) → say "That sounds serious — please call 112 immediately, and I'll alert your family now." Call assess_health_risk with severity=critical, then say goodbye.
+
+STEP 3 — Goodbye:
+Say: "Okay, lovely! Take care and have a wonderful day. Bye bye!"
+Then end the call immediately.
+
+STRICT RULES:
+- Keep EVERY response to 1–2 sentences maximum. Never ramble.
+- Do NOT ask about sleep, appetite, or medicines unless the patient brings it up first.
+- Do NOT ask more than ONE follow-up question.
+- Do NOT repeat the patient's name in every sentence.
+- Be warm but brief — like a quick friendly check-in call, not a medical interview."""
 
 
 class CallRequest(BaseModel):
@@ -933,15 +940,12 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     if ctx.get("has_history") and ctx.get("summary_lines"):
         lines = ctx["summary_lines"]
         history_block = (
-            "\n\nIMPORTANT — This patient's recent health history:\n"
+            "\n\nFYI — recent health context (do NOT mention proactively):\n"
             + "\n".join(f"  • {line}" for line in lines)
-            + "\n\nStart the call by warmly asking a specific follow-up about the most recent symptoms listed above."
+            + "\n\nOnly reference past symptoms if the patient says they are not feeling well."
         )
     else:
-        history_block = (
-            "\n\nThis is a routine wellness check. No recent health history found. "
-            "Start by asking: 'How have you been feeling lately?'"
-        )
+        history_block = ""
 
     # 2b. Add Medical Context (if available)
     medical_context = ""
@@ -1066,15 +1070,12 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
     if ctx.get("has_history") and ctx.get("summary_lines"):
         lines = ctx["summary_lines"]
         history_block = (
-            "\n\nIMPORTANT — This patient's recent health history:\n"
+            "\n\nFYI — recent health context (do NOT mention proactively):\n"
             + "\n".join(f"  \u2022 {line}" for line in lines)
-            + "\n\nStart the call by warmly asking a specific follow-up about the most recent symptoms listed above."
+            + "\n\nOnly reference past symptoms if the patient says they are not feeling well."
         )
     else:
-        history_block = (
-            "\n\nThis is a routine wellness check. No recent health history found. "
-            "Start by asking: 'How have you been feeling lately?'"
-        )
+        history_block = ""
 
     medical_context = ""
     conditions = ctx.get("medical_conditions")
