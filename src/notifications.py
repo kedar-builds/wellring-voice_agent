@@ -22,7 +22,7 @@ Environment variables (set in .env):
 import logging
 import os
 import datetime
-from typing import Dict, Any, Optional
+from typing import Optional
 from src.database import log_alert, get_family_contacts
 from src.users import get_caregiver_phone, get_user
 

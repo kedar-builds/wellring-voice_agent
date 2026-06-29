@@ -1,5 +1,4 @@
 import asyncio
-import httpx
 from src.main import initiate_call, CallRequest
 
 async def main():

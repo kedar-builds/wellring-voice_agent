@@ -13,7 +13,7 @@ vapi_payload = {
             "model": "gpt-4o-mini",
             "systemPrompt": dynamic_prompt
         },
-        "firstMessage": f"Hello"
+        "firstMessage": "Hello"
     },
     "customer": {
         "number": payload_phone,

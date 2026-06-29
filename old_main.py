@@ -28,7 +28,6 @@ import datetime
 import os
 import asyncio
 import logging
-import sqlite3
 import json
 import re
 import httpx
@@ -157,7 +156,7 @@ async def run_reminder_scheduler():
                 if should_trigger:
                     logger.info(f"Triggering reminder {rem_id} ({rem_title}) for {rem_phone}")
                     if rem_type in ("call", "family_call"):
-                        body = f"📞 WellRing check-in call is ringing you now..."
+                        body = "📞 WellRing check-in call is ringing you now..."
                         send_whatsapp_reminder(rem_phone, body)
                         try:
                             await _do_bolna_call(phone=rem_phone, user_name=None)
@@ -900,7 +899,7 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     if ctx.get("has_history") and ctx.get("summary_lines"):
         lines = ctx["summary_lines"]
         history_block = (
-            f"\n\nIMPORTANT — This patient's recent health history:\n"
+            "\n\nIMPORTANT — This patient's recent health history:\n"
             + "\n".join(f"  • {line}" for line in lines)
             + "\n\nStart the call by warmly asking a specific follow-up about the most recent symptoms listed above."
         )
@@ -1610,7 +1609,7 @@ async def bolna_webhook(request: Request):
                 severity = extracted.get("severity", "medium")
                 intent = extracted.get("intent", "health_check")
             else:
-                logger.info(f"[WEBHOOK] Call completed, but no extraction data or transcript found. Treating as missed call.")
+                logger.info("[WEBHOOK] Call completed, but no extraction data or transcript found. Treating as missed call.")
                 user_profile = get_user_by_phone(phone)
                 patient_name = user_profile.get("name", "your loved one") if user_profile else "your loved one"
                 

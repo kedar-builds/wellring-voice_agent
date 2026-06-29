@@ -16,7 +16,6 @@ Covers:
     - Database logging: each request increments interaction count
 """
 
-import pytest
 
 # ---------------------------------------------------------------------------
 # Shared payloads
