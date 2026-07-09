@@ -31,7 +31,7 @@ wellring-voice_agent/
 │       └── migrate.py     ← Schema migration runner
 ├── tests/                 ← Pytest test suite
 ├── docs/                  ← Architecture & API docs
-├── vapi_assistant.json    ← Vapi cloud assistant blueprint
+├── bolna_assistant.json    ← Bolna cloud assistant blueprint
 ├── voice_health.py        ← Local hardware testing script (Gemini + Whisper + Piper)
 ├── simulate_demo.py       ← Demo scenario runner
 ├── .github/workflows/     ← CI/CD pipeline
@@ -55,7 +55,7 @@ wellring-voice_agent/
    ```bash
    cp .env.example .env
    ```
-   *Fill in your API keys (Gemini, Twilio, Vapi) and set a strong `WELLRING_API_KEY`.*
+   *Fill in your API keys (Gemini, Twilio, Bolna) and set a strong `WELLRING_API_KEY`.*
 4. (Optional) Set up PostgreSQL and run the migration:
    ```bash
    # Set DATABASE_URL in .env first

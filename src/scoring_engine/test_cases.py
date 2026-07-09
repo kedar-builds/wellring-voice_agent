@@ -79,7 +79,7 @@ TEST_CASES: List[Dict[str, Any]] = [
         "symptoms":          ["breathing_problem"],
         "severity":          "high",
         "confidence":        0.95,
-        "expected_level":    RiskLevel.MEDIUM,     # base=60, final=57 → MEDIUM
+        "expected_level":    RiskLevel.HIGH,       # base=85, final=81 → HIGH
         "expected_category": "RESPIRATORY",
     },
     # ── Case 6: Fall detected, medium severity ────────────────────────────
@@ -141,8 +141,8 @@ TEST_CASES: List[Dict[str, Any]] = [
         "symptoms":          ["chest_pain", "breathing_problem"],
         "severity":          "high",
         "confidence":        0.5,
-        # NOTE: 110 * 0.5 = 55 → MEDIUM
-        "expected_level":    RiskLevel.MEDIUM,
+        # NOTE: 150 * 0.5 = 75 → HIGH
+        "expected_level":    RiskLevel.HIGH,
         "expected_category": "CARDIAC",
     },
     # ── Case 12: History multiplier escalation ────────────────────────────

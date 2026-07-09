@@ -54,7 +54,7 @@ Every health risk assessment triggered by a voice interaction.
 | `message` | Text | Human-readable summary |
 | `steps` | Text[] | Ordered escalation steps |
 | `breakdown` | Text[] | Per-component score explanation |
-| `vapi_call_id` | Text | Vapi session identifier |
+| `bolna_call_id` | Text | Bolna session identifier |
 | `recording_url` | Text | URL to call recording |
 | `assessed_at` | Timestamptz | Auto-set on create |
 
@@ -85,7 +85,7 @@ Voice/text conversation turns with Riley (the AI assistant).
 | `conversation_id` | UUID (PK) | Auto-generated |
 | `user_id` | UUID (FK → users) | Patient |
 | `assessment_id` | UUID (FK → assessments) | Linked assessment (nullable) |
-| `vapi_call_id` | Text | Vapi session ID |
+| `bolna_call_id` | Text | Bolna session ID |
 | `channel` | Text | `web` / `phone` / `whatsapp` |
 | `role` | Text | `user` / `assistant` / `system` |
 | `content` | Text | Message content |

@@ -22,7 +22,7 @@ New Postgres-first functions:
   get_pg_conn()                   → psycopg2 connection (context manager)
   log_assessment_pg(data, user_id) → UUID str
   upsert_health_history(user_id, symptom, assessment_id, severity, risk_level)
-  log_conversation_turn(user_id, role, content, vapi_call_id, channel)
+  log_conversation_turn(user_id, role, content, bolna_call_id, channel)
 """
 
 import datetime
@@ -119,10 +119,14 @@ def init_pg_tables() -> None:
         schema_path = pathlib.Path(__file__).parent / "db" / "schema.sql"
         if schema_path.exists():
             sql = schema_path.read_text()
-            with get_pg_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(sql)
-            logger.info("[PG] PostgreSQL tables initialized using schema.sql.")
+            try:
+                with get_pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(sql)
+                logger.info("[PG] PostgreSQL tables initialized using schema.sql.")
+            except Exception as schema_err:
+                # Non-fatal: tables may already exist with slightly different definitions
+                logger.warning(f"[PG] schema.sql partial error (continuing): {schema_err}")
         else:
             logger.error(f"[PG] schema.sql not found at {schema_path}")
 
@@ -161,7 +165,7 @@ def init_pg_tables() -> None:
                 ("message", "TEXT NOT NULL DEFAULT ''"),
                 ("steps", "TEXT[] NOT NULL DEFAULT '{}'"),
                 ("breakdown", "TEXT[] NOT NULL DEFAULT '{}'"),
-                ("vapi_call_id", "TEXT"),
+                ("bolna_call_id", "TEXT"),
                 ("recording_url", "TEXT"),
                 ("transcript", "TEXT"),
                 ("emotion_analysis", "TEXT"),
@@ -169,14 +173,33 @@ def init_pg_tables() -> None:
             ]
         }
         
-        with get_pg_conn() as conn:
-            with conn.cursor() as cur:
-                for table, cols in columns_to_ensure.items():
-                    for col_name, col_type in cols:
-                        try:
-                            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
-                        except Exception as col_err:
-                            logger.warning(f"[PG] Could not add column {col_name} to table {table}: {col_err}")
+        # Handle rename: vapi_call_id → bolna_call_id (for databases created before Bolna migration)
+        # Covers both assessments and conversations tables — each in its own transaction
+        for _tbl in ("assessments", "conversations"):
+            try:
+                with get_pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT column_name FROM information_schema.columns
+                            WHERE table_name = %s AND column_name = 'vapi_call_id'
+                        """, (_tbl,))
+                        if cur.fetchone():
+                            cur.execute(f"ALTER TABLE {_tbl} RENAME COLUMN vapi_call_id TO bolna_call_id;")
+                            logger.info(f"[PG] Renamed {_tbl}.vapi_call_id → bolna_call_id.")
+            except Exception as rename_err:
+                logger.debug(f"[PG] {_tbl} rename skipped (likely already done): {rename_err}")
+
+        # Add missing columns — each in its own transaction so one failure doesn't abort others
+        for table, cols in columns_to_ensure.items():
+            for col_name, col_type in cols:
+                try:
+                    with get_pg_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} {col_type};"
+                            )
+                except Exception as col_err:
+                    logger.debug(f"[PG] Column {table}.{col_name} already exists or incompatible: {col_err}")
         logger.info("[PG] PostgreSQL columns verified and upgraded successfully.")
     except Exception as e:
         logger.error(f"[PG] Failed to initialize/migrate Postgres tables: {e}")
@@ -369,11 +392,11 @@ def _log_interaction_pg(data: Dict[str, Any]) -> str:
         INSERT INTO assessments (
             user_id, intent, symptoms, severity, confidence,
             score, base_score, risk_level, category, action,
-            message, steps, breakdown, vapi_call_id, recording_url, transcript, emotion_analysis
+            message, steps, breakdown, bolna_call_id, recording_url, transcript, emotion_analysis
         ) VALUES (
             %(user_id)s, %(intent)s, %(symptoms)s, %(severity)s, %(confidence)s,
             %(score)s, %(base_score)s, %(risk_level)s, %(category)s, %(action)s,
-            %(message)s, %(steps)s, %(breakdown)s, %(vapi_call_id)s, %(recording_url)s, %(transcript)s, %(emotion_analysis)s
+            %(message)s, %(steps)s, %(breakdown)s, %(bolna_call_id)s, %(recording_url)s, %(transcript)s, %(emotion_analysis)s
         )
         RETURNING assessment_id
     """
@@ -391,7 +414,7 @@ def _log_interaction_pg(data: Dict[str, Any]) -> str:
         "message":       data.get("message", ""),
         "steps":         data.get("steps", []),
         "breakdown":     data.get("breakdown", []),
-        "vapi_call_id":  data.get("vapi_call_id"),
+        "bolna_call_id":  data.get("bolna_call_id"),
         "recording_url": data.get("recording_url"),
         "transcript":    data.get("transcript"),
         "emotion_analysis": data.get("emotion_analysis"),
@@ -721,7 +744,7 @@ def log_conversation_turn(
     user_id: str,
     role: str,
     content: str,
-    vapi_call_id: Optional[str] = None,
+    bolna_call_id: Optional[str] = None,
     channel: str = "web",
     assessment_id: Optional[str] = None,
     audio_url: Optional[str] = None,
@@ -735,10 +758,10 @@ def log_conversation_turn(
 
     sql = """
         INSERT INTO conversations (
-            user_id, assessment_id, vapi_call_id,
+            user_id, assessment_id, bolna_call_id,
             channel, role, content, audio_url
         ) VALUES (
-            %(user_id)s, %(assessment_id)s, %(vapi_call_id)s,
+            %(user_id)s, %(assessment_id)s, %(bolna_call_id)s,
             %(channel)s, %(role)s, %(content)s, %(audio_url)s
         )
         RETURNING conversation_id
@@ -748,7 +771,7 @@ def log_conversation_turn(
             cur.execute(sql, {
                 "user_id":       user_id,
                 "assessment_id": assessment_id,
-                "vapi_call_id":  vapi_call_id,
+                "bolna_call_id":  bolna_call_id,
                 "channel":       channel,
                 "role":          role,
                 "content":       content,
