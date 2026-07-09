@@ -13,3 +13,5 @@ ollama.log
 *.log
 backend.log
 uploads/
+health_agent.db
+bolna_logs.json

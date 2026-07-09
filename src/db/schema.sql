@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS assessments (
     assessment_id   UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         UUID            NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
 
-    -- Input captured from Vapi / frontend
+    -- Input captured from Bolna / frontend
     intent          TEXT            NOT NULL DEFAULT 'health_issue',
     symptoms        TEXT[]          NOT NULL DEFAULT '{}',
     severity        TEXT            NOT NULL
@@ -94,8 +94,8 @@ CREATE TABLE IF NOT EXISTS assessments (
     steps           TEXT[]          NOT NULL DEFAULT '{}',
     breakdown       TEXT[]          NOT NULL DEFAULT '{}',
 
-    -- Vapi metadata
-    vapi_call_id    TEXT,
+    -- Bolna metadata
+    bolna_call_id    TEXT,
     recording_url   TEXT,
     transcript      TEXT,
     emotion_analysis TEXT,
@@ -161,8 +161,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     -- Link to the assessment triggered mid-session (nullable)
     assessment_id   UUID            REFERENCES assessments(assessment_id) ON DELETE SET NULL,
 
-    -- Vapi session identifiers
-    vapi_call_id    TEXT,
+    -- Bolna session identifiers
+    bolna_call_id    TEXT,
     channel         TEXT            NOT NULL DEFAULT 'web'
                                     CHECK (channel IN ('web', 'phone', 'whatsapp')),
 
@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversations_user_id      ON conversations(user_id);
-CREATE INDEX IF NOT EXISTS idx_conversations_vapi_call_id ON conversations(vapi_call_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_bolna_call_id ON conversations(bolna_call_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_spoken_at    ON conversations(spoken_at DESC);
 
 

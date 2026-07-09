@@ -106,7 +106,7 @@ erDiagram
         TEXT        message
         TEXT[]      steps
         TEXT[]      breakdown
-        TEXT        vapi_call_id
+        TEXT        bolna_call_id
         TEXT        recording_url
         TEXT        transcript
         TEXT        emotion_analysis
@@ -131,7 +131,7 @@ erDiagram
         UUID    conversation_id PK
         UUID    user_id         FK
         UUID    assessment_id   FK
-        TEXT    vapi_call_id
+        TEXT    bolna_call_id
         TEXT    channel
         TEXT    role
         TEXT    content
@@ -223,7 +223,7 @@ One row per **voice call health check-in** that triggers a risk score.
 | `message` | `TEXT` | Human-readable assessment summary |
 | `steps` | `TEXT[]` | Recommended next steps |
 | `breakdown` | `TEXT[]` | Scoring calculation explanation |
-| `vapi_call_id` | `TEXT` | Bolna / Vapi session ID |
+| `bolna_call_id` | `TEXT` | Bolna session ID |
 | `recording_url` | `TEXT` | Call recording link |
 | `transcript` | `TEXT` | Full call transcript |
 | `emotion_analysis` | `TEXT` | Voice tone/emotion summary |
@@ -264,7 +264,7 @@ Individual **turn-by-turn messages** between the elder and Riley.
 | `conversation_id` | `UUID PK` | |
 | `user_id` | `UUID FK → users` | Cascade delete |
 | `assessment_id` | `UUID FK → assessments` | Optional — set if call triggered an assessment |
-| `vapi_call_id` | `TEXT` | Session grouping key |
+| `bolna_call_id` | `TEXT` | Session grouping key |
 | `channel` | `TEXT` | `web / phone / whatsapp` |
 | `role` | `TEXT` | `user / assistant / system` |
 | `content` | `TEXT NOT NULL` | The message text |
@@ -272,7 +272,7 @@ Individual **turn-by-turn messages** between the elder and Riley.
 | `duration_secs` | `INTEGER` | Turn duration |
 | `spoken_at` | `TIMESTAMPTZ` | Default: `now()` |
 
-**Indexes:** `user_id`, `vapi_call_id`, `spoken_at DESC`
+**Indexes:** `user_id`, `bolna_call_id`, `spoken_at DESC`
 
 ---
 

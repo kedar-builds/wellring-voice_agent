@@ -33,8 +33,13 @@ import re
 import httpx
 from google import genai
 from google.genai import types
+from src.storage import upload_recording_to_s3, get_presigned_url, is_storage_configured
 
 logger = logging.getLogger(__name__)
+
+# Propagate src.* loggers through uvicorn so notifications/db logs show in server output
+for _mod in ("src.notifications", "src.database", "src.watchdog"):
+    logging.getLogger(_mod).setLevel(logging.INFO)
 
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
@@ -127,7 +132,9 @@ async def run_reminder_scheduler():
                             should_trigger = True
                             trigger_timestamp = now.isoformat()
                     except Exception as e:
-                        logger.error(f"Error parsing date {rem_time}: {e}")
+                        # Log as warning, not error — bad time format in DB should not spam
+                        logger.warning(f"[SCHEDULER] Skipping reminder {rem_id!r}: cannot parse time {rem_time!r}: {e}")
+                        continue  # skip this reminder — don't block the loop
                 else:
                     if current_time_str == rem_time:
                         if rem_freq == "daily":
@@ -388,6 +395,69 @@ def health():
     return HealthResponse(status="ok", version="1.0.0")
 
 
+@app.get("/storage-status", tags=["Health"])
+def storage_status(api_key: str = Depends(get_api_key)):
+    """
+    Check whether Backblaze B2 storage is configured.
+
+    Architecture reminder:
+      - PostgreSQL  → structured data (users, assessments, health_history, conversations, alerts)
+      - Backblaze B2 → binary blobs (call recordings / audio files)
+    """
+    configured = is_storage_configured()
+    return {
+        "backblaze_b2": "configured" if configured else "not_configured",
+        "postgres": "active" if os.environ.get("DATABASE_URL") else "inactive (sqlite fallback)",
+        "architecture": {
+            "postgres": ["users", "assessments", "health_history", "conversations", "alerts", "reminders"],
+            "backblaze_b2": ["call recordings (audio files)"],
+        },
+    }
+
+
+@app.get("/recordings/{assessment_id}", tags=["Recordings"])
+async def get_recording(assessment_id: str, api_key: str = Depends(get_api_key)):
+    """
+    Fetch a temporary pre-signed URL for the call recording linked to an assessment.
+
+    The recording_url stored in Postgres (assessments table) is the permanent B2
+    object path. This endpoint signs it so the frontend can stream/download it
+    securely without exposing raw B2 credentials.
+
+    Returns:
+        { assessment_id, presigned_url, expires_in_seconds }
+    """
+    from src.database import get_pg_conn, _pg_cursor, _use_postgres
+    import psycopg2.extras  # noqa: F401 — needed for RealDictCursor
+
+    if not _use_postgres():
+        raise HTTPException(status_code=503, detail="PostgreSQL is not configured.")
+
+    try:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                cur.execute(
+                    "SELECT recording_url FROM assessments WHERE assessment_id = %s",
+                    (assessment_id,)
+                )
+                row = cur.fetchone()
+    except Exception as exc:
+        logger.error(f"[RECORDING] DB error: {exc}")
+        raise HTTPException(status_code=500, detail="Database error.")
+
+    if not row or not row.get("recording_url"):
+        raise HTTPException(status_code=404, detail="No recording found for this assessment.")
+
+    permanent_url = row["recording_url"]
+    signed_url = get_presigned_url(permanent_url, expires_in=3600)
+
+    return {
+        "assessment_id": assessment_id,
+        "presigned_url": signed_url,
+        "expires_in_seconds": 3600,
+    }
+
+
 async def process_assessment_data(
     intent: str,
     symptoms: List[str],
@@ -634,7 +704,7 @@ def sanitize_assess_payload(body: dict) -> dict:
 @app.post("/assess", tags=["Risk Assessment"])
 async def assess(request: Request, api_key: str = Depends(get_api_key_lenient)):
     """
-    Core endpoint. Accepts the LLM-parsed voice input (either flat or wrapped in Vapi's webhook format)
+    Core endpoint. Accepts the LLM-parsed voice input
     and returns a health risk assessment with escalation steps.
     """
     try:
@@ -642,55 +712,17 @@ async def assess(request: Request, api_key: str = Depends(get_api_key_lenient)):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    # Check if this is a Vapi tool call request
-    is_vapi = False
-    tool_call_id = None
-    
-    # Check for Vapi tool-calls format
-    if isinstance(body, dict) and "message" in body:
-        msg = body["message"]
-        if isinstance(msg, dict) and msg.get("type") in ("tool-calls", "function-call"):
-            is_vapi = True
-            tool_calls = msg.get("toolCalls", [])
-            if not tool_calls and "call" in msg:
-                tool_calls = [msg.get("call")]
-            
-            if tool_calls:
-                first_call = tool_calls[0]
-                tool_call_id = first_call.get("id")
-                func = first_call.get("function", {})
-                args = func.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        pass
-                
-                # Sanitize the arguments
-                args = sanitize_assess_payload(args)
-                
-                # Extract fields from Vapi tool call arguments
-                intent = args.get("intent", "health_issue")
-                symptoms = args.get("symptoms", [])
-                severity = args.get("severity", "medium")
-                confidence = args.get("confidence", 1.0)
-                user_id = args.get("user_id")
-                recording_url = args.get("recording_url")
-            else:
-                raise HTTPException(status_code=400, detail="Vapi tool-calls empty")
-    else:
-        # Standard direct AssessRequest payload
-        try:
-            sanitized_body = sanitize_assess_payload(body)
-            payload = AssessRequest(**sanitized_body)
-            intent = payload.intent
-            symptoms = payload.symptoms
-            severity = payload.severity
-            confidence = payload.confidence
-            user_id = payload.user_id
-            recording_url = payload.recording_url
-        except Exception as err:
-            raise HTTPException(status_code=422, detail=str(err))
+    try:
+        sanitized_body = sanitize_assess_payload(body)
+        payload = AssessRequest(**sanitized_body)
+        intent = payload.intent
+        symptoms = payload.symptoms
+        severity = payload.severity
+        confidence = payload.confidence
+        user_id = payload.user_id
+        recording_url = payload.recording_url
+    except Exception as err:
+        raise HTTPException(status_code=422, detail=str(err))
 
     response_data = await process_assessment_data(
         intent=intent,
@@ -701,25 +733,7 @@ async def assess(request: Request, api_key: str = Depends(get_api_key_lenient)):
         recording_url=recording_url
     )
 
-    # Return structure based on who called it
-    if is_vapi:
-        return {
-            "results": [
-                {
-                    "toolCallId": tool_call_id,
-                    "result": {
-                        "score": response_data["score"],
-                        "risk_level": response_data["risk_level"],
-                        "category": response_data["category"],
-                        "action": response_data["action"],
-                        "message": response_data["message"],
-                        "steps": response_data["steps"]
-                    }
-                }
-            ]
-        }
-    else:
-        return AssessResponse(**response_data)
+    return AssessResponse(**response_data)
 
 
 @app.get("/symptoms", tags=["Reference"])
@@ -875,7 +889,8 @@ def remove_reminder(reminder_id: int, api_key: str = Depends(get_api_key)):
 # ---------------------------------------------------------------------------
 
 BOLNA_API_KEY = os.environ.get("BOLNA_API_KEY", "")
-BOLNA_AGENT_ID = os.environ.get("BOLNA_AGENT_ID", "ab32d1ed-a6ae-4581-a712-c7f5e235f9f0")
+BOLNA_AGENT_ID = os.environ.get("BOLNA_AGENT_ID", "59528716-267c-4a93-af51-97e7282f0123")
+BASE_WEBHOOK_URL = os.environ.get("BASE_WEBHOOK_URL", "https://wellring-backend.onrender.com").rstrip("/")
 
 BASE_SYSTEM_PROMPT = """You are a caring assistant from WellRing calling to check on [elder_name].
 
@@ -892,7 +907,8 @@ STEP 2 — Resolution & Goodbye:
 STRICT RULES:
 - Stick EXACTLY to the script phrases provided above. Do not add extra filler words.
 - Do NOT ask any other follow-up questions.
-- Keep the interaction as brief as possible."""
+- Keep the interaction as brief as possible.
+- When the conversation is over, use the `end_call` tool to terminate the session."""
 
 
 class CallRequest(BaseModel):
@@ -954,7 +970,7 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     # Fetch user profile to get Voice Cloning settings
     user_profile = get_user_by_phone(payload.phone)
     voice_id = user_profile.get("voice_id") if user_profile else None
-    user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
+    tts_provider = user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
 
     logger.info(f"[CALL] Initiating call to {payload.phone} | history={ctx.get('has_history')} | user={user_name} | voice_id={voice_id}")
 
@@ -964,7 +980,7 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     async with httpx.AsyncClient(timeout=30) as client:
         # We only pass the specific prompts and webhook overrides we need.
         # Passing the entire fetched agent_config causes immediate call drops due to conflicting metadata (e.g. id, created_at).
-        task_config = {
+        task_config: Dict[str, Any] = {
             "tools_config": {
                 "api_tools": {
                     "tools_params": {
@@ -976,11 +992,24 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
                                 "confidence": "%(confidence)s",
                                 "user_id": user_id_val
                             }
+                        },
+                        "end_call": {
+                            "param": {}
                         }
                     }
                 }
             }
         }
+        
+        if voice_id:
+            task_config["tools_config"]["synthesizer"] = {
+                "provider": tts_provider,
+                "provider_config": {
+                    "voice": voice_id,
+                    "voice_id": voice_id
+                }
+            }
+
         bolna_payload = {
             "agent_id": BOLNA_AGENT_ID,
             "recipient_phone_number": normalized_phone,
@@ -989,16 +1018,16 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
                     "system_prompt": dynamic_prompt
                 }
             },
-            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook",
+            "default_webhook": f"{BASE_WEBHOOK_URL}/bolna-webhook",
             "agent_config": {
                 "tasks": [task_config],
                 "engine": {
                     "transcription": {
-                        "interruption_threshold": 1,
+                        "interruption_threshold": 3,
                         "generate_precise_transcript": True
                     },
                     "response_latency": {
-                        "endpointing_ms": 200,
+                        "endpointing_ms": 500,
                         "linear_delay_ms": 50
                     }
                 }
@@ -1081,17 +1110,60 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
     dynamic_prompt = BASE_SYSTEM_PROMPT.replace("[elder_name]", resolved_name) + medical_context + history_block
 
     user_profile = get_user_by_phone(phone)
-    user_profile.get("voice_id") if user_profile else None
-    user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
-    user_id_val = str(user_profile["user_id"]) if user_profile and user_profile.get("user_id") else ""
+    voice_id = user_profile.get("voice_id") if user_profile else None
+    tts_provider = user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
+    user_id_val = str(user_profile.get("user_id", "")) if user_profile else ""
 
     logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
     async with httpx.AsyncClient(timeout=30) as client:
+        task_config: Dict[str, Any] = {
+            "tools_config": {
+                "api_tools": {
+                    "tools_params": {
+                        "assess_health_risk": {
+                            "param": {
+                                "intent": "%(intent)s",
+                                "symptoms": "%(symptoms)s",
+                                "severity": "%(severity)s",
+                                "confidence": "%(confidence)s",
+                                "user_id": user_id_val
+                            }
+                        },
+                        "end_call": {
+                            "param": {}
+                        }
+                    }
+                }
+            }
+        }
+        
+        if voice_id:
+            task_config["tools_config"]["synthesizer"] = {
+                "provider": tts_provider,
+                "provider_config": {
+                    "voice": voice_id,
+                    "voice_id": voice_id
+                }
+            }
+
         bolna_payload: Dict[str, Any] = {
             "agent_id": BOLNA_AGENT_ID,
             "recipient_phone_number": phone,
             "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
-            "default_webhook": "https://wellring-backend.onrender.com/bolna-webhook"
+            "default_webhook": f"{BASE_WEBHOOK_URL}/bolna-webhook",
+            "agent_config": {
+                "tasks": [task_config],
+                "engine": {
+                    "transcription": {
+                        "interruption_threshold": 3,
+                        "generate_precise_transcript": True
+                    },
+                    "response_latency": {
+                        "endpointing_ms": 500,
+                        "linear_delay_ms": 50
+                    }
+                }
+            }
         }
             
         if user_id_val:
@@ -1138,7 +1210,7 @@ async def manual_notify(request: Request, api_key: str = Depends(get_api_key)):
     Body: { phone: '+91...', risk_level: 'HIGH', symptoms: ['fever'], patient_name: 'Atharva' }
     """
     body = await request.json()
-    phone        = body.get("phone", os.environ.get("CAREGIVER_PHONE", ""))
+    phone        = body.get("phone")
     risk_level   = body.get("risk_level", "HIGH")
     symptoms     = body.get("symptoms", ["fever"])
     patient_name = body.get("patient_name", "the patient")
@@ -1237,8 +1309,10 @@ async def add_family_contact(req: FamilyContactRequest, api_key: str = Depends(g
             
         add_single_family_contact(str(profile["user_id"]), req.name, req.phone, req.relationship)
         return {"status": "success"}
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error adding family contact: {e}")
+        logger.error(f"Error adding family contact: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/family-contacts")
@@ -1246,7 +1320,9 @@ async def get_family_contacts_route(firebase_uid: str, api_key: str = Depends(ge
     try:
         profile = get_user_profile(firebase_uid)
         if not profile:
-            raise HTTPException(status_code=404, detail="Elder profile not found")
+            # Return empty list rather than 404 — frontend expects an array, not an error
+            logger.warning(f"[FAMILY-CONTACTS] No profile for firebase_uid={firebase_uid!r}, returning []")
+            return []
             
         contacts = get_family_contacts(str(profile["user_id"]))
         
@@ -1260,8 +1336,10 @@ async def get_family_contacts_route(firebase_uid: str, api_key: str = Depends(ge
                 "relationship": c.get("relationship", "Other")
             })
         return formatted_contacts
+    except HTTPException:
+        raise  # re-raise HTTP exceptions as-is (don't swallow 404 → 500)
     except Exception as e:
-        logger.error(f"Error fetching family contacts: {e}")
+        logger.error(f"Error fetching family contacts: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/family-contacts/{contact_id}")
@@ -1271,8 +1349,10 @@ async def delete_family_contact_route(contact_id: str, api_key: str = Depends(ge
         if not success:
             raise HTTPException(status_code=404, detail="Contact not found")
         return {"status": "success"}
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error deleting family contact: {e}")
+        logger.error(f"Error deleting family contact: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 # genai already imported at module top
@@ -1506,16 +1586,7 @@ async def bolna_webhook(request: Request):
                             caregiver_name=contact_name
                         )
             else:
-                # Fallback to default caregiver if no family contacts found
-                fallback_phone = os.environ.get("CAREGIVER_PHONE")
-                if fallback_phone:
-                    send_unanswered_call_alert(
-                        to_phone=fallback_phone,
-                        patient_name=patient_name,
-                        caregiver_name="Caregiver"
-                    )
-                else:
-                    logger.warning(f"[WEBHOOK] Could not find contacts for {phone} and no fallback phone set.")
+                logger.warning(f"[WEBHOOK] Could not find contacts for {phone}. No unanswered call alert sent.")
         
         elif status in ("completed", "success", "done"):
             # A successful call might have extracted health data
@@ -1571,6 +1642,10 @@ async def bolna_webhook(request: Request):
                     
             recording_url = payload.get("recording_url")
             
+            if recording_url:
+                # Upload to S3 (Backblaze B2) to replace transient Bolna link
+                recording_url = await upload_recording_to_s3(recording_url, phone)
+                
             # Analyze emotion if we have an audio recording URL
             emotion_analysis = ""
             if recording_url:
@@ -1624,13 +1699,7 @@ async def bolna_webhook(request: Request):
                                 caregiver_name=contact_name
                             )
                 else:
-                    fallback_phone = os.environ.get("CAREGIVER_PHONE")
-                    if fallback_phone:
-                        send_unanswered_call_alert(
-                            to_phone=fallback_phone,
-                            patient_name=patient_name,
-                            caregiver_name="Caregiver"
-                        )
+                    logger.warning(f"[WEBHOOK] Could not find contacts for {phone}. No unanswered call alert sent.")
 
             # If we have any data to process (either from transcript, or Bolna extracted)
             if formatted_transcript or extracted:

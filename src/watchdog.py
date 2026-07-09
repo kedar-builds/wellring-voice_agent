@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-NEMOTRON_MODEL = "nvidia/llama-3.1-nemotron-ultra-253b-v1"
+NEMOTRON_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
 WATCHDOG_INTERVAL_SECONDS = 60       # how often the watchdog runs
 ORPHAN_WINDOW_MINUTES = 10           # look-back window for orphaned assessments

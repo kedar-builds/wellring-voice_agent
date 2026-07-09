@@ -24,7 +24,7 @@ import os
 import datetime
 from typing import Optional
 from src.database import log_alert, get_family_contacts
-from src.users import get_caregiver_phone, get_user
+from src.users import get_user
 
 logger = logging.getLogger(__name__)
 
@@ -311,21 +311,23 @@ def trigger_alerts_if_needed(
                     "phone": contact.get("phone")
                 })
                 
-    # Fallback to caregiver phone if no family contacts found
+    # Fallback to caregiver phone from user profile if no family contacts found
     if not family_contacts:
-        caregiver_phone = get_caregiver_phone(user_id, CAREGIVER_PHONE)
+        caregiver_phone = None
         caregiver_name = None
         if user:  # safe — always defined above
             caregiver_name = user.get("caregiver_name") or None
             if user.get("caregiver_phone"):
                 caregiver_phone = user["caregiver_phone"]
         
-        # Last resort — always use the env var CAREGIVER_PHONE
-        if not caregiver_phone:
-            caregiver_phone = CAREGIVER_PHONE
-        
         if caregiver_phone:
             family_contacts.append({"name": caregiver_name, "phone": caregiver_phone})
+
+    # Last-resort fallback: use the global CAREGIVER_PHONE env variable
+    # (covers anonymous Bolna calls and demo assessments with no user_id)
+    if not family_contacts and CAREGIVER_PHONE:
+        logger.info(f"[NOTIFY] Using global CAREGIVER_PHONE fallback: {CAREGIVER_PHONE}")
+        family_contacts.append({"name": None, "phone": CAREGIVER_PHONE})
 
     if not family_contacts:
         logger.warning("[NOTIFY] No caregiver/family phone found — skipping alert.")
