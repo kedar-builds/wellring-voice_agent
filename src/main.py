@@ -898,17 +898,18 @@ CALL FLOW — follow this EXACT script:
 
 STEP 1 — Check in:
 Say: "Hello, how are you feeling today and how is your day so far?? Any discomfort throughout the day??"
-Wait for their response.
+WAIT FOR THEIR RESPONSE. Do NOT end the call or use tools yet.
 
 STEP 2 — Resolution & Goodbye:
-- If they say NO / ALL GOOD / FINE (No problems) → say "Till then take your medicines regularly and take care." and end the call.
-- If they mention ANY discomfort, pain, or urgent situation → immediately call the `assess_health_risk` tool with severity=high to send a WhatsApp alert to their family. Then say "I will notify your family immediately. Till then take your medicines regularly and take care." and end the call.
+- If they say NO / ALL GOOD / FINE (No problems) → say "Till then take your medicines regularly and take care." THEN use the `end_call` tool.
+- If they mention ANY discomfort, pain, or urgent situation → immediately call the `assess_health_risk` tool with severity=high to send a WhatsApp alert to their family. Then say "I will notify your family immediately. Till then take your medicines regularly and take care." THEN use the `end_call` tool.
 
 STRICT RULES:
 - Stick EXACTLY to the script phrases provided above. Do not add extra filler words.
 - Do NOT ask any other follow-up questions.
 - Keep the interaction as brief as possible.
-- When the conversation is over, use the `end_call` tool to terminate the session."""
+- IMPORTANT: You MUST wait for the user to respond before ending the call.
+- NEVER use the `end_call` tool until AFTER you have spoken the goodbye message."""
 
 
 class CallRequest(BaseModel):
@@ -978,37 +979,62 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     user_id_val = str(user_profile.get("user_id", "")) if user_profile else ""
     
     async with httpx.AsyncClient(timeout=30) as client:
-        # We only pass the specific prompts and webhook overrides we need.
-        # Passing the entire fetched agent_config causes immediate call drops due to conflicting metadata (e.g. id, created_at).
-        task_config: Dict[str, Any] = {
-            "tools_config": {
-                "api_tools": {
-                    "tools_params": {
-                        "assess_health_risk": {
-                            "param": {
-                                "intent": "%(intent)s",
-                                "symptoms": "%(symptoms)s",
-                                "severity": "%(severity)s",
-                                "confidence": "%(confidence)s",
-                                "user_id": user_id_val
-                            }
-                        },
-                        "end_call": {
-                            "param": {}
-                        }
-                    }
-                }
-            }
-        }
+        # 1. Fetch current agent config to avoid dropping settings like transcriber, llm_config, etc.
+        agent_resp = await client.get(
+            f"https://api.bolna.ai/agent/{BOLNA_AGENT_ID}",
+            headers={"Authorization": f"Bearer {BOLNA_API_KEY}"}
+        )
+        if agent_resp.status_code != 200:
+            logger.error(f"[CALL] Failed to fetch agent config: {agent_resp.text}")
+            raise HTTPException(status_code=500, detail="Failed to fetch agent config from Bolna")
+            
+        fetched_agent = agent_resp.json()
+        agent_config = fetched_agent.get("agent_config", {})
         
-        if voice_id:
-            task_config["tools_config"]["synthesizer"] = {
-                "provider": tts_provider,
-                "provider_config": {
-                    "voice": voice_id,
-                    "voice_id": voice_id
-                }
-            }
+        # 2. Inject user-specific parameters into the first task
+        tasks = agent_config.get("tasks", [])
+        if tasks:
+            task_0 = tasks[0]
+            if "tools_config" not in task_0:
+                task_0["tools_config"] = {}
+            if "api_tools" not in task_0["tools_config"]:
+                task_0["tools_config"]["api_tools"] = {}
+            if "tools_params" not in task_0["tools_config"]["api_tools"]:
+                task_0["tools_config"]["api_tools"]["tools_params"] = {}
+                
+            tools_params = task_0["tools_config"]["api_tools"]["tools_params"]
+            
+            # Ensure structure exists for assess_health_risk
+            if "assess_health_risk" not in tools_params:
+                tools_params["assess_health_risk"] = {"param": {}}
+            elif "param" not in tools_params["assess_health_risk"]:
+                tools_params["assess_health_risk"]["param"] = {}
+                
+            tools_params["assess_health_risk"]["param"].update({
+                "intent": "%(intent)s",
+                "symptoms": "%(symptoms)s",
+                "severity": "%(severity)s",
+                "confidence": "%(confidence)s",
+                "user_id": user_id_val
+            })
+            
+            # Ensure end_call exists
+            if "end_call" not in tools_params:
+                tools_params["end_call"] = {"param": {}}
+                
+            # 3. Dynamic Voice override if configured
+            if voice_id:
+                if "synthesizer" not in task_0["tools_config"]:
+                    task_0["tools_config"]["synthesizer"] = {}
+                if "provider_config" not in task_0["tools_config"]["synthesizer"]:
+                    task_0["tools_config"]["synthesizer"]["provider_config"] = {}
+                    
+                task_0["tools_config"]["synthesizer"]["provider"] = tts_provider
+                task_0["tools_config"]["synthesizer"]["provider_config"]["voice"] = voice_id
+                task_0["tools_config"]["synthesizer"]["provider_config"]["voice_id"] = voice_id
+                
+            tasks[0] = task_0
+            agent_config["tasks"] = tasks
 
         bolna_payload = {
             "agent_id": BOLNA_AGENT_ID,
@@ -1019,19 +1045,7 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
                 }
             },
             "default_webhook": f"{BASE_WEBHOOK_URL}/bolna-webhook",
-            "agent_config": {
-                "tasks": [task_config],
-                "engine": {
-                    "transcription": {
-                        "interruption_threshold": 3,
-                        "generate_precise_transcript": True
-                    },
-                    "response_latency": {
-                        "endpointing_ms": 500,
-                        "linear_delay_ms": 50
-                    }
-                }
-            }
+            "agent_config": agent_config
         }
             
         if user_id_val:
@@ -1116,54 +1130,69 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
 
     logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
     async with httpx.AsyncClient(timeout=30) as client:
-        task_config: Dict[str, Any] = {
-            "tools_config": {
-                "api_tools": {
-                    "tools_params": {
-                        "assess_health_risk": {
-                            "param": {
-                                "intent": "%(intent)s",
-                                "symptoms": "%(symptoms)s",
-                                "severity": "%(severity)s",
-                                "confidence": "%(confidence)s",
-                                "user_id": user_id_val
-                            }
-                        },
-                        "end_call": {
-                            "param": {}
-                        }
-                    }
-                }
-            }
-        }
+        # 1. Fetch current agent config to avoid dropping settings like transcriber, llm_config, etc.
+        agent_resp = await client.get(
+            f"https://api.bolna.ai/agent/{BOLNA_AGENT_ID}",
+            headers={"Authorization": f"Bearer {BOLNA_API_KEY}"}
+        )
+        if agent_resp.status_code != 200:
+            logger.error(f"[CALL] Failed to fetch agent config: {agent_resp.text}")
+            raise RuntimeError(f"Failed to fetch agent config from Bolna")
+            
+        fetched_agent = agent_resp.json()
+        agent_config = fetched_agent.get("agent_config", {})
         
-        if voice_id:
-            task_config["tools_config"]["synthesizer"] = {
-                "provider": tts_provider,
-                "provider_config": {
-                    "voice": voice_id,
-                    "voice_id": voice_id
-                }
-            }
+        # 2. Inject user-specific parameters into the first task
+        tasks = agent_config.get("tasks", [])
+        if tasks:
+            task_0 = tasks[0]
+            if "tools_config" not in task_0:
+                task_0["tools_config"] = {}
+            if "api_tools" not in task_0["tools_config"]:
+                task_0["tools_config"]["api_tools"] = {}
+            if "tools_params" not in task_0["tools_config"]["api_tools"]:
+                task_0["tools_config"]["api_tools"]["tools_params"] = {}
+                
+            tools_params = task_0["tools_config"]["api_tools"]["tools_params"]
+            
+            # Ensure structure exists for assess_health_risk
+            if "assess_health_risk" not in tools_params:
+                tools_params["assess_health_risk"] = {"param": {}}
+            elif "param" not in tools_params["assess_health_risk"]:
+                tools_params["assess_health_risk"]["param"] = {}
+                
+            tools_params["assess_health_risk"]["param"].update({
+                "intent": "%(intent)s",
+                "symptoms": "%(symptoms)s",
+                "severity": "%(severity)s",
+                "confidence": "%(confidence)s",
+                "user_id": user_id_val
+            })
+            
+            # Ensure end_call exists
+            if "end_call" not in tools_params:
+                tools_params["end_call"] = {"param": {}}
+                
+            # 3. Dynamic Voice override if configured
+            if voice_id:
+                if "synthesizer" not in task_0["tools_config"]:
+                    task_0["tools_config"]["synthesizer"] = {}
+                if "provider_config" not in task_0["tools_config"]["synthesizer"]:
+                    task_0["tools_config"]["synthesizer"]["provider_config"] = {}
+                    
+                task_0["tools_config"]["synthesizer"]["provider"] = tts_provider
+                task_0["tools_config"]["synthesizer"]["provider_config"]["voice"] = voice_id
+                task_0["tools_config"]["synthesizer"]["provider_config"]["voice_id"] = voice_id
+                
+            tasks[0] = task_0
+            agent_config["tasks"] = tasks
 
         bolna_payload: Dict[str, Any] = {
             "agent_id": BOLNA_AGENT_ID,
             "recipient_phone_number": phone,
             "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
             "default_webhook": f"{BASE_WEBHOOK_URL}/bolna-webhook",
-            "agent_config": {
-                "tasks": [task_config],
-                "engine": {
-                    "transcription": {
-                        "interruption_threshold": 3,
-                        "generate_precise_transcript": True
-                    },
-                    "response_latency": {
-                        "endpointing_ms": 500,
-                        "linear_delay_ms": 50
-                    }
-                }
-            }
+            "agent_config": agent_config
         }
             
         if user_id_val:

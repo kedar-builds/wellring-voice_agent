@@ -63,6 +63,8 @@ def build_alert_message(
     steps: list,
     caregiver_name: Optional[str] = None,
     timestamp: Optional[str] = None,
+    transcript: Optional[str] = None,
+    recording_url: Optional[str] = None,
 ) -> str:
     """
     Build a clear, human-readable WhatsApp message for the caregiver.
@@ -102,6 +104,12 @@ def build_alert_message(
 
     action_clean = action.replace("_", " ").title()
 
+    call_summary = ""
+    if transcript:
+        call_summary = f"\n\n📝 *Call Summary:*\n{transcript}"
+    if recording_url:
+        call_summary += f"\n\n🎧 *Call Recording:* {recording_url}"
+
     msg = (
         f"{emoji} *WellRing Health Alert*\n\n"
         f"{greeting}\n\n"
@@ -110,7 +118,8 @@ def build_alert_message(
         f"🩺 *Risk Level:* {risk_level} (Score: {score})\n"
         f"💊 *Symptoms:* {sym_str}\n"
         f"📋 *Action:* {action_clean}"
-        f"{steps_block}\n\n"
+        f"{steps_block}"
+        f"{call_summary}\n\n"
         f"⏰ Reported at: {ts}\n\n"
         f"👉 View full report: {DASHBOARD_URL}\n"
         f"— WellRing Team"
@@ -124,6 +133,8 @@ def build_routine_update_message(
     symptoms: Optional[list] = None,
     risk_level: str = "LOW",
     timestamp: Optional[str] = None,
+    transcript: Optional[str] = None,
+    recording_url: Optional[str] = None,
 ) -> str:
     """
     Routine (LOW/MEDIUM) check-in update for caregivers.
@@ -139,11 +150,18 @@ def build_routine_update_message(
     else:
         health_line = f"Yeah, {patient_name} is fine and doing well."
 
+    call_summary = ""
+    if transcript:
+        call_summary = f"\n\n📝 *Call Summary:*\n{transcript}"
+    if recording_url:
+        call_summary += f"\n\n🎧 *Call Recording:* {recording_url}"
+
     msg = (
         f"{emoji} *WellRing Daily Update*\n\n"
         f"{greeting}\n\n"
         f"*{patient_name}* just completed their daily wellness check-in with Riley.\n\n"
-        f"{health_line}\n\n"
+        f"{health_line}"
+        f"{call_summary}\n\n"
         f"⏰ Check-in time: {ts}\n\n"
         f"👉 Full history: {DASHBOARD_URL}\n"
         f"— WellRing Team"
@@ -213,6 +231,8 @@ def send_whatsapp_alert(
     symptoms   = response_data.get("symptoms", [])
     action     = response_data.get("action", "monitor")
     steps      = response_data.get("steps", [])
+    transcript = response_data.get("transcript")
+    recording_url = response_data.get("recording_url")
 
     body = build_alert_message(
         patient_name=patient_name,
@@ -222,6 +242,8 @@ def send_whatsapp_alert(
         action=action,
         steps=steps,
         caregiver_name=caregiver_name,
+        transcript=transcript,
+        recording_url=recording_url,
     )
 
     sent = False
@@ -358,6 +380,8 @@ def trigger_alerts_if_needed(
                 caregiver_name=name,
                 symptoms=response_data.get("symptoms", []),
                 risk_level=risk_level,
+                transcript=response_data.get("transcript"),
+                recording_url=response_data.get("recording_url"),
             )
             sent = False
             if USE_TWILIO:
