@@ -368,8 +368,8 @@ def trigger_alerts_if_needed(
                 caregiver_name=name,
             )
 
-    else:
-        # Routine update for LOW/MEDIUM check-ins — always notify family
+    elif risk_level == "MEDIUM":
+        # Routine update for MEDIUM check-ins — always notify family
         # that the elder answered and completed the check-in.
         for contact in family_contacts:
             phone = contact["phone"]
@@ -400,6 +400,8 @@ def trigger_alerts_if_needed(
                 recipient_phone=phone,
                 recipient_name=name,
             )
+    else:
+        logger.info(f"[NOTIFY] Risk level is {risk_level}, skipping WhatsApp update.")
 
 
 def send_whatsapp_reminder(to_phone: str, body: str) -> bool:
