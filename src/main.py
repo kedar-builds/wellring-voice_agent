@@ -415,6 +415,29 @@ def storage_status(api_key: str = Depends(get_api_key)):
     }
 
 
+@app.get("/config-check", tags=["Health"])
+def config_check(api_key: str = Depends(get_api_key)):
+    """
+    Check environment configuration and return masked API keys to debug credential issues.
+    """
+    def mask_key(val: str) -> str:
+        if not val:
+            return "not_configured"
+        if len(val) <= 10:
+            return "***"
+        return f"{val[:6]}...{val[-4:]}"
+
+    return {
+        "BOLNA_AGENT_ID": mask_key(os.environ.get("BOLNA_AGENT_ID", "")),
+        "BOLNA_API_KEY": mask_key(os.environ.get("BOLNA_API_KEY", "")),
+        "GEMINI_API_KEY": mask_key(os.environ.get("GEMINI_API_KEY", "")),
+        "TWILIO_ACCOUNT_SID": mask_key(os.environ.get("TWILIO_ACCOUNT_SID", "")),
+        "CAREGIVER_PHONE": mask_key(os.environ.get("CAREGIVER_PHONE", "")),
+        "DATABASE_URL_configured": bool(os.environ.get("DATABASE_URL")),
+    }
+
+
+
 @app.get("/recordings/{assessment_id}", tags=["Recordings"])
 async def get_recording(assessment_id: str, api_key: str = Depends(get_api_key)):
     """
@@ -989,17 +1012,17 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
             raise HTTPException(status_code=500, detail="Failed to fetch agent config from Bolna")
             
         fetched_agent = agent_resp.json()
-        agent_config = fetched_agent.get("agent_config", {})
+        agent_config = fetched_agent.get("agent_config") or fetched_agent
         
         # 2. Inject user-specific parameters into the first task
         tasks = agent_config.get("tasks", [])
         if tasks:
             task_0 = tasks[0]
-            if "tools_config" not in task_0:
+            if task_0.get("tools_config") is None:
                 task_0["tools_config"] = {}
-            if "api_tools" not in task_0["tools_config"]:
+            if task_0["tools_config"].get("api_tools") is None:
                 task_0["tools_config"]["api_tools"] = {}
-            if "tools_params" not in task_0["tools_config"]["api_tools"]:
+            if task_0["tools_config"]["api_tools"].get("tools_params") is None:
                 task_0["tools_config"]["api_tools"]["tools_params"] = {}
                 
             tools_params = task_0["tools_config"]["api_tools"]["tools_params"]
@@ -1140,17 +1163,17 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
             raise RuntimeError(f"Failed to fetch agent config from Bolna")
             
         fetched_agent = agent_resp.json()
-        agent_config = fetched_agent.get("agent_config", {})
+        agent_config = fetched_agent.get("agent_config") or fetched_agent
         
         # 2. Inject user-specific parameters into the first task
         tasks = agent_config.get("tasks", [])
         if tasks:
             task_0 = tasks[0]
-            if "tools_config" not in task_0:
+            if task_0.get("tools_config") is None:
                 task_0["tools_config"] = {}
-            if "api_tools" not in task_0["tools_config"]:
+            if task_0["tools_config"].get("api_tools") is None:
                 task_0["tools_config"]["api_tools"] = {}
-            if "tools_params" not in task_0["tools_config"]["api_tools"]:
+            if task_0["tools_config"]["api_tools"].get("tools_params") is None:
                 task_0["tools_config"]["api_tools"]["tools_params"] = {}
                 
             tools_params = task_0["tools_config"]["api_tools"]["tools_params"]
