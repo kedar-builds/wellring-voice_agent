@@ -416,7 +416,7 @@ def storage_status(api_key: str = Depends(get_api_key)):
 
 
 @app.get("/config-check", tags=["Health"])
-def config_check(api_key: str = Depends(get_api_key)):
+def config_check():
     """
     Check environment configuration and return masked API keys to debug credential issues.
     """
