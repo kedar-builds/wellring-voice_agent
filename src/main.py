@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Security, Depends, status, Request, UploadFile, File, Form
+from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -257,8 +258,6 @@ async def lifespan(app: FastAPI):
                 await task
             except asyncio.CancelledError:
                 pass
-
-from fastapi.responses import JSONResponse
 
 app = FastAPI(
     title="WellRing Health Risk API",
