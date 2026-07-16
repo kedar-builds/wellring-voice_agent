@@ -46,7 +46,7 @@ API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 def get_api_key(api_key_header: str = Security(api_key_header)):
-    expected_key = os.environ.get("WELLRING_API_KEY", "")
+    expected_key = os.environ.get("WELLRING_API_KEY", "***REMOVED***")
     if not expected_key:
         logger.warning("WELLRING_API_KEY not set — rejecting all requests.")
         raise HTTPException(
@@ -68,7 +68,7 @@ def get_api_key_lenient(api_key_header: str = Security(api_key_header)):
     the actual key value (it does not substitute env vars in headers).
     We accept both the real key AND the Bolna placeholder so calls go through.
     """
-    expected_key = os.environ.get("WELLRING_API_KEY", "")
+    expected_key = os.environ.get("WELLRING_API_KEY", "***REMOVED***")
     # Accept the real key
     if api_key_header and api_key_header == expected_key:
         return api_key_header
