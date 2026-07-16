@@ -912,7 +912,7 @@ def remove_reminder(reminder_id: int, api_key: str = Depends(get_api_key)):
 
 BOLNA_API_KEY = os.environ.get("BOLNA_API_KEY", "")
 BOLNA_AGENT_ID = os.environ.get("BOLNA_AGENT_ID", "59528716-267c-4a93-af51-97e7282f0123")
-BASE_WEBHOOK_URL = os.environ.get("BASE_WEBHOOK_URL", "https://wellring-backend.onrender.com").rstrip("/")
+BASE_WEBHOOK_URL = os.environ.get("BASE_WEBHOOK_URL", "https://wellring-backend-production.up.railway.app").rstrip("/")
 
 BASE_SYSTEM_PROMPT = """You are a caring assistant from WellRing calling to check on [elder_name].
 
