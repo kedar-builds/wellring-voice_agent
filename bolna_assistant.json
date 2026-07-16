@@ -45,7 +45,7 @@
           }
         },
         "server": {
-          "url": "https://wellring-backend.onrender.com/assess",
+          "url": "https://wellring-backend-production.up.railway.app/assess",
           "headers": {
             "X-API-Key": "{{WELLRING_API_KEY}}"
           }

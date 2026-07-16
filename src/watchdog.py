@@ -59,7 +59,7 @@ async def _call_nemotron(system_prompt: str, user_message: str) -> Optional[str]
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://wellring-backend.onrender.com",
+        "HTTP-Referer": "https://wellring-backend-production.up.railway.app",
         "X-Title": "WellRing Watchdog",
     }
     payload = {
