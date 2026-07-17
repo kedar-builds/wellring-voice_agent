@@ -87,7 +87,7 @@ from src.database import (
     add_reminder, get_reminders, delete_reminder, update_reminder_trigger,
     get_assessments_list, get_assessment_stats, get_user_health_context,
     upsert_user_profile, get_user_profile, upsert_family_contacts, get_family_contacts, delete_family_contact,
-    add_single_family_contact, get_user_by_phone, get_call_timeline
+    add_single_family_contact, get_user_by_phone, get_call_timeline, log_conversation_turn
 )
 from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp, send_unanswered_call_alert
 from src.watchdog import run_watchdog
@@ -333,6 +333,9 @@ class AssessRequest(BaseModel):
     )
     user_id: Optional[str] = Field(None, description="UUID of the user (patient)")
     recording_url: Optional[str] = Field(None, description="URL to the audio recording of the assessment")
+    bolna_call_id: Optional[str] = Field(None, description="Call ID from Bolna")
+    transcript: Optional[str] = Field(None, description="Full transcript of the call")
+    emotion_analysis: Optional[str] = Field(None, description="Emotion analysis results")
 
     @field_validator("severity")
     @classmethod
@@ -370,7 +373,11 @@ class AssessResponse(BaseModel):
 
     # --- Meta ---
     timestamp: str     = Field(..., description="ISO 8601 UTC timestamp of the assessment")
+    assessment_id: Optional[str] = Field(None, description="UUID of the persisted assessment record")
     recording_url: Optional[str] = Field(None, description="URL to the audio recording if provided")
+    bolna_call_id: Optional[str] = Field(None, description="Call ID from Bolna if provided")
+    transcript: Optional[str] = Field(None, description="Transcript of the call if provided")
+    emotion_analysis: Optional[str] = Field(None, description="Emotion analysis if provided")
 
 
 class HealthResponse(BaseModel):
@@ -487,6 +494,7 @@ async def process_assessment_data(
     confidence: float,
     user_id: Optional[str] = None,
     recording_url: Optional[str] = None,
+    bolna_call_id: Optional[str] = None,
     transcript: Optional[str] = None,
     emotion_analysis: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -631,6 +639,7 @@ async def process_assessment_data(
         "breakdown": score_result["breakdown"],
         "timestamp": datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z",
         "recording_url": recording_url,
+        "bolna_call_id": bolna_call_id,
         "transcript": transcript,
         "emotion_analysis": emotion_analysis,
     }
@@ -640,6 +649,7 @@ async def process_assessment_data(
     log_data["intent"] = intent
     log_data["user_id"] = user_id
     interaction_id = await asyncio.to_thread(log_interaction, log_data)
+    response_data["assessment_id"] = interaction_id
 
     # Trigger alerts if necessary (also contains blocking I/O)
     await asyncio.to_thread(trigger_alerts_if_needed, interaction_id, response_data, user_id)
@@ -743,6 +753,9 @@ async def assess(request: Request, api_key: str = Depends(get_api_key_lenient)):
         confidence = payload.confidence
         user_id = payload.user_id
         recording_url = payload.recording_url
+        bolna_call_id = payload.bolna_call_id
+        transcript = payload.transcript
+        emotion_analysis = payload.emotion_analysis
     except Exception as err:
         raise HTTPException(status_code=422, detail=str(err))
 
@@ -752,7 +765,10 @@ async def assess(request: Request, api_key: str = Depends(get_api_key_lenient)):
         severity=severity,
         confidence=confidence,
         user_id=user_id,
-        recording_url=recording_url
+        recording_url=recording_url,
+        bolna_call_id=bolna_call_id,
+        transcript=transcript,
+        emotion_analysis=emotion_analysis
     )
 
     return AssessResponse(**response_data)
@@ -1757,7 +1773,9 @@ async def bolna_webhook(request: Request):
                 user_profile = get_user_by_phone(phone)
                 user_id = str(user_profile["user_id"]) if user_profile and "user_id" in user_profile else None
                 
-                await process_assessment_data(
+                call_id = _find_key(payload, ["call_id", "id"])
+
+                response_data = await process_assessment_data(
                     intent=intent,
                     symptoms=symptoms,
                     severity=severity,
@@ -1765,8 +1783,28 @@ async def bolna_webhook(request: Request):
                     user_id=user_id,
                     recording_url=recording_url,
                     transcript=formatted_transcript if formatted_transcript else None,
-                    emotion_analysis=emotion_analysis
+                    emotion_analysis=emotion_analysis,
+                    bolna_call_id=call_id
                 )
+                
+                assessment_id = response_data.get("assessment_id")
+                
+                if user_id and isinstance(raw_transcript, list):
+                    for msg in raw_transcript:
+                        if isinstance(msg, dict):
+                            r = msg.get("role", "unknown")
+                            c = msg.get("content", "")
+                            if c:
+                                await asyncio.to_thread(
+                                    log_conversation_turn,
+                                    user_id=user_id,
+                                    role=r,
+                                    content=c,
+                                    bolna_call_id=call_id,
+                                    channel="voice",
+                                    assessment_id=assessment_id,
+                                    audio_url=None
+                                )
 
         return {"status": "ok"}
     except Exception as e:
