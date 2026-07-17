@@ -888,7 +888,10 @@ def _get_assessments_pg(limit: int = 50, risk_level: Optional[str] = None) -> Li
                action,
                message,
                user_id,
-               recording_url
+               recording_url,
+               bolna_call_id,
+               transcript,
+               emotion_analysis
         FROM assessments
     """
     params: List[Any] = []
