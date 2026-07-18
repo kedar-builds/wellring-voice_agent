@@ -87,7 +87,8 @@ from src.database import (
     add_reminder, get_reminders, delete_reminder, update_reminder_trigger,
     get_assessments_list, get_assessment_stats, get_user_health_context,
     upsert_user_profile, get_user_profile, upsert_family_contacts, get_family_contacts, delete_family_contact,
-    add_single_family_contact, get_user_by_phone, get_call_timeline, log_conversation_turn
+    add_single_family_contact, get_user_by_phone, get_call_timeline, log_conversation_turn,
+    ANONYMOUS_USER_ID,
 )
 from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp, send_unanswered_call_alert
 from src.watchdog import run_watchdog
@@ -307,7 +308,7 @@ class AssessRequest(BaseModel):
     Payload sent by Kedar's LLM module after parsing the user's speech.
     """
     intent: str = Field(
-        default="health_issue",
+        ...,
         description="Intent extracted from speech. e.g. 'health_issue', 'general_query'",
         examples=["health_issue"],
     )
@@ -608,12 +609,20 @@ async def process_assessment_data(
                 normalized_symptoms.append(s)
 
     try:
-        # Build history counts for each symptom from the last 3 days
-        # Use asyncio.to_thread to avoid blocking the event loop with sync DB calls
-        history_counts = {}
-        for s in normalized_symptoms:
-            count = await asyncio.to_thread(get_symptom_repeat_count, s, 3)
-            history_counts[s] = count
+        # Build history counts for each symptom from the last 3 days.
+        # Skip for unmatched callers (user_id is None or the shared Anonymous sentinel)
+        # — the sentinel is a cross-patient bucket; applying its accumulated history
+        # to any individual caller would silently inflate their score.
+        is_identified = user_id and user_id != ANONYMOUS_USER_ID
+        if is_identified:
+            history_counts = {}
+            for s in normalized_symptoms:
+                count = await asyncio.to_thread(get_symptom_repeat_count, s, 3, user_id=user_id)
+                history_counts[s] = count
+        else:
+            # ponytail: first-contact baseline for unmatched callers. Upgrade path:
+            # once callers are reliably matched to a user_id at call time, remove this guard.
+            history_counts = {}
 
         score_result = calculate_score(
             symptoms=normalized_symptoms,
@@ -731,16 +740,15 @@ def sanitize_assess_payload(body: dict) -> dict:
             else:
                 sanitized["intent"] = intent_clean
     else:
-        # Intent is audit-only and does not affect scoring. Defaulting is safe,
-        # but we log this so we can track how often the LLM/Bolna omits it.
+        # ponytail: intent is audit-only (doesn't feed scoring). Default is safe,
+        # but log loudly so we can track how often Bolna omits it.
         logger.warning(
             "[ASSESS] 'intent' missing from payload — defaulting to 'health_issue'. "
             "Source: Bolna tool schema likely doesn't include this field."
         )
         sanitized["intent"] = "health_issue"
 
-    # Defensive check: if symptoms are missing but severity is high, log a warning.
-    # The real fix is ensuring the Bolna tool schema correctly prompts for symptoms.
+    # Log-only defensive check. Bug B (Bolna schema not sending 'symptoms') is the real fix — this just makes silent under-scoring visible.
     if not sanitized.get("symptoms"):
         sev = sanitized.get("severity", "").lower()
         if sev in ("high", "critical"):
