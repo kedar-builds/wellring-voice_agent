@@ -281,6 +281,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 ALLOWED_ORIGINS = [
+    "*",
     "https://wellring-frontend.vercel.app",
     "http://localhost:5173",
     "http://localhost:5174",
@@ -306,7 +307,7 @@ class AssessRequest(BaseModel):
     Payload sent by Kedar's LLM module after parsing the user's speech.
     """
     intent: str = Field(
-        ...,
+        default="health_issue",
         description="Intent extracted from speech. e.g. 'health_issue', 'general_query'",
         examples=["health_issue"],
     )
@@ -729,6 +730,25 @@ def sanitize_assess_payload(body: dict) -> dict:
                 sanitized["intent"] = "health_issue"
             else:
                 sanitized["intent"] = intent_clean
+    else:
+        # Intent is audit-only and does not affect scoring. Defaulting is safe,
+        # but we log this so we can track how often the LLM/Bolna omits it.
+        logger.warning(
+            "[ASSESS] 'intent' missing from payload — defaulting to 'health_issue'. "
+            "Source: Bolna tool schema likely doesn't include this field."
+        )
+        sanitized["intent"] = "health_issue"
+
+    # Defensive check: if symptoms are missing but severity is high, log a warning.
+    # The real fix is ensuring the Bolna tool schema correctly prompts for symptoms.
+    if not sanitized.get("symptoms"):
+        sev = sanitized.get("severity", "").lower()
+        if sev in ("high", "critical"):
+            logger.warning(
+                "[ASSESS] symptoms=[] with severity=%r — scoring will produce LOW/MEDIUM. "
+                "Bolna tool schema likely omits 'symptoms'. Check assess_health_risk schema.",
+                sev,
+            )
 
     return sanitized
 
