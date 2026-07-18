@@ -452,6 +452,15 @@ def _ensure_anonymous_user_pg() -> str:
             return str(row["user_id"]) if row else ""
 
 
+# Sentinel UUID for unmatched callers. History-based multipliers must NOT
+# accumulate on this account — it is a shared bucket, not a single patient.
+# Fetched once at import; safe since it's create-if-not-exists.
+try:
+    ANONYMOUS_USER_ID: str = _ensure_anonymous_user_pg() if _use_postgres() and _PG_AVAILABLE else ""
+except Exception:
+    ANONYMOUS_USER_ID = ""
+
+
 def _log_interaction_supabase(data: Dict[str, Any]) -> Optional[int]:
     supabase = get_supabase()
     if not supabase:
