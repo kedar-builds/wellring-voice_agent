@@ -1343,11 +1343,11 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
             return str(row["user_id"]) if row else ""
 
 def get_user_by_phone(phone: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Look up a user profile by their phone number."""
+    """Look up a user profile by their phone number (most recent first)."""
     if _use_postgres() and _PG_AVAILABLE:
         with get_pg_conn() as conn:
             with _pg_cursor(conn) as cur:
-                cur.execute("SELECT * FROM users WHERE phone = %s", (phone,))
+                cur.execute("SELECT * FROM users WHERE phone = %s ORDER BY created_at DESC LIMIT 1", (phone,))
                 row = cur.fetchone()
                 if row:
                     return dict(row)
@@ -1358,7 +1358,7 @@ def get_user_by_phone(phone: str, db_path: Optional[str] = None) -> Optional[Dic
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE phone = ?", (phone,))
+    cur.execute("SELECT * FROM users WHERE phone = ? ORDER BY created_at DESC LIMIT 1", (phone,))
     row = cur.fetchone()
     conn.close()
     if row:
