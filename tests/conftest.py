@@ -16,6 +16,9 @@ import pytest
 # ── Set the test DB path at module load (before any src import) ───────────
 _tmp_db = tempfile.mktemp(suffix=".db", prefix="wellring_test_")
 os.environ["WELLRING_DB_PATH"] = _tmp_db
+# Set a test-only API key so auth functions don't 500 on missing env var.
+# This value is not a secret — it exists only within the test process.
+os.environ.setdefault("WELLRING_API_KEY", "wellring-test-key-local")
 
 
 @pytest.fixture(scope="session")
@@ -33,7 +36,7 @@ def client():
     # We patch at the function level (lazy check) so dotenv can't override it.
     with patch.object(db_module, "_use_postgres", return_value=False):
         with TestClient(app) as c:
-            c.headers.update({"X-API-Key": "***REMOVED***"})
+            c.headers.update({"X-API-Key": os.environ["WELLRING_API_KEY"]})
             yield c
 
     # Cleanup the temp DB after all tests finish

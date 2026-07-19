@@ -34,7 +34,7 @@ import re
 import httpx
 from google import genai
 from google.genai import types
-from src.storage import upload_recording_to_s3, get_presigned_url, is_storage_configured
+from src.storage import upload_recording_to_b2, get_presigned_url, is_storage_configured
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +46,14 @@ API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 def get_api_key(api_key_header: str = Security(api_key_header)):
-    expected_key = os.environ.get("WELLRING_API_KEY", "***REMOVED***")
+    expected_key = os.environ.get("WELLRING_API_KEY")
     if not expected_key:
-        logger.warning("WELLRING_API_KEY not set — rejecting all requests.")
+        logger.error("WELLRING_API_KEY not set — rejecting all requests.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Server API key not configured"
         )
-    if api_key_header == expected_key or api_key_header == "***REMOVED***":
+    if api_key_header == expected_key:
         return api_key_header
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -66,11 +66,17 @@ def get_api_key_lenient(api_key_header: str = Security(api_key_header)):
     Lenient auth for the /assess endpoint called by Bolna tool calls.
     Bolna sends the literal template string '{{WELLRING_API_KEY}}' instead of
     the actual key value (it does not substitute env vars in headers).
-    We accept both the real key AND the Bolna placeholder so calls go through.
+    We accept the real key OR the Bolna placeholder — nothing else.
     """
-    expected_key = os.environ.get("WELLRING_API_KEY", "***REMOVED***")
+    expected_key = os.environ.get("WELLRING_API_KEY")
+    if not expected_key:
+        logger.error("WELLRING_API_KEY not set — rejecting all requests.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server API key not configured"
+        )
     # Accept the real key
-    if api_key_header and (api_key_header == expected_key or api_key_header == "***REMOVED***"):
+    if api_key_header == expected_key:
         return api_key_header
     # Accept Bolna's unsubstituted placeholder (tool call headers)
     if api_key_header in ("{{WELLRING_API_KEY}}", "%WELLRING_API_KEY%"):
@@ -659,7 +665,7 @@ async def process_assessment_data(
     log_data["intent"] = intent
     log_data["user_id"] = user_id
     interaction_id = await asyncio.to_thread(log_interaction, log_data)
-    response_data["assessment_id"] = interaction_id
+    response_data["assessment_id"] = str(interaction_id) if interaction_id is not None else None
 
     # Trigger alerts if necessary (also contains blocking I/O)
     await asyncio.to_thread(trigger_alerts_if_needed, interaction_id, response_data, user_id)
@@ -739,14 +745,6 @@ def sanitize_assess_payload(body: dict) -> dict:
                 sanitized["intent"] = "health_issue"
             else:
                 sanitized["intent"] = intent_clean
-    else:
-        # ponytail: intent is audit-only (doesn't feed scoring). Default is safe,
-        # but log loudly so we can track how often Bolna omits it.
-        logger.warning(
-            "[ASSESS] 'intent' missing from payload — defaulting to 'health_issue'. "
-            "Source: Bolna tool schema likely doesn't include this field."
-        )
-        sanitized["intent"] = "health_issue"
 
     # Log-only defensive check. Bug B (Bolna schema not sending 'symptoms') is the real fix — this just makes silent under-scoring visible.
     if not sanitized.get("symptoms"):
@@ -1739,7 +1737,7 @@ async def bolna_webhook(request: Request):
             
             if recording_url:
                 # Upload to S3 (Backblaze B2) to replace transient Bolna link
-                recording_url = await upload_recording_to_s3(recording_url, phone)
+                recording_url = await upload_recording_to_b2(recording_url, phone)
                 
             # Analyze emotion if we have an audio recording URL
             emotion_analysis = ""
