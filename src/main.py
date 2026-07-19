@@ -745,14 +745,6 @@ def sanitize_assess_payload(body: dict) -> dict:
                 sanitized["intent"] = "health_issue"
             else:
                 sanitized["intent"] = intent_clean
-    else:
-        # ponytail: intent is audit-only (doesn't feed scoring). Default is safe,
-        # but log loudly so we can track how often Bolna omits it.
-        logger.warning(
-            "[ASSESS] 'intent' missing from payload — defaulting to 'health_issue'. "
-            "Source: Bolna tool schema likely doesn't include this field."
-        )
-        sanitized["intent"] = "health_issue"
 
     # Log-only defensive check. Bug B (Bolna schema not sending 'symptoms') is the real fix — this just makes silent under-scoring visible.
     if not sanitized.get("symptoms"):
