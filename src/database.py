@@ -274,7 +274,8 @@ def init_db(db_path: Optional[str] = None) -> None:
             relationship        TEXT,
             voice_id            TEXT,
             tts_provider        TEXT,
-            updated_at          TEXT
+            updated_at          TEXT,
+            is_system           INTEGER NOT NULL DEFAULT 0
         )
     """)
 
@@ -303,6 +304,23 @@ def init_db(db_path: Optional[str] = None) -> None:
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nemotron_audits (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at      TEXT    NOT NULL,
+            user_id         TEXT,
+            assessment_id   TEXT,
+            original_score  INTEGER,
+            original_risk   TEXT,
+            final_score     INTEGER,
+            final_risk      TEXT,
+            self_corrected  INTEGER NOT NULL DEFAULT 0,
+            override_reason TEXT,
+            raw_payload     TEXT,
+            audit_status    TEXT    NOT NULL DEFAULT 'PASSED'
+        )
+    """)
+
     conn.commit()
     # Migrate any pre-existing DB with old schema
     _migrate_sqlite_schema(conn)
@@ -325,6 +343,7 @@ def _migrate_sqlite_schema(conn: sqlite3.Connection) -> None:
         "caregiver_for_user_id": "TEXT",
         "relationship": "TEXT",
         "updated_at": "TEXT",
+        "is_system": "INTEGER NOT NULL DEFAULT 0",
     }
     for col, col_type in needed_cols.items():
         if col not in existing_cols:
@@ -434,11 +453,12 @@ def _ensure_anonymous_user_pg() -> str:
     """
     Return the UUID of the 'anonymous' sentinel user, creating it if needed.
     """
-    sql_select = "SELECT user_id FROM users WHERE email = 'anonymous@wellring.internal' LIMIT 1"
+    sql_select = "SELECT user_id FROM users WHERE is_system = TRUE LIMIT 1"
     sql_insert = """
-        INSERT INTO users (name, role, email)
-        VALUES ('Anonymous', 'elderly', 'anonymous@wellring.internal')
-        ON CONFLICT DO NOTHING
+        INSERT INTO users (name, role, email, is_system)
+        VALUES ('Anonymous', 'elderly', 'anonymous@wellring.internal', TRUE)
+        ON CONFLICT (is_system) WHERE is_system = TRUE 
+        DO UPDATE SET email = EXCLUDED.email
         RETURNING user_id
     """
     with get_pg_conn() as conn:
@@ -544,13 +564,15 @@ def _symptom_count_pg(symptom: str, days: int, user_id: Optional[str]) -> int:
     cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days)
     sql = """
         SELECT COUNT(*) AS cnt
-        FROM   assessments
-        WHERE  %(symptom)s = ANY(symptoms)
-          AND  assessed_at >= %(cutoff)s
+        FROM   assessments a
+        JOIN   users u ON u.user_id = a.user_id
+        WHERE  %(symptom)s = ANY(a.symptoms)
+          AND  a.assessed_at >= %(cutoff)s
+          AND  u.is_system IS NOT TRUE
     """
     params: Dict[str, Any] = {"symptom": symptom, "cutoff": cutoff}
     if user_id:
-        sql += " AND user_id = %(user_id)s"
+        sql += " AND a.user_id = %(user_id)s"
         params["user_id"] = user_id
 
     with get_pg_conn() as conn:
@@ -582,12 +604,16 @@ def _symptom_count_sqlite(symptom: str, days: int, db_path: Optional[str]) -> in
     db_path = _resolve_db_path(db_path)
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
+    # Exclude the Anonymous sentinel user (role='elderly', name='Anonymous')
+    # so its accumulated history never inflates real users' multipliers.
     cur.execute(
         """
         SELECT COUNT(DISTINCT i.id)
         FROM   interactions i, json_each(i.symptoms) je
+        LEFT JOIN users u ON u.user_id = i.user_id
         WHERE  je.value = ?
           AND  i.timestamp >= datetime('now', ? || ' days')
+          AND  (u.is_system IS NULL OR u.is_system = 0)
         """,
         (symptom, f"-{days}"),
     )
@@ -1291,7 +1317,7 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
         import datetime
         db_path = _resolve_db_path(None)
         user_id = str(uuid.uuid4())
-        now_str = datetime.datetime.utcnow().isoformat()
+        now_str = datetime.datetime.now(datetime.UTC).isoformat()
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute("""
@@ -1781,3 +1807,328 @@ def _get_call_timeline_sqlite(phone: str, limit: int, db_path: Optional[str] = N
     except Exception as exc:
         logger.error(f"[TIMELINE] SQLite query failed: {exc}")
         return []
+
+
+# ===========================================================================
+# Nemotron Watchdog Audit Functions
+# ===========================================================================
+
+def log_nemotron_audit(
+    user_id: str,
+    assessment_id: str,
+    original_score: int,
+    original_risk: str,
+    final_score: int,
+    final_risk: str,
+    self_corrected: bool,
+    override_reason: str,
+    raw_payload: Dict[str, Any],
+    audit_status: str = "PASSED",
+) -> Optional[Union[int, str]]:
+    """
+    Log a Nemotron audit event to the database.
+    Returns the audit row id (int for SQLite, UUID str for Postgres).
+    """
+    created_at = datetime.datetime.now(datetime.UTC).isoformat()
+
+    # --- Postgres ---
+    if _use_postgres() and _PG_AVAILABLE:
+        sql = """
+            INSERT INTO nemotron_audits (
+                created_at, user_id, assessment_id,
+                original_score, original_risk,
+                final_score, final_risk,
+                self_corrected, override_reason, raw_payload, audit_status
+            ) VALUES (
+                %(created_at)s, %(user_id)s, %(assessment_id)s,
+                %(original_score)s, %(original_risk)s,
+                %(final_score)s, %(final_risk)s,
+                %(self_corrected)s, %(override_reason)s, %(raw_payload)s, %(audit_status)s
+            ) RETURNING id
+        """
+        try:
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    cur.execute(sql, {
+                        "created_at":     created_at,
+                        "user_id":        user_id,
+                        "assessment_id":  assessment_id,
+                        "original_score": original_score,
+                        "original_risk":  original_risk,
+                        "final_score":    final_score,
+                        "final_risk":     final_risk,
+                        "self_corrected": self_corrected,
+                        "override_reason": override_reason,
+                        "raw_payload":    json.dumps(raw_payload),
+                        "audit_status":   audit_status,
+                    })
+                    row = cur.fetchone()
+                    return str(row["id"]) if row else None
+        except Exception as exc:
+            logger.error(f"[NEMOTRON-AUDIT] Postgres insert failed: {exc}")
+
+    # --- SQLite fallback ---
+    db_path = os.environ.get("WELLRING_DB_PATH", DB_PATH)
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO nemotron_audits (
+                created_at, user_id, assessment_id,
+                original_score, original_risk,
+                final_score, final_risk,
+                self_corrected, override_reason, raw_payload, audit_status
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                created_at, user_id, assessment_id,
+                original_score, original_risk,
+                final_score, final_risk,
+                1 if self_corrected else 0,
+                override_reason,
+                json.dumps(raw_payload),
+                audit_status,
+            ),
+        )
+        conn.commit()
+        row_id = cur.lastrowid
+        conn.close()
+        return row_id
+    except Exception as exc:
+        logger.error(f"[NEMOTRON-AUDIT] SQLite insert failed: {exc}")
+        return None
+
+
+def get_latest_nemotron_audits(limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Return the most recent Nemotron audit rows, newest first.
+    """
+    # --- Postgres ---
+    if _use_postgres() and _PG_AVAILABLE:
+        sql = """
+            SELECT id, created_at, user_id, assessment_id,
+                   original_score, original_risk,
+                   final_score, final_risk,
+                   self_corrected, override_reason, raw_payload, audit_status
+            FROM   nemotron_audits
+            ORDER  BY created_at DESC
+            LIMIT  %(limit)s
+        """
+        try:
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    cur.execute(sql, {"limit": limit})
+                    rows = []
+                    for r in cur.fetchall():
+                        d = dict(r)
+                        d["id"] = str(d["id"])
+                        d["self_corrected"] = bool(d.get("self_corrected"))
+                        if isinstance(d.get("created_at"), datetime.datetime):
+                            d["created_at"] = d["created_at"].isoformat()
+                        rows.append(d)
+                    return rows
+        except Exception as exc:
+            logger.error(f"[NEMOTRON-AUDIT] Postgres fetch failed: {exc}")
+
+    # --- SQLite fallback ---
+    db_path = os.environ.get("WELLRING_DB_PATH", DB_PATH)
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM nemotron_audits ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            d["self_corrected"] = bool(d.get("self_corrected"))
+            rows.append(d)
+        conn.close()
+        return rows
+    except Exception as exc:
+        logger.error(f"[NEMOTRON-AUDIT] SQLite fetch failed: {exc}")
+        return []
+
+
+def get_active_watchdog_logs(limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Return recent Nemotron audit logs where self_corrected is True
+    (i.e. watchdog actively intervened), useful for the monitoring dashboard.
+    """
+    # --- Postgres ---
+    if _use_postgres() and _PG_AVAILABLE:
+        sql = """
+            SELECT id, created_at, user_id, assessment_id,
+                   original_risk, final_risk,
+                   self_corrected, override_reason, audit_status
+            FROM   nemotron_audits
+            WHERE  self_corrected = TRUE
+            ORDER  BY created_at DESC
+            LIMIT  %(limit)s
+        """
+        try:
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    cur.execute(sql, {"limit": limit})
+                    rows = []
+                    for r in cur.fetchall():
+                        d = dict(r)
+                        d["id"] = str(d["id"])
+                        d["self_corrected"] = bool(d.get("self_corrected"))
+                        if isinstance(d.get("created_at"), datetime.datetime):
+                            d["created_at"] = d["created_at"].isoformat()
+                        rows.append(d)
+                    return rows
+        except Exception as exc:
+            logger.error(f"[WATCHDOG-LOGS] Postgres fetch failed: {exc}")
+
+    # --- SQLite fallback ---
+    db_path = os.environ.get("WELLRING_DB_PATH", DB_PATH)
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, created_at, user_id, assessment_id,
+                   original_risk, final_risk,
+                   self_corrected, override_reason, audit_status
+            FROM   nemotron_audits
+            WHERE  self_corrected = 1
+            ORDER  BY created_at DESC
+            LIMIT  ?
+            """,
+            (limit,),
+        )
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            d["self_corrected"] = bool(d.get("self_corrected"))
+            rows.append(d)
+        conn.close()
+        return rows
+    except Exception as exc:
+        logger.error(f"[WATCHDOG-LOGS] SQLite fetch failed: {exc}")
+        return []
+
+
+def get_health_facts_for_user(user_id: str) -> Dict[str, Any]:
+    """
+    Return a summary of health facts (recent assessments, risk distribution)
+    for a given user_id. Used by the watchdog to build context.
+    """
+    result: Dict[str, Any] = {
+        "user_id": user_id,
+        "recent_assessments": [],
+        "risk_distribution": {},
+        "latest_risk": None,
+    }
+
+    # --- Postgres ---
+    if _use_postgres() and _PG_AVAILABLE:
+        sql = """
+            SELECT assessment_id, assessed_at, risk_level, symptoms, score, action
+            FROM   assessments
+            WHERE  user_id = %(user_id)s
+            ORDER  BY assessed_at DESC
+            LIMIT  10
+        """
+        try:
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    cur.execute(sql, {"user_id": user_id})
+                    rows = []
+                    for r in cur.fetchall():
+                        d = dict(r)
+                        d["assessment_id"] = str(d["assessment_id"])
+                        if isinstance(d.get("assessed_at"), datetime.datetime):
+                            d["assessed_at"] = d["assessed_at"].isoformat()
+                        rows.append(d)
+                    result["recent_assessments"] = rows
+                    if rows:
+                        result["latest_risk"] = rows[0].get("risk_level")
+                        dist: Dict[str, int] = {}
+                        for r in rows:
+                            lv = r.get("risk_level", "UNKNOWN")
+                            dist[lv] = dist.get(lv, 0) + 1
+                        result["risk_distribution"] = dist
+                    return result
+        except Exception as exc:
+            logger.error(f"[HEALTH-FACTS] Postgres query failed: {exc}")
+
+    # --- SQLite fallback ---
+    db_path = os.environ.get("WELLRING_DB_PATH", DB_PATH)
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, timestamp, risk_level, symptoms, score, action
+            FROM   interactions
+            WHERE  user_id = ?
+            ORDER  BY timestamp DESC
+            LIMIT  10
+            """,
+            (user_id,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        result["recent_assessments"] = rows
+        if rows:
+            result["latest_risk"] = rows[0].get("risk_level")
+            dist = {}
+            for r in rows:
+                lv = r.get("risk_level", "UNKNOWN")
+                dist[lv] = dist.get(lv, 0) + 1
+            result["risk_distribution"] = dist
+        return result
+    except Exception as exc:
+        logger.error(f"[HEALTH-FACTS] SQLite query failed: {exc}")
+        return result
+
+
+def is_call_active(call_id: str) -> bool:
+    """
+    Return True if the given Bolna call_id has an entry in the conversations
+    table, indicating it is (or was) an active/completed call.
+    Works with both Postgres and SQLite.
+    """
+    if not call_id:
+        return False
+
+    # --- Postgres ---
+    if _use_postgres() and _PG_AVAILABLE:
+        sql = """
+            SELECT 1 FROM conversations
+            WHERE bolna_call_id = %(call_id)s
+            LIMIT 1
+        """
+        try:
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    cur.execute(sql, {"call_id": call_id})
+                    return cur.fetchone() is not None
+        except Exception as exc:
+            logger.error(f"[IS-CALL-ACTIVE] Postgres query failed: {exc}")
+            return False
+
+    # --- SQLite fallback ---
+    db_path = os.environ.get("WELLRING_DB_PATH", DB_PATH)
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        # Check interactions table which stores bolna_call_id in SQLite
+        cur.execute(
+            "SELECT 1 FROM interactions WHERE recording_url LIKE ? LIMIT 1",
+            (f"%{call_id}%",),
+        )
+        found = cur.fetchone() is not None
+        conn.close()
+        return found
+    except Exception as exc:
+        logger.error(f"[IS-CALL-ACTIVE] SQLite query failed: {exc}")
+        return False
