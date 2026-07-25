@@ -11,10 +11,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- `tests/test_history_sentinel_exclusion.py` — recreated from deleted source; 4 tests covering sentinel
+  exclusion, orphan exclusion, real-user counting, and user-scoped isolation. All 4 pass.
+  *Verification: `pytest tests/test_history_sentinel_exclusion.py -v` → 4 passed in 0.85s (2026-07-26)*
 - `CHANGELOG.md` — this file (Phase 7.4)
 - `CONTRIBUTING.md` — branch + review process documentation (Phase 7.1/7.3)
 - Nemotron 70B watchdog integration: hallucination detection, confidence-based follow-ups,
   audit logging to `nemotron_audits` table (7 tests, all passing)
+
 
 ### Fixed
 - `get_symptom_repeat_count` — excluded `is_system` sentinel user from global symptom
@@ -39,6 +43,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   commit contains `bn-0d9f1aa2347d4aa68b593c8e0680aed5`; key has been invalidated)
 - Rotated PostgreSQL password (Phase 6.3)
 - CORS origins audited; stale `onrender.com` references removed (Phase 5.2)
+- Verified git history for leaked credentials via `git log -G` regex search; confirmed no active external credentials exist in history (Phase 6.4)
+- Stripped `wellring-secure-2026` from 7 JSON config snapshots and 2 helper scripts
+  (`check_system.py`, `smoke_test.py`); scripts now fail loudly if `WELLRING_API_KEY` is
+  unset rather than silently using the old bypass. Stale `onrender.com` URL in
+  `book_appointment` webhook replaced with Railway URL across all config files. (2026-07-26)
 
 ---
 

@@ -653,12 +653,13 @@ def log_alert(
     recipient_name: Optional[str] = None,
     recipient_phone: Optional[str] = None,
     recipient_email: Optional[str] = None,
+    error_message: Optional[str] = None,
 ) -> None:
     """Log a sent alert / notification."""
 
     if _use_postgres() and _PG_AVAILABLE:
         _log_alert_pg(interaction_id, risk_level, notification_type, status,
-                      recipient_name, recipient_phone, recipient_email)
+                      recipient_name, recipient_phone, recipient_email, error_message)
         return
 
     if USE_SUPABASE and _SUPABASE_AVAILABLE:
@@ -695,9 +696,10 @@ def _log_alert_pg(
     recipient_name: Optional[str],
     recipient_phone: Optional[str],
     recipient_email: Optional[str],
+    error_message: Optional[str] = None,
 ) -> None:
     # Normalize alert_type to lowercase (DB check constraint requires lowercase)
-    _VALID_ALERT_TYPES = {"sms", "call", "email", "push", "emergency_services", "in_app"}
+    _VALID_ALERT_TYPES = {"sms", "call", "email", "push", "emergency_services", "in_app", "whatsapp"}
     alert_type_norm = alert_type.lower()
     if alert_type_norm not in _VALID_ALERT_TYPES:
         alert_type_norm = "sms"  # safe fallback
@@ -711,10 +713,10 @@ def _log_alert_pg(
     sql = """
         INSERT INTO alerts (
             assessment_id, alert_type, status,
-            recipient_name, recipient_phone, recipient_email
+            recipient_name, recipient_phone, recipient_email, error_message
         ) VALUES (
             %(assessment_id)s, %(alert_type)s, %(status)s,
-            %(recipient_name)s, %(recipient_phone)s, %(recipient_email)s
+            %(recipient_name)s, %(recipient_phone)s, %(recipient_email)s, %(error_message)s
         )
     """
     import uuid as _uuid
@@ -737,6 +739,7 @@ def _log_alert_pg(
                 "recipient_name":  recipient_name,
                 "recipient_phone": recipient_phone,
                 "recipient_email": recipient_email,
+                "error_message":   error_message,
             })
 
 

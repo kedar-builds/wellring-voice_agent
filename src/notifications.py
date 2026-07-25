@@ -22,7 +22,7 @@ Environment variables (set in .env):
 import logging
 import os
 import datetime
-from typing import Optional
+from typing import Optional, Tuple
 from src.database import log_alert, get_family_contacts
 from src.users import get_user
 
@@ -173,15 +173,16 @@ def build_routine_update_message(
 # Twilio send
 # ---------------------------------------------------------------------------
 
-def _twilio_send(to_phone: str, body: str, notification_type: str = "whatsapp") -> bool:
+def _twilio_send(to_phone: str, body: str, notification_type: str = "whatsapp") -> Tuple[bool, Optional[str]]:
     """
     Internal: dispatch a message via Twilio.
     Handles WhatsApp and SMS channels.
-    Returns True on success, False on failure.
+    Returns (True, None) on success, (False, error_message) on failure.
     """
     if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-        logger.warning("[TWILIO] Credentials not configured — skipping send.")
-        return False
+        err = "Twilio credentials not configured"
+        logger.warning(f"[TWILIO] {err} — skipping send.")
+        return False, err
 
     try:
         from twilio.rest import Client
@@ -204,11 +205,12 @@ def _twilio_send(to_phone: str, body: str, notification_type: str = "whatsapp") 
 
         message = client.messages.create(body=body, from_=from_num, to=to_num)
         logger.info(f"[TWILIO] Sent to {to_phone} | SID: {message.sid}")
-        return True
+        return True, None
 
     except Exception as exc:
-        logger.error(f"[TWILIO] Send failed to {to_phone}: {exc}")
-        return False
+        err_msg = str(exc)
+        logger.error(f"[TWILIO] Send failed to {to_phone}: {err_msg}")
+        return False, err_msg
 
 
 # ---------------------------------------------------------------------------
@@ -247,8 +249,9 @@ def send_whatsapp_alert(
     )
 
     sent = False
+    err_msg = None
     if USE_TWILIO:
-        sent = _twilio_send(to_phone, body)
+        sent, err_msg = _twilio_send(to_phone, body)
     else:
         logger.info(f"[WHATSAPP MOCK → {to_phone}]\n{body}")
         sent = True  # treat mock as success so tests pass
@@ -261,6 +264,7 @@ def send_whatsapp_alert(
         status="sent" if sent else "failed",
         recipient_phone=to_phone,
         recipient_name=caregiver_name,
+        error_message=err_msg,
     )
     return sent
 
@@ -286,7 +290,7 @@ def send_unanswered_call_alert(
 
     sent = False
     if USE_TWILIO:
-        sent = _twilio_send(to_phone, body)
+        sent, _ = _twilio_send(to_phone, body)
     else:
         logger.info(f"[WHATSAPP MOCK → {to_phone}]\n{body}")
         sent = True
@@ -384,8 +388,9 @@ def trigger_alerts_if_needed(
                 recording_url=response_data.get("recording_url"),
             )
             sent = False
+            err_msg = None
             if USE_TWILIO:
-                sent = _twilio_send(phone, body)
+                sent, err_msg = _twilio_send(phone, body)
             else:
                 logger.info(f"[ROUTINE MOCK → {phone}]\n{body}")
                 sent = True  # treat mock as success
@@ -399,6 +404,7 @@ def trigger_alerts_if_needed(
                 status="sent" if sent else "failed",
                 recipient_phone=phone,
                 recipient_name=name,
+                error_message=err_msg,
             )
     else:
         logger.info(f"[NOTIFY] Risk level is {risk_level}, skipping WhatsApp update.")
@@ -409,7 +415,8 @@ def send_whatsapp_reminder(to_phone: str, body: str) -> bool:
     Send a WhatsApp reminder (called by the scheduler for medicine / checkup reminders).
     """
     if USE_TWILIO:
-        return _twilio_send(to_phone, body)
+        sent, _ = _twilio_send(to_phone, body)
+        return sent
     else:
         logger.info(f"[REMINDER MOCK → {to_phone}]\n{body}")
         return True
@@ -430,12 +437,13 @@ def send_test_whatsapp(to_phone: str, patient_name: str = "Atharva") -> dict:
     )
 
     if USE_TWILIO:
-        success = _twilio_send(to_phone, body)
+        success, err_msg = _twilio_send(to_phone, body)
         return {
             "sent": success,
             "channel": "whatsapp" if USE_WHATSAPP else "sms",
             "to": to_phone,
-            "message_preview": body[:100] + "..."
+            "message_preview": body[:100] + "...",
+            "error": err_msg
         }
     else:
         logger.info(f"[TEST MOCK → {to_phone}]\n{body}")
