@@ -56,6 +56,9 @@ CREATE TABLE IF NOT EXISTS users (
     voice_id        TEXT,
     tts_provider    TEXT            NOT NULL DEFAULT 'elevenlabs',
 
+    -- System Flags
+    is_system       BOOLEAN         NOT NULL DEFAULT FALSE,
+
     -- Timestamps
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now()
@@ -63,6 +66,7 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 CREATE INDEX IF NOT EXISTS idx_users_caregiver_for ON users(caregiver_for_user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_system ON users(is_system) WHERE is_system = TRUE;
 
 
 -- ---------------------------------------------------------------------------

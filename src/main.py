@@ -18,7 +18,7 @@ Interactive docs:
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Security, Depends, status, Request, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Security, Depends, status, Request, UploadFile, File, Form, Query
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +32,7 @@ import logging
 import json
 import re
 import httpx
+import secrets
 from google import genai
 from google.genai import types
 from src.storage import upload_recording_to_b2, get_presigned_url, is_storage_configured
@@ -50,10 +51,10 @@ def get_api_key(api_key_header: str = Security(api_key_header)):
     if not expected_key:
         logger.error("WELLRING_API_KEY not set — rejecting all requests.")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server API key not configured"
         )
-    if api_key_header == expected_key:
+    if api_key_header and secrets.compare_digest(api_key_header, expected_key):
         return api_key_header
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -64,24 +65,23 @@ def get_api_key(api_key_header: str = Security(api_key_header)):
 def get_api_key_lenient(api_key_header: str = Security(api_key_header)):
     """
     Lenient auth for the /assess endpoint called by Bolna tool calls.
-    Bolna sends the literal template string '{{WELLRING_API_KEY}}' instead of
-    the actual key value (it does not substitute env vars in headers).
-    We accept the real key OR the Bolna placeholder — nothing else.
+    Accepts the primary API key or a dedicated BOLNA_WEBHOOK_SECRET.
     """
     expected_key = os.environ.get("WELLRING_API_KEY")
     if not expected_key:
         logger.error("WELLRING_API_KEY not set — rejecting all requests.")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server API key not configured"
         )
     # Accept the real key
-    if api_key_header == expected_key:
+    if api_key_header and secrets.compare_digest(api_key_header, expected_key):
         return api_key_header
-    # Accept Bolna's unsubstituted placeholder (tool call headers)
-    if api_key_header in ("{{WELLRING_API_KEY}}", "%WELLRING_API_KEY%"):
-        logger.debug("[AUTH] Bolna tool-call placeholder accepted for /assess")
+    
+    bolna_secret = os.environ.get("BOLNA_WEBHOOK_SECRET")
+    if bolna_secret and api_key_header and secrets.compare_digest(api_key_header, bolna_secret):
         return api_key_header
+
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or missing API Key"
@@ -144,7 +144,14 @@ async def run_reminder_scheduler():
                         logger.warning(f"[SCHEDULER] Skipping reminder {rem_id!r}: cannot parse time {rem_time!r}: {e}")
                         continue  # skip this reminder — don't block the loop
                 else:
-                    if current_time_str == rem_time:
+                    try:
+                        target_time = datetime.datetime.strptime(rem_time, "%H:%M").time()
+                        target_dt = now.replace(hour=target_time.hour, minute=target_time.minute, second=0, microsecond=0)
+                    except ValueError:
+                        logger.warning(f"[SCHEDULER] Skipping reminder {rem_id!r}: invalid HH:MM time {rem_time!r}")
+                        continue
+                        
+                    if now >= target_dt:
                         if rem_freq == "daily":
                             if last_trig != current_date_str:
                                 should_trigger = True
@@ -174,10 +181,13 @@ async def run_reminder_scheduler():
                     if rem_type in ("call", "family_call"):
                         body = "📞 WellRing check-in call is ringing you now..."
                         send_whatsapp_reminder(rem_phone, body)
-                        try:
-                            await _do_bolna_call(phone=rem_phone, user_name=None)
-                        except Exception as e:
-                            logger.error(f"Error initiating voice call for reminder: {e}")
+                        async def safe_bolna_call(p):
+                            try:
+                                await _do_bolna_call(phone=p, user_name=None)
+                            except Exception as e:
+                                logger.error(f"Error initiating voice call for reminder: {e}")
+                        
+                        asyncio.create_task(safe_bolna_call(rem_phone))
                         update_reminder_trigger(rem_id, trigger_timestamp)
                     else:
                         if rem_type == "medicine":
@@ -288,7 +298,6 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 ALLOWED_ORIGINS = [
-    "*",
     "https://wellring-frontend.vercel.app",
     "http://localhost:5173",
     "http://localhost:5174",
@@ -994,31 +1003,25 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
     if not BOLNA_API_KEY:
         raise HTTPException(status_code=500, detail="BOLNA_API_KEY not configured")
 
-    # Normalize phone: strip spaces/dashes, prepend +91 for 10-digit Indian numbers
-    raw_phone = str(payload.phone).strip().replace(' ', '').replace('-', '')
-    if raw_phone.startswith('0'):
-        raw_phone = '+91' + raw_phone[1:]
-    elif not raw_phone.startswith('+') and len(raw_phone) == 10:
-        raw_phone = '+91' + raw_phone
-    normalized_phone = raw_phone
+    try:
+        return await _do_bolna_call(phone=payload.phone, user_name=payload.user_name)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
-    # 1. Fetch health context from DB
-    ctx = get_user_health_context(normalized_phone, days=7)
-    user_name = payload.user_name or ctx.get("user_name", "there")
+def _build_bolna_payload(phone: str, user_name: Optional[str], agent_config: dict) -> tuple[dict, str, dict, str]:
+    """Helper to build the Bolna payload including context loading, prompt generation, and task configuration."""
+    ctx = get_user_health_context(phone, days=7)
+    resolved_name = user_name or ctx.get("user_name", "there")
 
-    # 2. Build personalised prompt
     history_block = ""
     if ctx.get("has_history") and ctx.get("summary_lines"):
         lines = ctx["summary_lines"]
         history_block = (
             "\n\nFYI — recent health context (do NOT mention proactively):\n"
-            + "\n".join(f"  • {line}" for line in lines)
+            + "\n".join(f"  \u2022 {line}" for line in lines)
             + "\n\nOnly reference past symptoms if the patient says they are not feeling well."
         )
-    else:
-        history_block = ""
 
-    # 2b. Add Medical Context (if available)
     medical_context = ""
     conditions = ctx.get("medical_conditions")
     notes = ctx.get("medical_notes")
@@ -1030,119 +1033,70 @@ async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key
             medical_context += f"Doctor/Caregiver Notes: {notes}\n"
         medical_context += "Keep these conditions in mind but do not alarm the patient. If symptoms relate to these conditions, you may ask gently if they think it's related."
 
-    dynamic_prompt = BASE_SYSTEM_PROMPT.replace("[elder_name]", user_name) + medical_context + history_block
+    dynamic_prompt = BASE_SYSTEM_PROMPT.replace("[elder_name]", resolved_name) + medical_context + history_block
 
-    # Fetch user profile to get Voice Cloning settings
-    user_profile = get_user_by_phone(payload.phone)
+    user_profile = get_user_by_phone(phone)
     voice_id = user_profile.get("voice_id") if user_profile else None
     tts_provider = user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
-
-    logger.info(f"[CALL] Initiating call to {payload.phone} | history={ctx.get('has_history')} | user={user_name} | voice_id={voice_id}")
-
-    # 3. Call Bolna API
     user_id_val = str(user_profile.get("user_id", "")) if user_profile else ""
-    
-    async with httpx.AsyncClient(timeout=30) as client:
-        # 1. Fetch current agent config to avoid dropping settings like transcriber, llm_config, etc.
-        agent_resp = await client.get(
-            f"https://api.bolna.ai/agent/{BOLNA_AGENT_ID}",
-            headers={"Authorization": f"Bearer {BOLNA_API_KEY}"}
-        )
-        if agent_resp.status_code != 200:
-            logger.error(f"[CALL] Failed to fetch agent config: {agent_resp.text}")
-            raise HTTPException(status_code=500, detail="Failed to fetch agent config from Bolna")
+
+    tasks = agent_config.get("tasks", [])
+    if tasks:
+        task_0 = tasks[0]
+        if task_0.get("tools_config") is None:
+            task_0["tools_config"] = {}
+        if task_0["tools_config"].get("api_tools") is None:
+            task_0["tools_config"]["api_tools"] = {}
+        if task_0["tools_config"]["api_tools"].get("tools_params") is None:
+            task_0["tools_config"]["api_tools"]["tools_params"] = {}
             
-        fetched_agent = agent_resp.json()
-        agent_config = fetched_agent.get("agent_config") or fetched_agent
+        tools_params = task_0["tools_config"]["api_tools"]["tools_params"]
         
-        # 2. Inject user-specific parameters into the first task
-        tasks = agent_config.get("tasks", [])
-        if tasks:
-            task_0 = tasks[0]
-            if task_0.get("tools_config") is None:
-                task_0["tools_config"] = {}
-            if task_0["tools_config"].get("api_tools") is None:
-                task_0["tools_config"]["api_tools"] = {}
-            if task_0["tools_config"]["api_tools"].get("tools_params") is None:
-                task_0["tools_config"]["api_tools"]["tools_params"] = {}
-                
-            tools_params = task_0["tools_config"]["api_tools"]["tools_params"]
+        # Ensure structure exists for assess_health_risk
+        if "assess_health_risk" not in tools_params:
+            tools_params["assess_health_risk"] = {"param": {}}
+        elif "param" not in tools_params["assess_health_risk"]:
+            tools_params["assess_health_risk"]["param"] = {}
             
-            # Ensure structure exists for assess_health_risk
-            if "assess_health_risk" not in tools_params:
-                tools_params["assess_health_risk"] = {"param": {}}
-            elif "param" not in tools_params["assess_health_risk"]:
-                tools_params["assess_health_risk"]["param"] = {}
-                
-            tools_params["assess_health_risk"]["param"].update({
-                "intent": "%(intent)s",
-                "symptoms": "%(symptoms)s",
-                "severity": "%(severity)s",
-                "confidence": "%(confidence)s",
-                "user_id": user_id_val
-            })
+        tools_params["assess_health_risk"]["param"].update({
+            "intent": "%(intent)s",
+            "symptoms": "%(symptoms)s",
+            "severity": "%(severity)s",
+            "confidence": "%(confidence)s",
+            "user_id": user_id_val
+        })
+        
+        # Ensure end_call exists
+        if "end_call" not in tools_params:
+            tools_params["end_call"] = {"param": {}}
             
-            # Ensure end_call exists
-            if "end_call" not in tools_params:
-                tools_params["end_call"] = {"param": {}}
+        # 3. Dynamic Voice override if configured
+        if voice_id:
+            if "synthesizer" not in task_0["tools_config"]:
+                task_0["tools_config"]["synthesizer"] = {}
+            if "provider_config" not in task_0["tools_config"]["synthesizer"]:
+                task_0["tools_config"]["synthesizer"]["provider_config"] = {}
                 
-            # 3. Dynamic Voice override if configured
-            if voice_id:
-                if "synthesizer" not in task_0["tools_config"]:
-                    task_0["tools_config"]["synthesizer"] = {}
-                if "provider_config" not in task_0["tools_config"]["synthesizer"]:
-                    task_0["tools_config"]["synthesizer"]["provider_config"] = {}
-                    
-                task_0["tools_config"]["synthesizer"]["provider"] = tts_provider
-                task_0["tools_config"]["synthesizer"]["provider_config"]["voice"] = voice_id
-                task_0["tools_config"]["synthesizer"]["provider_config"]["voice_id"] = voice_id
-                
-            tasks[0] = task_0
-            agent_config["tasks"] = tasks
-
-        bolna_payload = {
-            "agent_id": BOLNA_AGENT_ID,
-            "recipient_phone_number": normalized_phone,
-            "agent_prompts": {
-                "task_1": {
-                    "system_prompt": dynamic_prompt
-                }
-            },
-            "default_webhook": f"{BASE_WEBHOOK_URL}/bolna-webhook",
-            "agent_config": agent_config
-        }
+            task_0["tools_config"]["synthesizer"]["provider"] = tts_provider
+            task_0["tools_config"]["synthesizer"]["provider_config"]["voice"] = voice_id
+            task_0["tools_config"]["synthesizer"]["provider_config"]["voice_id"] = voice_id
             
-        if user_id_val:
-            bolna_payload["metadata"] = {"user_id": user_id_val}
+        tasks[0] = task_0
+        agent_config["tasks"] = tasks
 
-        resp = await client.post(
-            "https://api.bolna.ai/call",
-            headers={
-                "Authorization": f"Bearer {BOLNA_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json=bolna_payload
-        )
-
-    if resp.status_code not in (200, 201, 202):
-        logger.error(f"[CALL] Bolna API error {resp.status_code}: {resp.text}")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Bolna API returned {resp.status_code}: {resp.text}"
-        )
-
-    resp_data = resp.json()
-    logger.info(f"[CALL] Bolna call queued: {resp_data}")
-
-    return {
-        "status": "queued",
-        "run_id": resp_data.get("run_id") or resp_data.get("execution_id"),
-        "phone": normalized_phone,
-        "user_name": user_name,
-        "has_history": ctx.get("has_history", False),
-        "history_summary": ctx.get("summary_lines", []),
-        "prompt_preview": dynamic_prompt[:300] + "..."
+    webhook_secret = os.environ.get("BOLNA_WEBHOOK_SECRET", "")
+    bolna_payload: Dict[str, Any] = {
+        "agent_id": BOLNA_AGENT_ID,
+        "recipient_phone_number": phone,
+        "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
+        "default_webhook": f"{BASE_WEBHOOK_URL}/bolna-webhook?token={webhook_secret}",
+        "agent_config": agent_config
     }
+        
+    if user_id_val:
+        bolna_payload["metadata"] = {"user_id": user_id_val}
+
+    return bolna_payload, resolved_name, ctx, dynamic_prompt
 
 async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
     """
@@ -1160,39 +1114,6 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
         raw = '+91' + raw
     phone = raw
 
-    ctx = get_user_health_context(phone, days=7)
-    resolved_name = user_name or ctx.get("user_name", "there")
-
-    history_block = ""
-    if ctx.get("has_history") and ctx.get("summary_lines"):
-        lines = ctx["summary_lines"]
-        history_block = (
-            "\n\nFYI — recent health context (do NOT mention proactively):\n"
-            + "\n".join(f"  \u2022 {line}" for line in lines)
-            + "\n\nOnly reference past symptoms if the patient says they are not feeling well."
-        )
-    else:
-        history_block = ""
-
-    medical_context = ""
-    conditions = ctx.get("medical_conditions")
-    notes = ctx.get("medical_notes")
-    if conditions or notes:
-        medical_context = "\n\nPATIENT MEDICAL CONTEXT:\n"
-        if conditions:
-            medical_context += f"Medical Conditions: {', '.join(conditions)}\n"
-        if notes:
-            medical_context += f"Doctor/Caregiver Notes: {notes}\n"
-        medical_context += "Keep these conditions in mind but do not alarm the patient."
-
-    dynamic_prompt = BASE_SYSTEM_PROMPT.replace("[elder_name]", resolved_name) + medical_context + history_block
-
-    user_profile = get_user_by_phone(phone)
-    voice_id = user_profile.get("voice_id") if user_profile else None
-    tts_provider = user_profile.get("tts_provider", "elevenlabs") if user_profile else "elevenlabs"
-    user_id_val = str(user_profile.get("user_id", "")) if user_profile else ""
-
-    logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
     async with httpx.AsyncClient(timeout=30) as client:
         # 1. Fetch current agent config to avoid dropping settings like transcriber, llm_config, etc.
         agent_resp = await client.get(
@@ -1206,61 +1127,9 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
         fetched_agent = agent_resp.json()
         agent_config = fetched_agent.get("agent_config") or fetched_agent
         
-        # 2. Inject user-specific parameters into the first task
-        tasks = agent_config.get("tasks", [])
-        if tasks:
-            task_0 = tasks[0]
-            if task_0.get("tools_config") is None:
-                task_0["tools_config"] = {}
-            if task_0["tools_config"].get("api_tools") is None:
-                task_0["tools_config"]["api_tools"] = {}
-            if task_0["tools_config"]["api_tools"].get("tools_params") is None:
-                task_0["tools_config"]["api_tools"]["tools_params"] = {}
-                
-            tools_params = task_0["tools_config"]["api_tools"]["tools_params"]
-            
-            # Ensure structure exists for assess_health_risk
-            if "assess_health_risk" not in tools_params:
-                tools_params["assess_health_risk"] = {"param": {}}
-            elif "param" not in tools_params["assess_health_risk"]:
-                tools_params["assess_health_risk"]["param"] = {}
-                
-            tools_params["assess_health_risk"]["param"].update({
-                "intent": "%(intent)s",
-                "symptoms": "%(symptoms)s",
-                "severity": "%(severity)s",
-                "confidence": "%(confidence)s",
-                "user_id": user_id_val
-            })
-            
-            # Ensure end_call exists
-            if "end_call" not in tools_params:
-                tools_params["end_call"] = {"param": {}}
-                
-            # 3. Dynamic Voice override if configured
-            if voice_id:
-                if "synthesizer" not in task_0["tools_config"]:
-                    task_0["tools_config"]["synthesizer"] = {}
-                if "provider_config" not in task_0["tools_config"]["synthesizer"]:
-                    task_0["tools_config"]["synthesizer"]["provider_config"] = {}
-                    
-                task_0["tools_config"]["synthesizer"]["provider"] = tts_provider
-                task_0["tools_config"]["synthesizer"]["provider_config"]["voice"] = voice_id
-                task_0["tools_config"]["synthesizer"]["provider_config"]["voice_id"] = voice_id
-                
-            tasks[0] = task_0
-            agent_config["tasks"] = tasks
-
-        bolna_payload: Dict[str, Any] = {
-            "agent_id": BOLNA_AGENT_ID,
-            "recipient_phone_number": phone,
-            "agent_prompts": {"task_1": {"system_prompt": dynamic_prompt}},
-            "default_webhook": f"{BASE_WEBHOOK_URL}/bolna-webhook",
-            "agent_config": agent_config
-        }
-            
-        if user_id_val:
-            bolna_payload["metadata"] = {"user_id": user_id_val}
+        bolna_payload, resolved_name, ctx, dynamic_prompt = _build_bolna_payload(phone, user_name, agent_config)
+        
+        logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
 
         resp = await client.post(
             "https://api.bolna.ai/call",
@@ -1269,7 +1138,19 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
         )
     if resp.status_code not in (200, 201, 202):
         raise RuntimeError(f"Bolna API returned {resp.status_code}: {resp.text}")
-    return resp.json()
+        
+    resp_data = resp.json()
+    logger.info(f"[CALL] Bolna call queued: {resp_data}")
+
+    return {
+        "status": "queued",
+        "run_id": resp_data.get("run_id") or resp_data.get("execution_id"),
+        "phone": phone,
+        "user_name": resolved_name,
+        "has_history": ctx.get("has_history", False),
+        "history_summary": ctx.get("summary_lines", []),
+        "prompt_preview": dynamic_prompt[:300] + "..."
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1481,6 +1362,10 @@ async def upload_document(
         unique_filename = f"{timestamp}_{safe_filename}"
         file_path = os.path.join(upload_dir, unique_filename)
         
+        # Prevent path traversal
+        if not os.path.abspath(file_path).startswith(os.path.abspath(upload_dir)):
+            raise HTTPException(status_code=400, detail="Invalid file path")
+        
         with open(file_path, "wb") as f:
             f.write(await file.read())
             
@@ -1626,11 +1511,14 @@ Transcript:
         return {"symptoms": [], "severity": "low", "intent": "health_check"}
 
 @app.post("/bolna-webhook", tags=["Webhooks"])
-async def bolna_webhook(request: Request):
+async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
     """
     Handle webhook callbacks from Bolna.
     If the call failed or was unanswered, notify family members.
     """
+    expected_token = os.environ.get("BOLNA_WEBHOOK_SECRET")
+    if expected_token and token != expected_token:
+        raise HTTPException(status_code=401, detail="Invalid webhook token")
     try:
         payload = await request.json()
         logger.info(f"[WEBHOOK] Received Bolna webhook: {payload}")
@@ -1837,3 +1725,23 @@ async def bolna_webhook(request: Request):
         logger.error(f"[WEBHOOK] Error handling Bolna webhook: {e}")
         return {"status": "error", "message": str(e)}
 
+
+# ---------------------------------------------------------------------------
+# Watchdog / Nemotron audit logs endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/watchdog/logs")
+async def get_watchdog_logs(
+    limit: int = Query(default=20, ge=1, le=200, description="Number of audit log entries to return"),
+    api_key: str = Depends(get_api_key),
+):
+    """
+    Return recent Nemotron watchdog audit logs for the monitoring dashboard.
+    Shows logs where the watchdog self-corrected (overrode) an LLM assessment.
+    """
+    from src.database import get_active_watchdog_logs
+    logs = await asyncio.to_thread(get_active_watchdog_logs, limit)
+    return {
+        "audits": logs,
+        "count": len(logs),
+    }
