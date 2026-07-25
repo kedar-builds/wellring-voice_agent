@@ -557,7 +557,7 @@ def get_symptom_repeat_count(symptom: str, days: int = 3, db_path: Optional[str]
         if result >= 0:
             return result
 
-    return _symptom_count_sqlite(symptom, days, db_path)
+    return _symptom_count_sqlite(symptom, days, db_path, user_id)
 
 
 def _symptom_count_pg(symptom: str, days: int, user_id: Optional[str]) -> int:
@@ -600,23 +600,40 @@ def _symptom_count_supabase(symptom: str, days: int) -> int:
         return -1
 
 
-def _symptom_count_sqlite(symptom: str, days: int, db_path: Optional[str]) -> int:
+def _symptom_count_sqlite(symptom: str, days: int, db_path: Optional[str], user_id: Optional[str] = None) -> int:
     db_path = _resolve_db_path(db_path)
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    # Exclude the Anonymous sentinel user (role='elderly', name='Anonymous')
+    # Exclude the Anonymous sentinel user (is_system=TRUE)
     # so its accumulated history never inflates real users' multipliers.
-    cur.execute(
-        """
-        SELECT COUNT(DISTINCT i.id)
-        FROM   interactions i, json_each(i.symptoms) je
-        LEFT JOIN users u ON u.user_id = i.user_id
-        WHERE  je.value = ?
-          AND  i.timestamp >= datetime('now', ? || ' days')
-          AND  (u.is_system IS NULL OR u.is_system = 0)
-        """,
-        (symptom, f"-{days}"),
-    )
+    # When a user_id is provided, scope the count to that specific user.
+    # Use i.user_id IS NOT NULL to exclude orphan rows (no user reference).
+    if user_id:
+        cur.execute(
+            """
+            SELECT COUNT(DISTINCT i.id)
+            FROM   interactions i, json_each(i.symptoms) je
+            LEFT JOIN users u ON u.user_id = i.user_id
+            WHERE  je.value = ?
+              AND  i.timestamp >= datetime('now', ? || ' days')
+              AND  i.user_id = ?
+              AND  (u.is_system IS NULL OR u.is_system = 0)
+            """,
+            (symptom, f"-{days}", user_id),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT COUNT(DISTINCT i.id)
+            FROM   interactions i, json_each(i.symptoms) je
+            LEFT JOIN users u ON u.user_id = i.user_id
+            WHERE  je.value = ?
+              AND  i.timestamp >= datetime('now', ? || ' days')
+              AND  i.user_id IS NOT NULL
+              AND  (u.is_system IS NULL OR u.is_system = 0)
+            """,
+            (symptom, f"-{days}"),
+        )
     count = cur.fetchone()[0]
     conn.close()
     return count

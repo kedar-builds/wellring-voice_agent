@@ -188,6 +188,7 @@ def test_all_required_fields_present(client):
         "score", "base_score", "confidence",
         "risk_level", "category", "symptoms", "severity",
         "action", "message", "steps", "breakdown", "timestamp",
+        "assessment_id",
     ]
     for field in required:
         assert field in data, f"Missing field: {field}"

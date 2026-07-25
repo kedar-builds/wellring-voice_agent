@@ -16,13 +16,35 @@ import pytest
 # ── Set the test DB path at module load (before any src import) ───────────
 _tmp_db = tempfile.mktemp(suffix=".db", prefix="wellring_test_")
 os.environ["WELLRING_DB_PATH"] = _tmp_db
+os.environ["DATABASE_URL"] = ""
 # Set a test-only API key so auth functions don't 500 on missing env var.
 # This value is not a secret — it exists only within the test process.
 os.environ.setdefault("WELLRING_API_KEY", "wellring-test-key-local")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _init_test_db():
+    """
+    Session-scoped autouse fixture.
+
+    Patches _use_postgres → False and calls init_db() ONCE at the start
+    of the test session.  This ensures the nemotron_audits table (and all
+    other tables) are present in the temp SQLite file for tests that call
+    DB functions directly, without requiring the `client` fixture.
+    """
+    import src.database as db_module
+
+    with patch.object(db_module, "_use_postgres", return_value=False):
+        db_module.init_db()
+        yield
+
+    # Cleanup the temp DB after all tests finish
+    if os.path.exists(_tmp_db):
+        os.remove(_tmp_db)
+
+
 @pytest.fixture(scope="session")
-def client():
+def client(_init_test_db):
     """
     Session-scoped FastAPI TestClient.
     Uses a temporary SQLite DB — Postgres is patched out so the real
@@ -33,13 +55,7 @@ def client():
     import src.database as db_module
 
     # Force SQLite for the entire test session regardless of DATABASE_URL.
-    # We patch at the function level (lazy check) so dotenv can't override it.
     with patch.object(db_module, "_use_postgres", return_value=False):
         with TestClient(app) as c:
             c.headers.update({"X-API-Key": os.environ["WELLRING_API_KEY"]})
             yield c
-
-    # Cleanup the temp DB after all tests finish
-    if os.path.exists(_tmp_db):
-        os.remove(_tmp_db)
-

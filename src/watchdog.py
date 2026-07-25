@@ -328,7 +328,7 @@ async def run_watchdog():
 
     logger.info(f"[WATCHDOG] 🧠 Nemotron watchdog started (model: {NEMOTRON_MODEL})")
 
-    retry_counts: Dict[str, int] = {}  # track per-assessment retry count
+    retry_counts: Dict[str, Dict[str, Any]] = {}  # track per-assessment retry count and timestamp
 
     while True:
         try:
@@ -374,8 +374,13 @@ async def run_watchdog():
                 aid = action.get("assessment_id", "unknown")
 
                 # Guard: don't retry the same assessment more than 3 times total
-                retry_counts[aid] = retry_counts.get(aid, 0) + 1
-                if retry_counts[aid] > 3:
+                if aid not in retry_counts:
+                    retry_counts[aid] = {"count": 0, "timestamp": datetime.datetime.now(datetime.UTC).timestamp()}
+                
+                retry_counts[aid]["count"] += 1
+                retry_counts[aid]["timestamp"] = datetime.datetime.now(datetime.UTC).timestamp()
+                
+                if retry_counts[aid]["count"] > 3:
                     logger.warning(
                         f"[WATCHDOG] Max retries reached for {aid} — "
                         f"skipping to avoid alert spam."
@@ -389,11 +394,11 @@ async def run_watchdog():
                 f"[WATCHDOG] Cycle complete — {dispatched}/{len(actions)} actions dispatched."
             )
 
-            # --- 4. Clean up retry counters for old assessments ---
-            # Flush counts older than 30 minutes to free memory
+            # Flush counts older than 24 hours to free memory
+            now_ts = datetime.datetime.now(datetime.UTC).timestamp()
             to_drop = [
-                k for k in list(retry_counts.keys())
-                if retry_counts[k] >= 3
+                k for k, v in retry_counts.items()
+                if (now_ts - v.get("timestamp", 0)) > 24 * 3600
             ]
             for k in to_drop:
                 del retry_counts[k]
@@ -403,3 +408,138 @@ async def run_watchdog():
             break
         except Exception as exc:
             logger.error(f"[WATCHDOG] Unexpected error in watchdog loop: {exc}", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Guardrail: rule-based assessment audit (Nemotron self-correction)
+# ---------------------------------------------------------------------------
+
+# Symptoms that are ALWAYS treated as CRITICAL regardless of LLM output
+_ALWAYS_CRITICAL_SYMPTOMS = frozenset({
+    "chest_pain", "stroke_symptoms", "unconscious",
+    "breathing_problem", "shortness_of_breath",
+})
+
+# Minimum confidence below which we force follow-up questions
+_MIN_CONFIDENCE = 0.5
+
+
+def audit_and_correct_assessment(
+    assessment: Dict[str, Any],
+    raw_payload: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Rule-based Nemotron watchdog guardrail.
+
+    Checks the LLM assessment against the raw input payload and applies
+    safety overrides if the model has hallucinated or under-reported risk.
+
+    Returns:
+        (corrected_assessment, audit_record)
+
+    audit_record keys:
+        self_corrected  : bool  — True if any override was applied
+        audit_status    : str   — "PASSED" | "OVERRIDDEN" | "FOLLOW_UP"
+        override_reason : str   — human-readable explanation (or "")
+    """
+    corrected = dict(assessment)          # shallow copy — we only mutate our copy
+    symptoms  = [s.lower() for s in raw_payload.get("symptoms", [])]
+    severity  = (raw_payload.get("severity") or "").lower()
+    confidence = float(raw_payload.get("confidence", 1.0))
+
+    self_corrected   = False
+    audit_status     = "PASSED"
+    override_reason  = ""
+
+    # --- Rule 1: critical symptoms must never be LOW / MEDIUM ---
+    critical_hit = _ALWAYS_CRITICAL_SYMPTOMS.intersection(symptoms)
+    if critical_hit and corrected.get("risk_level", "").upper() in ("LOW", "MEDIUM", "NONE", ""):
+        symptom_name = next(iter(critical_hit))
+        corrected["risk_level"] = "CRITICAL"
+        corrected["action"]     = "call_911"
+        self_corrected  = True
+        audit_status    = "OVERRIDDEN"
+        override_reason = (
+            f"Chest pain detected" if "chest_pain" in critical_hit
+            else f"Critical symptom '{symptom_name}' detected"
+        ) + f": auto-escalated to CRITICAL. Original risk was {assessment.get('risk_level', 'UNKNOWN')}."
+
+    # --- Rule 2: low confidence forces follow-up ---
+    elif confidence < _MIN_CONFIDENCE and corrected.get("action") != "follow_up_questions":
+        corrected["action"] = "follow_up_questions"
+        self_corrected  = True
+        audit_status    = "FOLLOW_UP"
+        override_reason = (
+            f"Low confidence ({confidence:.2f} < {_MIN_CONFIDENCE}): "
+            "forced follow-up questions to gather more information."
+        )
+
+    # --- Rule 3: severity=critical payload but risk not CRITICAL ---
+    elif severity == "critical" and corrected.get("risk_level", "").upper() not in ("CRITICAL", "HIGH"):
+        corrected["risk_level"] = "CRITICAL"
+        corrected["action"]     = "immediate_alert"
+        self_corrected  = True
+        audit_status    = "OVERRIDDEN"
+        override_reason = (
+            f"Payload severity=critical but LLM returned risk={assessment.get('risk_level')}: "
+            "auto-elevated to CRITICAL."
+        )
+
+    audit_record: Dict[str, Any] = {
+        "self_corrected":  self_corrected,
+        "audit_status":    audit_status,
+        "override_reason": override_reason if self_corrected else None,
+        "original_risk":   assessment.get("risk_level"),
+        "final_risk":      corrected.get("risk_level"),
+    }
+
+    if self_corrected:
+        logger.warning(
+            f"[WATCHDOG-GUARDRAIL] Override applied | "
+            f"status={audit_status} | reason={override_reason}"
+        )
+
+    return corrected, audit_record
+
+
+def evaluate_pipeline_health() -> Dict[str, Any]:
+    """
+    Lightweight synchronous health probe for the WellRing pipeline.
+
+    Checks:
+      - OPENROUTER_API_KEY configured (Nemotron available)
+      - DATABASE_URL or SQLite DB accessible
+
+    Returns a dict with keys: healthy (bool), checks (dict), message (str)
+    """
+    checks: Dict[str, bool] = {}
+
+    # Nemotron / OpenRouter availability
+    checks["openrouter_configured"] = bool(os.environ.get("OPENROUTER_API_KEY"))
+
+    # Database reachability
+    try:
+        from src.database import _use_postgres, _PG_AVAILABLE
+        if _use_postgres() and _PG_AVAILABLE:
+            from src.database import get_pg_conn, _pg_cursor
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    cur.execute("SELECT 1")
+            checks["database"] = True
+        else:
+            import sqlite3 as _sqlite3
+            db_path = os.environ.get("WELLRING_DB_PATH", "wellring.db")
+            _conn = _sqlite3.connect(db_path)
+            _conn.execute("SELECT 1")
+            _conn.close()
+            checks["database"] = True
+    except Exception as exc:
+        logger.error(f"[PIPELINE-HEALTH] Database check failed: {exc}")
+        checks["database"] = False
+
+    healthy = all(checks.values())
+    message = "All pipeline checks passed." if healthy else (
+        "Pipeline degraded: " + ", ".join(k for k, v in checks.items() if not v)
+    )
+
+    return {"healthy": healthy, "checks": checks, "message": message}
