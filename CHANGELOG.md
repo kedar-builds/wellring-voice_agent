@@ -18,8 +18,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `CONTRIBUTING.md` — branch + review process documentation (Phase 7.1/7.3)
 - Nemotron 70B watchdog integration: hallucination detection, confidence-based follow-ups,
   audit logging to `nemotron_audits` table (7 tests, all passing)
-
-
 ### Fixed
 - `get_symptom_repeat_count` — excluded `is_system` sentinel user from global symptom
   counts to prevent score inflation (Phase 3.4); both Postgres and SQLite paths corrected
