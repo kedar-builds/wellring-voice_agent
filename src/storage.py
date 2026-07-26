@@ -29,13 +29,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _cfg() -> dict:
-    """Read B2 / S3 config from environment at call time."""
+    """Read B2 / S3 config from environment at call time.
+
+    Priority: BACKBLAZE_* vars (canonical) → AWS_* vars (legacy fallback).
+    The .env file uses BACKBLAZE_* names; the AWS_* aliases are kept for
+    compatibility with older deployments.
+    """
     return {
-        "key_id":       os.environ.get("AWS_ACCESS_KEY_ID", ""),
-        "app_key":      os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
-        "region":       os.environ.get("AWS_REGION", "us-east-005"),
-        "bucket":       os.environ.get("AWS_BUCKET_NAME", "wellring-recordings"),
-        "endpoint_url": os.environ.get("AWS_ENDPOINT_URL", "https://s3.us-east-005.backblazeb2.com"),
+        "key_id":       os.environ.get("BACKBLAZE_KEY_ID")       or os.environ.get("AWS_ACCESS_KEY_ID", ""),
+        "app_key":      os.environ.get("BACKBLAZE_APP_KEY")       or os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+        "region":       os.environ.get("BACKBLAZE_REGION")        or os.environ.get("AWS_REGION", "us-east-005"),
+        "bucket":       os.environ.get("BACKBLAZE_BUCKET")        or os.environ.get("AWS_BUCKET_NAME", "wellring-recordings"),
+        "endpoint_url": os.environ.get("BACKBLAZE_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT_URL", "https://s3.us-east-005.backblazeb2.com"),
     }
 
 

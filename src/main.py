@@ -183,6 +183,10 @@ async def run_reminder_scheduler():
                         send_whatsapp_reminder(rem_phone, body)
                         async def safe_bolna_call(p):
                             try:
+                                # 5-second delay: gives the previous Bolna session time to
+                                # fully tear down its TTS engine before a new call is placed,
+                                # preventing the "silent second call" race condition.
+                                await asyncio.sleep(5)
                                 await _do_bolna_call(phone=p, user_name=None)
                             except Exception as e:
                                 logger.error(f"Error initiating voice call for reminder: {e}")
@@ -260,6 +264,10 @@ async def lifespan(app: FastAPI):
     from src.database import init_pg_tables
     init_db()
     init_pg_tables()   # Creates PG tables if they don't exist (safe on each startup)
+    if is_storage_configured():
+        logger.info("[STARTUP] ✅ Backblaze B2 storage is configured — recordings will be uploaded permanently.")
+    else:
+        logger.warning("[STARTUP] ⚠️  Backblaze B2 storage NOT configured (BACKBLAZE_KEY_ID / BACKBLAZE_APP_KEY missing). Recordings will use transient Bolna URLs only.")
     try:
         seed_demo_data()
     except Exception as e:
@@ -1541,12 +1549,12 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
             return None
 
         # Robustly find status and phone from deeply nested Bolna payloads
-        status = _find_key(payload, ["status", "call_status"]) or "unknown"
+        status = _find_key(payload, ["status", "call_status", "event"]) or "unknown"
         phone = _find_key(payload, ["recipient_phone_number", "phone_number", "to"])
         call_id = _find_key(payload, ["call_id", "id", "session_id"]) or "bolna_missed_call"
         
         # If it's a failed or unanswered call, send a WhatsApp alert
-        if status in ("no-answer", "no_answer", "failed", "busy", "canceled", "error", "unanswered", "not-answered", "not_answered"):
+        if status in ("no-answer", "no_answer", "failed", "busy", "canceled", "error", "unanswered", "not-answered", "not_answered", "call.failed", "call.unanswered", "call.canceled", "call.busy"):
             logger.info(f"[WEBHOOK] Call to {phone} ended with status: {status}. Sending alert...")
             
             # Lookup the patient by phone to get family contacts
@@ -1572,8 +1580,13 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
             else:
                 logger.warning(f"[WEBHOOK] Could not find contacts for {phone}. No unanswered call alert sent.")
         
-        elif status in ("completed", "success", "done"):
+        elif status in ("completed", "success", "done", "call.ended", "call.completed", "call_ended", "call_completed"):
             # A successful call might have extracted health data
+            # --- User resolution: prefer metadata.user_id (injected at call time) ---
+            # This avoids a DB lookup by phone which can fail if numbers don't match exactly.
+            _metadata = payload.get("metadata") or {}
+            _meta_user_id = _metadata.get("user_id") if isinstance(_metadata, dict) else None
+
             def _find_extraction_data(data):
                 if isinstance(data, dict):
                     if "extraction_data" in data:
@@ -1623,8 +1636,10 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                     formatted_transcript = "\n\n".join(lines)
                 elif isinstance(raw_transcript, str):
                     formatted_transcript = raw_transcript
-                    
-            recording_url = payload.get("recording_url")
+
+            # Use the nested-key finder so recording_url is captured regardless of
+            # how deeply Bolna nests it in the payload (root, call_data, etc.)
+            recording_url = _find_key(payload, ["recording_url", "record_url", "audio_url"])
             
             if recording_url:
                 # Upload to S3 (Backblaze B2) to replace transient Bolna link
@@ -1664,34 +1679,30 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                 severity = extracted.get("severity", "medium")
                 intent = extracted.get("intent", "health_check")
             else:
-                logger.info("[WEBHOOK] Call completed, but no extraction data or transcript found. Treating as missed call.")
-                user_profile = get_user_by_phone(phone)
-                patient_name = user_profile.get("name", "your loved one") if user_profile else "your loved one"
-                
-                contacts = []
-                if user_profile and "user_id" in user_profile:
-                    contacts = get_family_contacts(str(user_profile["user_id"]))
-                
-                if contacts:
-                    for contact in contacts:
-                        contact_phone = contact.get("phone")
-                        contact_name = contact.get("name")
-                        if contact_phone:
-                            send_unanswered_call_alert(
-                                to_phone=contact_phone,
-                                patient_name=patient_name,
-                                caregiver_name=contact_name,
-                                interaction_id=call_id
-                            )
-                else:
-                    logger.warning(f"[WEBHOOK] Could not find contacts for {phone}. No unanswered call alert sent.")
+                logger.info("[WEBHOOK] Call completed, but no extraction data or transcript found. Ignoring to prevent duplicate missed call alerts.")
 
             # If we have any data to process (either from transcript, or Bolna extracted)
             if formatted_transcript or extracted:
-                user_profile = get_user_by_phone(phone)
-                user_id = str(user_profile["user_id"]) if user_profile and "user_id" in user_profile else None
-                
+                # Prefer metadata.user_id injected at call time; fall back to phone lookup
+                if _meta_user_id:
+                    user_id = str(_meta_user_id)
+                    logger.info(f"[WEBHOOK] Resolved user_id from metadata: {user_id}")
+                else:
+                    user_profile = get_user_by_phone(phone)
+                    user_id = str(user_profile["user_id"]) if user_profile and "user_id" in user_profile else None
+                    if user_id:
+                        logger.info(f"[WEBHOOK] Resolved user_id via phone lookup: {user_id}")
+                    else:
+                        logger.warning(f"[WEBHOOK] Could not resolve user_id for phone {phone} — assessment logged as anonymous")
+
                 call_id = _find_key(payload, ["call_id", "id"])
+                duration_val = _find_key(payload, ["duration", "call_duration", "duration_secs"])
+                duration_secs = None
+                if duration_val is not None:
+                    try:
+                        duration_secs = int(float(duration_val))
+                    except (ValueError, TypeError):
+                        pass
 
                 response_data = await process_assessment_data(
                     intent=intent,
@@ -1719,9 +1730,10 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                                     role=r,
                                     content=c,
                                     bolna_call_id=call_id,
-                                    channel="voice",
+                                    channel="phone",  # Bolna = voice call = 'phone' channel (DB CHECK: web|phone|whatsapp)
                                     assessment_id=assessment_id,
-                                    audio_url=None
+                                    audio_url=None,
+                                    duration_secs=duration_secs
                                 )
 
         return {"status": "ok"}

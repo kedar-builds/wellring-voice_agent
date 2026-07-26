@@ -7,6 +7,8 @@ from pathlib import Path
 
 # Load .env manually so it works standalone
 env_path = Path(__file__).parent / ".env"
+if not env_path.exists():
+    env_path = Path(__file__).parent.parent / ".env"
 if env_path.exists():
     for line in env_path.read_text().splitlines():
         line = line.strip()

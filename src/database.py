@@ -803,6 +803,7 @@ def log_conversation_turn(
     channel: str = "web",
     assessment_id: Optional[str] = None,
     audio_url: Optional[str] = None,
+    duration_secs: Optional[int] = None,
 ) -> Optional[str]:
     """
     Persist a single conversation message to the `conversations` table.
@@ -814,10 +815,10 @@ def log_conversation_turn(
     sql = """
         INSERT INTO conversations (
             user_id, assessment_id, bolna_call_id,
-            channel, role, content, audio_url
+            channel, role, content, audio_url, duration_secs
         ) VALUES (
             %(user_id)s, %(assessment_id)s, %(bolna_call_id)s,
-            %(channel)s, %(role)s, %(content)s, %(audio_url)s
+            %(channel)s, %(role)s, %(content)s, %(audio_url)s, %(duration_secs)s
         )
         RETURNING conversation_id
     """
@@ -831,6 +832,7 @@ def log_conversation_turn(
                 "role":          role,
                 "content":       content,
                 "audio_url":     audio_url,
+                "duration_secs": duration_secs,
             })
             return str(cur.fetchone()["conversation_id"])
 
