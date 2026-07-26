@@ -2,7 +2,7 @@ import httpx
 
 url = "http://localhost:8000/call"
 headers = {
-    "X-API-Key": "wellring-secure-2026",
+    "X-API-Key": "***REMOVED***",
     "Content-Type": "application/json"
 }
 payload = {
