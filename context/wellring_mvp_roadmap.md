@@ -82,7 +82,8 @@ Two hard rules going forward, given this session's history:
     *Result (2026-07-26):* Checked `src/main.py`. `ALLOWED_ORIGINS` has localhost and frontend URLs, no `onrender.com` entries.
 - [x] **5.3** Audit `.env` / connection strings for any remaining Render references. (Done by user)
 - [x] **5.4** Confirm the Bolna v2 deploy path is the only one referenced anywhere in the codebase or docs. (Done by user)
-- [ ] **5.5** Audit repo for leftover Render files (e.g., `render.yaml`, Render-targeting `Dockerfile`) and remove them if Railway is the sole deployment target.
+- [x] **5.5** Audit repo for leftover Render files (e.g., `render.yaml`, Render-targeting `Dockerfile`) and remove them if Railway is the sole deployment target.
+    *Result (2026-07-26):* No `render.yaml` or Render-specific Dockerfiles found. Only doc references in CHANGELOG/roadmap (expected). `Dockerfile` is generic/Railway-compatible. Also fixed: CI workflow was hardcoding a stale package subset — updated to install from `requirements.txt` directly.
 
 ---
 
