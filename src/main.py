@@ -776,6 +776,7 @@ async def assess(request: Request, api_key: str = Depends(get_api_key_lenient)):
     """
     try:
         body = await request.json()
+        logger.info(f"RAW INCOMING PAYLOAD at /assess: {json.dumps(body)}")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
@@ -1542,6 +1543,7 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
         # Robustly find status and phone from deeply nested Bolna payloads
         status = _find_key(payload, ["status", "call_status"]) or "unknown"
         phone = _find_key(payload, ["recipient_phone_number", "phone_number", "to"])
+        call_id = _find_key(payload, ["call_id", "id", "session_id"]) or "bolna_missed_call"
         
         # If it's a failed or unanswered call, send a WhatsApp alert
         if status in ("no-answer", "no_answer", "failed", "busy", "canceled", "error", "unanswered", "not-answered", "not_answered"):
@@ -1564,7 +1566,8 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                         send_unanswered_call_alert(
                             to_phone=contact_phone,
                             patient_name=patient_name,
-                            caregiver_name=contact_name
+                            caregiver_name=contact_name,
+                            interaction_id=call_id
                         )
             else:
                 logger.warning(f"[WEBHOOK] Could not find contacts for {phone}. No unanswered call alert sent.")
@@ -1677,7 +1680,8 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                             send_unanswered_call_alert(
                                 to_phone=contact_phone,
                                 patient_name=patient_name,
-                                caregiver_name=contact_name
+                                caregiver_name=contact_name,
+                                interaction_id=call_id
                             )
                 else:
                     logger.warning(f"[WEBHOOK] Could not find contacts for {phone}. No unanswered call alert sent.")

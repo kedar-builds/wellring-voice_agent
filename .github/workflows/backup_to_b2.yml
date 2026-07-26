@@ -1,0 +1,47 @@
+name: Daily Postgres Backup to Backblaze B2
+
+on:
+  schedule:
+    # Runs at 02:00 UTC every day
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allows manual trigger from the GitHub UI
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL Client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Create backup directory
+        run: mkdir -p backups
+
+      - name: Generate timestamp
+        id: timestamp
+        run: echo "DATETIME=$(date +'%Y%m%d_%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Dump Database
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          BACKUP_FILE="backups/prod_backup_${{ steps.timestamp.outputs.DATETIME }}.sql"
+          echo "Dumping database to $BACKUP_FILE..."
+          pg_dump "$DATABASE_URL" -F c > "$BACKUP_FILE"
+          echo "BACKUP_FILE=$BACKUP_FILE" >> $GITHUB_ENV
+
+      - name: Upload to Backblaze B2 via AWS CLI
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.B2_ENDPOINT }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+        run: |
+          aws s3 cp "${BACKUP_FILE}" "s3://${B2_BUCKET_NAME}/database_backups/${BACKUP_FILE}" \
+            --endpoint-url "${AWS_ENDPOINT_URL}"
+          echo "Successfully uploaded ${BACKUP_FILE} to B2."

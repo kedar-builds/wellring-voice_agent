@@ -22,7 +22,7 @@ Environment variables (set in .env):
 import logging
 import os
 import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from src.database import log_alert, get_family_contacts
 from src.users import get_user
 
@@ -273,6 +273,7 @@ def send_unanswered_call_alert(
     to_phone: str,
     patient_name: str = "the patient",
     caregiver_name: Optional[str] = None,
+    interaction_id: Union[int, str] = "missed_call",
 ) -> bool:
     """
     Send a WhatsApp alert to the caregiver when the patient misses an automated call.
@@ -289,11 +290,23 @@ def send_unanswered_call_alert(
     )
 
     sent = False
+    err_msg = None
     if USE_TWILIO:
-        sent, _ = _twilio_send(to_phone, body)
+        sent, err_msg = _twilio_send(to_phone, body)
     else:
         logger.info(f"[WHATSAPP MOCK → {to_phone}]\n{body}")
         sent = True
+        
+    log_alert(
+        interaction_id=interaction_id,
+        timestamp=datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z",
+        risk_level="HIGH",
+        notification_type="whatsapp" if USE_WHATSAPP else "sms",
+        status="sent" if sent else "failed",
+        recipient_phone=to_phone,
+        recipient_name=caregiver_name,
+        error_message=err_msg,
+    )
 
     return sent
 

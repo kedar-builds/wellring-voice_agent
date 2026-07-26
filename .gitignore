@@ -2,18 +2,39 @@ venv/
 __pycache__/
 *.pyc
 .env
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Audio / media
 *.wav
 *.m4a
 *.mp3
 *.onnx
 *.onnx.json
-wellring.db
-audios/wellring.db
-ollama.log
+audios/
+
+# Logs
 *.log
-backend.log
-uploads/
-health_agent.db
-bolna_logs.json
-backups/
+
+# Local SQLite databases
+*.db
+
+# Database dumps
+*.dump
 *.sql
+
+# JSON snapshots / Bolna config dumps
+bolna_*.json
+*_config*.json
+*_agent*.json
+agent.json
+agent_data.json
+live_agent_config.json
+updated_agent_config.json
+verified_agent_config.json
+
+# Misc
+uploads/
+backups/
+vercel_env.txt
