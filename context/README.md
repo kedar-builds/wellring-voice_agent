@@ -10,7 +10,7 @@ WellRing has evolved into a production-ready cloud platform:
 - **Intelligence (LLM):** Powers the conversational assistant via Bolna, extracting structured symptoms and severity through tool calls.
 - **Scoring Engine (FastAPI):** A decoupled backend that receives `assess_health_risk` function calls from Bolna to calculate clinical risk (Low, Medium, High, Critical).
 - **Caregiver Dashboard (React + Vite):** A modern frontend (separate repo) where caregivers can view patient status, review assessment history, and manage reminders.
-- **Alerts (Twilio):** Automatically dispatches WhatsApp/SMS messages to caregivers when a high or critical risk is detected.
+- **Alerts (Twilio):** Automatically dispatches WhatsApp messages to caregivers when a high or critical risk is detected.
 
 ## 📂 Project Structure
 
@@ -19,7 +19,7 @@ wellring-voice_agent/
 ├── src/                   ← FastAPI Backend & Scoring Engine
 │   ├── main.py            ← Entrypoint (all routes, scheduler)
 │   ├── database.py        ← Multi-backend data access (PG, Supabase, SQLite)
-│   ├── notifications.py   ← Twilio WhatsApp/SMS dispatch
+│   ├── notifications.py   ← Twilio WhatsApp dispatch
 │   ├── users.py           ← User profile lookups
 │   ├── scoring_engine/    ← Risk calculation logic
 │   │   ├── rules.py       ← Symptom weights & categories
@@ -90,7 +90,7 @@ The system automatically detects critical keywords during the conversation:
 - Unconscious
 - Stroke symptoms
 
-On detection, the assistant is instructed to immediately tell the patient to call emergency services (112/911), while the backend simultaneously dispatches a critical WhatsApp/SMS alert to the assigned caregiver.
+On detection, the assistant is instructed to immediately tell the patient to call emergency services (112/911), while the backend simultaneously dispatches a critical WhatsApp alert to the assigned caregiver.
 
 ## 🔐 Security
 

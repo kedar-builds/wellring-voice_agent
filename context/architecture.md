@@ -20,7 +20,7 @@ graph TD;
     Scoring --> ResponseBuilder[Response Builder]
     ResponseBuilder --> DBLog[(Log Assessment)]
     ResponseBuilder --> Alerts[Notification Service]
-    Alerts -- WhatsApp/SMS --> Caregiver[Caregiver Phone]
+    Alerts -- WhatsApp --> Caregiver[Caregiver Phone]
     ResponseBuilder -- "tool result" --> LLM
     LLM --> Bolna
     Bolna --> Phone
@@ -51,7 +51,7 @@ graph TD;
    - **SQLite** (local fallback for dev/tests).
 
 5. **Notification System (`src/notifications.py`)**
-   - Triggers Twilio WhatsApp/SMS alerts to caregivers for HIGH and CRITICAL risk levels.
+   - Triggers Twilio WhatsApp alerts to caregivers for HIGH and CRITICAL risk levels.
    - Optional routine daily updates for LOW/MEDIUM.
    - Supports multiple family contacts per patient.
 
@@ -257,7 +257,7 @@ Every **notification sent** after an assessment. One assessment → many alerts.
 ---
 
 ### Table 4 — `conversations`
-Individual **turn-by-turn messages** between the elder and Riley.
+Individual **turn-by-turn messages** between the elder and Alice.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -324,7 +324,7 @@ Phone call arrives
        ▼
   assessments (one row per call)
        │
-       ├──► alerts (WhatsApp / SMS per assessment)
+       ├──► alerts (WhatsApp per assessment)
        │         └── Nemotron Watchdog retries failed rows
        │
        ├──► conversations (each turn stored)

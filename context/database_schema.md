@@ -78,7 +78,7 @@ Notification records triggered after assessments.
 
 ### `conversations`
 
-Voice/text conversation turns with Riley (the AI assistant).
+Voice/text conversation turns with Alice (the AI assistant).
 
 | Column | Type | Description |
 |---|---|---|

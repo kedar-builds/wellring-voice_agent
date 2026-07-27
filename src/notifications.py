@@ -75,7 +75,7 @@ def build_alert_message(
     Hi Ramani,
 
     Your elderly patient *Atharva* just had a health check-in with our AI
-    assistant, Riley. Here is what was reported:
+    assistant, Alice. Here is what was reported:
 
     🩺 *Risk Level:* HIGH (Score: 75)
     💊 *Symptoms:* Fever, Dizziness
@@ -113,7 +113,7 @@ def build_alert_message(
     msg = (
         f"{emoji} *WellRing Health Alert*\n\n"
         f"{greeting}\n\n"
-        f"Your elderly patient *{patient_name}* just had a health check-in with Riley (WellRing AI). "
+        f"Your elderly patient *{patient_name}* just had a health check-in with Alice (WellRing AI). "
         f"Here is what was reported:\n\n"
         f"🩺 *Risk Level:* {risk_level} (Score: {score})\n"
         f"💊 *Symptoms:* {sym_str}\n"
@@ -159,7 +159,7 @@ def build_routine_update_message(
     msg = (
         f"{emoji} *WellRing Daily Update*\n\n"
         f"{greeting}\n\n"
-        f"*{patient_name}* just completed their daily wellness check-in with Riley.\n\n"
+        f"*{patient_name}* just completed their daily wellness check-in with Alice.\n\n"
         f"{health_line}"
         f"{call_summary}\n\n"
         f"⏰ Check-in time: {ts}\n\n"
@@ -284,7 +284,7 @@ def send_unanswered_call_alert(
     body = (
         f"⚠️ *WellRing Missed Call Alert*\n\n"
         f"{greeting}\n\n"
-        f"Riley tried to call *{patient_name}* for their scheduled check-in at {ts}, but they did not answer the phone.\n\n"
+        f"Alice tried to call *{patient_name}* for their scheduled check-in at {ts}, but they did not answer the phone.\n\n"
         f"Please try checking on them when you get a chance.\n\n"
         f"— WellRing Team"
     )
