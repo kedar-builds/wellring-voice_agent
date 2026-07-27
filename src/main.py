@@ -31,6 +31,7 @@ import asyncio
 import logging
 import json
 import re
+import copy
 import httpx
 import secrets
 from google import genai
@@ -181,18 +182,23 @@ async def run_reminder_scheduler():
                     if rem_type in ("call", "family_call"):
                         body = "📞 WellRing check-in call is ringing you now..."
                         send_whatsapp_reminder(rem_phone, body)
-                        async def safe_bolna_call(p):
+                        # Capture loop variables in default args to avoid closure-capture bugs.
+                        async def safe_bolna_call(p, rid, ts):
                             try:
                                 # 5-second delay: gives the previous Bolna session time to
                                 # fully tear down its TTS engine before a new call is placed,
                                 # preventing the "silent second call" race condition.
                                 await asyncio.sleep(5)
                                 await _do_bolna_call(phone=p, user_name=None)
+                                # Only mark the reminder as triggered AFTER the call succeeds.
+                                # Moving this here prevents the previous race condition where
+                                # the DB was updated before Bolna even accepted the call.
+                                update_reminder_trigger(rid, ts)
+                                logger.info(f"[SCHEDULER] Reminder {rid} marked triggered after successful Bolna call.")
                             except Exception as e:
-                                logger.error(f"Error initiating voice call for reminder: {e}")
-                        
-                        asyncio.create_task(safe_bolna_call(rem_phone))
-                        update_reminder_trigger(rem_id, trigger_timestamp)
+                                logger.error(f"[SCHEDULER] Error initiating voice call for reminder {rid}: {e}. Reminder will retry next cycle.")
+
+                        asyncio.create_task(safe_bolna_call(rem_phone, rem_id, trigger_timestamp))
                     else:
                         if rem_type == "medicine":
                             body = f"💊 WellRing Medicine Reminder:\nPlease take {rem_title}.\nNotes: {rem_notes}"
@@ -1134,9 +1140,15 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
             raise RuntimeError(f"Failed to fetch agent config from Bolna")
             
         fetched_agent = agent_resp.json()
-        agent_config = fetched_agent.get("agent_config") or fetched_agent
-        
-        bolna_payload, resolved_name, ctx, dynamic_prompt = _build_bolna_payload(phone, user_name, agent_config)
+        # Deep-copy so concurrent calls (scheduler + manual /call) don't mutate
+        # each other's agent_config dict, which caused wrong user_id injection.
+        agent_config = copy.deepcopy(fetched_agent.get("agent_config") or fetched_agent)
+
+        # Run _build_bolna_payload in a thread: it calls blocking DB functions
+        # (get_user_health_context, get_user_by_phone) that must not block the event loop.
+        bolna_payload, resolved_name, ctx, dynamic_prompt = await asyncio.to_thread(
+            _build_bolna_payload, phone, user_name, agent_config
+        )
         
         logger.info(f"[CALL-INTERNAL] Initiating call to {phone} | user={resolved_name}")
 
@@ -1679,62 +1691,66 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                 severity = extracted.get("severity", "medium")
                 intent = extracted.get("intent", "health_check")
             else:
-                logger.info("[WEBHOOK] Call completed, but no extraction data or transcript found. Ignoring to prevent duplicate missed call alerts.")
+                logger.info("[WEBHOOK] Call completed with no transcript or extraction data — logging as healthy check-in.")
 
-            # If we have any data to process (either from transcript, or Bolna extracted)
-            if formatted_transcript or extracted:
-                # Prefer metadata.user_id injected at call time; fall back to phone lookup
-                if _meta_user_id:
-                    user_id = str(_meta_user_id)
-                    logger.info(f"[WEBHOOK] Resolved user_id from metadata: {user_id}")
+            # ALWAYS save every completed call to the DB — even "patient is fine" calls
+            # where Bolna sends no transcript or extraction data. Previously this block was
+            # guarded by `if formatted_transcript or extracted`, silently dropping healthy
+            # calls and leaving recording_url unsaved in Postgres.
+
+            # Prefer metadata.user_id injected at call time; fall back to phone lookup
+            if _meta_user_id:
+                user_id = str(_meta_user_id)
+                logger.info(f"[WEBHOOK] Resolved user_id from metadata: {user_id}")
+            else:
+                user_profile = get_user_by_phone(phone)
+                user_id = str(user_profile["user_id"]) if user_profile and "user_id" in user_profile else None
+                if user_id:
+                    logger.info(f"[WEBHOOK] Resolved user_id via phone lookup: {user_id}")
                 else:
-                    user_profile = get_user_by_phone(phone)
-                    user_id = str(user_profile["user_id"]) if user_profile and "user_id" in user_profile else None
-                    if user_id:
-                        logger.info(f"[WEBHOOK] Resolved user_id via phone lookup: {user_id}")
-                    else:
-                        logger.warning(f"[WEBHOOK] Could not resolve user_id for phone {phone} — assessment logged as anonymous")
+                    logger.warning(f"[WEBHOOK] Could not resolve user_id for phone {phone} — assessment logged as anonymous")
 
-                call_id = _find_key(payload, ["call_id", "id"])
-                duration_val = _find_key(payload, ["duration", "call_duration", "duration_secs"])
-                duration_secs = None
-                if duration_val is not None:
-                    try:
-                        duration_secs = int(float(duration_val))
-                    except (ValueError, TypeError):
-                        pass
+            call_id = _find_key(payload, ["call_id", "id"])
+            duration_val = _find_key(payload, ["duration", "call_duration", "duration_secs"])
+            duration_secs = None
+            if duration_val is not None:
+                try:
+                    duration_secs = int(float(duration_val))
+                except (ValueError, TypeError):
+                    pass
 
-                response_data = await process_assessment_data(
-                    intent=intent,
-                    symptoms=symptoms,
-                    severity=severity,
-                    confidence=1.0,
-                    user_id=user_id,
-                    recording_url=recording_url,
-                    transcript=formatted_transcript if formatted_transcript else None,
-                    emotion_analysis=emotion_analysis,
-                    bolna_call_id=call_id
-                )
-                
-                assessment_id = response_data.get("assessment_id")
-                
-                if user_id and isinstance(raw_transcript, list):
-                    for msg in raw_transcript:
-                        if isinstance(msg, dict):
-                            r = msg.get("role", "unknown")
-                            c = msg.get("content", "")
-                            if c:
-                                await asyncio.to_thread(
-                                    log_conversation_turn,
-                                    user_id=user_id,
-                                    role=r,
-                                    content=c,
-                                    bolna_call_id=call_id,
-                                    channel="phone",  # Bolna = voice call = 'phone' channel (DB CHECK: web|phone|whatsapp)
-                                    assessment_id=assessment_id,
-                                    audio_url=None,
-                                    duration_secs=duration_secs
-                                )
+            response_data = await process_assessment_data(
+                intent=intent,
+                symptoms=symptoms,
+                severity=severity,
+                confidence=1.0,
+                user_id=user_id,
+                recording_url=recording_url,
+                transcript=formatted_transcript if formatted_transcript else None,
+                emotion_analysis=emotion_analysis,
+                bolna_call_id=call_id
+            )
+
+            assessment_id = response_data.get("assessment_id")
+            logger.info(f"[WEBHOOK] Saved assessment {assessment_id} for call {call_id} (severity={severity}, symptoms={symptoms})")
+
+            if user_id and isinstance(raw_transcript, list):
+                for msg in raw_transcript:
+                    if isinstance(msg, dict):
+                        r = msg.get("role", "unknown")
+                        c = msg.get("content", "")
+                        if c:
+                            await asyncio.to_thread(
+                                log_conversation_turn,
+                                user_id=user_id,
+                                role=r,
+                                content=c,
+                                bolna_call_id=call_id,
+                                channel="phone",  # Bolna = voice call = 'phone' channel (DB CHECK: web|phone|whatsapp)
+                                assessment_id=assessment_id,
+                                audio_url=None,
+                                duration_secs=duration_secs
+                            )
 
         return {"status": "ok"}
     except Exception as e:
