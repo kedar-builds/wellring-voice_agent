@@ -189,12 +189,21 @@ async def run_reminder_scheduler():
                                 # fully tear down its TTS engine before a new call is placed,
                                 # preventing the "silent second call" race condition.
                                 await asyncio.sleep(5)
-                                await _do_bolna_call(phone=p, user_name=None)
+                                
+                                try:
+                                    res = await _do_bolna_call(phone=p, user_name=None)
+                                except RuntimeError as e:
+                                    logger.warning(f"[SCHEDULER] Bolna call failed ({e}). Retrying in 10s...")
+                                    await asyncio.sleep(10)
+                                    res = await _do_bolna_call(phone=p, user_name=None)
+                                
+                                run_id = res.get("run_id", "unknown")
+
                                 # Only mark the reminder as triggered AFTER the call succeeds.
                                 # Moving this here prevents the previous race condition where
                                 # the DB was updated before Bolna even accepted the call.
                                 update_reminder_trigger(rid, ts)
-                                logger.info(f"[SCHEDULER] Reminder {rid} marked triggered after successful Bolna call.")
+                                logger.info(f"[SCHEDULER] Reminder {rid} marked triggered after successful Bolna call (run_id: {run_id}).")
                             except Exception as e:
                                 logger.error(f"[SCHEDULER] Error initiating voice call for reminder {rid}: {e}. Reminder will retry next cycle.")
 
@@ -1113,6 +1122,50 @@ def _build_bolna_payload(phone: str, user_name: Optional[str], agent_config: dic
 
     return bolna_payload, resolved_name, ctx, dynamic_prompt
 
+# Cache for bolna agent config to prevent 502s under heavy load
+_agent_config_cache = None
+_agent_config_cache_time = 0.0
+_agent_config_lock = asyncio.Lock()
+
+async def _get_bolna_agent_config(client: httpx.AsyncClient) -> dict:
+    global _agent_config_cache, _agent_config_cache_time
+    import time
+    now = time.time()
+    
+    async with _agent_config_lock:
+        if _agent_config_cache and (now - _agent_config_cache_time < 300):
+            return copy.deepcopy(_agent_config_cache)
+            
+        try:
+            agent_resp = await client.get(
+                f"https://api.bolna.ai/agent/{BOLNA_AGENT_ID}",
+                headers={"Authorization": f"Bearer {BOLNA_API_KEY}"}
+            )
+            
+            if agent_resp.status_code == 200:
+                fetched_agent = agent_resp.json()
+                agent_config = fetched_agent.get("agent_config") or fetched_agent
+                
+                # Verify it looks like a valid config (non-empty dict)
+                if agent_config and isinstance(agent_config, dict) and len(agent_config) > 0:
+                    _agent_config_cache = copy.deepcopy(agent_config)
+                    _agent_config_cache_time = now
+                    return copy.deepcopy(_agent_config_cache)
+                else:
+                    logger.warning(f"[CALL] Bolna returned empty/invalid config: {fetched_agent}")
+            else:
+                logger.error(f"[CALL] Failed to fetch agent config: {agent_resp.text}")
+                
+        except Exception as e:
+            logger.error(f"[CALL] Exception fetching agent config: {e}")
+            
+        # If we failed to get a new one but have a cache, use it
+        if _agent_config_cache:
+            logger.warning("[CALL] Using stale agent config from cache due to fetch failure")
+            return copy.deepcopy(_agent_config_cache)
+            
+        raise RuntimeError("Failed to fetch a valid agent config from Bolna")
+
 async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
     """
     Internal helper — executes the Bolna outbound call logic without going through
@@ -1131,18 +1184,8 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
 
     async with httpx.AsyncClient(timeout=30) as client:
         # 1. Fetch current agent config to avoid dropping settings like transcriber, llm_config, etc.
-        agent_resp = await client.get(
-            f"https://api.bolna.ai/agent/{BOLNA_AGENT_ID}",
-            headers={"Authorization": f"Bearer {BOLNA_API_KEY}"}
-        )
-        if agent_resp.status_code != 200:
-            logger.error(f"[CALL] Failed to fetch agent config: {agent_resp.text}")
-            raise RuntimeError(f"Failed to fetch agent config from Bolna")
-            
-        fetched_agent = agent_resp.json()
-        # Deep-copy so concurrent calls (scheduler + manual /call) don't mutate
-        # each other's agent_config dict, which caused wrong user_id injection.
-        agent_config = copy.deepcopy(fetched_agent.get("agent_config") or fetched_agent)
+        # Deep-copy happens inside _get_bolna_agent_config so concurrent calls don't mutate each other
+        agent_config = await _get_bolna_agent_config(client)
 
         # Run _build_bolna_payload in a thread: it calls blocking DB functions
         # (get_user_health_context, get_user_by_phone) that must not block the event loop.
@@ -1543,6 +1586,7 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
     try:
         payload = await request.json()
         logger.info(f"[WEBHOOK] Received Bolna webhook: {payload}")
+        logger.info(f"[WEBHOOK] Payload keys: {list(payload.keys())}")
         
         def _find_key(data, target_keys):
             if isinstance(data, dict):
