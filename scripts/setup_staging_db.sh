@@ -39,12 +39,13 @@ psql "$BASE_URL/postgres" -c "DROP DATABASE IF EXISTS $STAGING_DB_NAME;"
 psql "$BASE_URL/postgres" -c "CREATE DATABASE $STAGING_DB_NAME;"
 
 echo "Dumping schema from $ORIGINAL_DB_NAME..."
-pg_dump "$DATABASE_URL" --schema-only --no-owner --no-privileges -f /tmp/wellring_schema.sql
+SCHEMA_TMP=$(mktemp /tmp/wellring_XXXXXX.sql)   # mode-600, unguessable filename
+pg_dump "$DATABASE_URL" --schema-only --no-owner --no-privileges -f "$SCHEMA_TMP"
 
 echo "Restoring schema to $STAGING_DB_NAME..."
-psql "$STAGING_URL" -f /tmp/wellring_schema.sql
+psql "$STAGING_URL" -f "$SCHEMA_TMP"
 
-rm -f /tmp/wellring_schema.sql
+rm -f "$SCHEMA_TMP"
 
 echo "Staging database setup complete."
 echo "You can now connect using STAGING_DATABASE_URL=$STAGING_URL"

@@ -13,6 +13,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Create a non-root user for the runtime process.
+# The build steps (pip install, COPY) run as root so they can write to /app;
+# we switch to appuser only for the CMD to follow the principle of least privilege.
+RUN adduser --disabled-password --no-create-home --gecos "" appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8000
 
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -245,10 +245,18 @@ CREATE TRIGGER trg_users_updated_at
 -- ---------------------------------------------------------------------------
 -- 6. REMINDERS
 -- ---------------------------------------------------------------------------
--- Scheduled reminders for the voice agent to trigger
+-- Scheduled reminders for the voice agent to trigger.
+--
+-- NOTE: Existing deployments with a SERIAL id column must run:
+--   psql "$DATABASE_URL" -f scripts/migrate_reminders_uuid.sql
+-- before redeploying the application.  This schema definition only takes
+-- effect on a fresh (first-time) deployment.
+-- ---------------------------------------------------------------------------
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 CREATE TABLE IF NOT EXISTS reminders (
-    id              SERIAL PRIMARY KEY,
+    id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
     type            TEXT NOT NULL,
     title           TEXT NOT NULL,
     time            TEXT NOT NULL,

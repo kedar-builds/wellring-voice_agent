@@ -26,6 +26,7 @@ SYMPTOM_WEIGHTS: Dict[str, int] = {
 
     "fall_detected":      65,   # always HIGH
     "breathing_problem":  65,   # always HIGH
+    "shortness_of_breath": 65,  # LLM alias for breathing_problem — keep weight identical
 
     "severe_bleeding":    70,
     "heart_palpitation":  61,   # always HIGH

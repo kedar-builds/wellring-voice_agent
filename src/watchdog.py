@@ -414,10 +414,17 @@ async def run_watchdog():
 # Guardrail: rule-based assessment audit (Nemotron self-correction)
 # ---------------------------------------------------------------------------
 
-# Symptoms that are ALWAYS treated as CRITICAL regardless of LLM output
+# Symptoms that are ALWAYS treated as CRITICAL regardless of LLM output.
+# Keys must match what the Gemini/Nemotron extraction layer may return.
+# IMPORTANT: keep in sync with SYMPTOM_WEIGHTS in scoring_engine/rules.py —
+# if a key exists here but not in SYMPTOM_WEIGHTS, the base score will be 0
+# (guardrail still fires, but the stored score is misleading).
 _ALWAYS_CRITICAL_SYMPTOMS = frozenset({
-    "chest_pain", "stroke_symptoms", "unconscious",
-    "breathing_problem", "shortness_of_breath",
+    "chest_pain",
+    "stroke_symptoms",
+    "unconscious",
+    "breathing_problem",      # primary key in SYMPTOM_WEIGHTS
+    "shortness_of_breath",    # alternate phrasing LLM may emit; weight in rules.py
 })
 
 # Minimum confidence below which we force follow-up questions
@@ -521,11 +528,11 @@ def evaluate_pipeline_health() -> Dict[str, Any]:
     try:
         from src.database import _use_postgres, _PG_AVAILABLE
         if _use_postgres() and _PG_AVAILABLE:
-            from src.database import get_pg_conn, _pg_cursor
-            with get_pg_conn() as conn:
-                with _pg_cursor(conn) as cur:
-                    cur.execute("SELECT 1")
-            checks["database"] = True
+            # Use pg_pool_alive() instead of SELECT 1 — avoids a full network
+            # round-trip on every health poll and doesn't hold a connection open
+            # while the HTTP response is being serialised.
+            from src.database import pg_pool_alive
+            checks["database"] = pg_pool_alive()
         else:
             import sqlite3 as _sqlite3
             db_path = os.environ.get("WELLRING_DB_PATH", "wellring.db")

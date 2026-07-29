@@ -109,7 +109,10 @@ async def run_reminder_scheduler():
     while True:
         try:
             await asyncio.sleep(15)  # check every 15 seconds for responsive testing
-            reminders = get_reminders()
+            # Run the blocking DB call in a thread — get_reminders() uses psycopg2
+            # synchronously. Calling it directly here would stall the event loop
+            # for the entire round-trip to PostgreSQL on every 15-second tick.
+            reminders = await asyncio.to_thread(get_reminders)
             if not reminders:
                 continue
                 
@@ -202,7 +205,8 @@ async def run_reminder_scheduler():
                                 # Only mark the reminder as triggered AFTER the call succeeds.
                                 # Moving this here prevents the previous race condition where
                                 # the DB was updated before Bolna even accepted the call.
-                                update_reminder_trigger(rid, ts)
+                                # Offload to thread — psycopg2 is synchronous.
+                                await asyncio.to_thread(update_reminder_trigger, rid, ts)
                                 logger.info(f"[SCHEDULER] Reminder {rid} marked triggered after successful Bolna call (run_id: {run_id}).")
                             except Exception as e:
                                 logger.error(f"[SCHEDULER] Error initiating voice call for reminder {rid}: {e}. Reminder will retry next cycle.")
@@ -218,7 +222,9 @@ async def run_reminder_scheduler():
                         
                         success = send_whatsapp_reminder(rem_phone, body)
                         if success:
-                            update_reminder_trigger(rem_id, trigger_timestamp)
+                            # Offload to thread — same reason as get_reminders above:
+                            # psycopg2 is synchronous and would stall the event loop.
+                            await asyncio.to_thread(update_reminder_trigger, rem_id, trigger_timestamp)
         except asyncio.CancelledError:
             logger.info("Reminder scheduler task cancelled.")
             break
@@ -973,7 +979,7 @@ def create_reminder(payload: ReminderCreate, api_key: str = Depends(get_api_key)
 
 
 @app.delete("/reminders/{reminder_id}", tags=["Reminders"])
-def remove_reminder(reminder_id: int, api_key: str = Depends(get_api_key)):
+def remove_reminder(reminder_id: str, api_key: str = Depends(get_api_key)):
     """Delete a reminder schedule."""
     success = delete_reminder(reminder_id)
     if not success:
@@ -1604,9 +1610,10 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                         return res
             return None
 
-        # Robustly find status and phone from deeply nested Bolna payloads
+        # Extract core fields once — avoids variable shadowing between
+        # the failed-call and completed-call branches below.
         status = _find_key(payload, ["status", "call_status", "event"]) or "unknown"
-        phone = _find_key(payload, ["recipient_phone_number", "phone_number", "to"])
+        phone  = _find_key(payload, ["recipient_phone_number", "phone_number", "to"])
         call_id = _find_key(payload, ["call_id", "id", "session_id"]) or "bolna_missed_call"
         
         # If it's a failed or unanswered call, send a WhatsApp alert
@@ -1754,7 +1761,7 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                 else:
                     logger.warning(f"[WEBHOOK] Could not resolve user_id for phone {phone} — assessment logged as anonymous")
 
-            call_id = _find_key(payload, ["call_id", "id"])
+            # call_id was already extracted at top of function (shared by both branches)
             duration_val = _find_key(payload, ["duration", "call_duration", "duration_secs"])
             duration_secs = None
             if duration_val is not None:
@@ -1798,8 +1805,17 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
 
         return {"status": "ok"}
     except Exception as e:
-        logger.error(f"[WEBHOOK] Error handling Bolna webhook: {e}")
-        return {"status": "error", "message": str(e)}
+        # Log with full traceback so the root cause is visible in uvicorn output.
+        logger.error(f"[WEBHOOK] Error handling Bolna webhook: {e}", exc_info=True)
+        # Return HTTP 500 so Bolna knows delivery failed and can retry.
+        # Previously this returned HTTP 200 {"status": "error"}, which caused
+        # Bolna to consider the webhook delivered and never retry, silently
+        # dropping the assessment for any call where an exception occurred.
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
 
 
 # ---------------------------------------------------------------------------

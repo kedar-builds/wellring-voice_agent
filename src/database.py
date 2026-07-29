@@ -65,6 +65,7 @@ DB_PATH: str = os.environ.get("WELLRING_DB_PATH", "wellring.db")
 try:
     import psycopg2
     import psycopg2.extras  # for RealDictCursor, UUID support
+    import psycopg2.pool
     psycopg2.extras.register_uuid()
     _PG_AVAILABLE = True
 except ImportError:
@@ -79,33 +80,107 @@ except ImportError:
 
 
 # ===========================================================================
-# PostgreSQL helpers
+# PostgreSQL connection pool
 # ===========================================================================
+# A single ThreadedConnectionPool is shared across all threads spawned by
+# asyncio.to_thread().  Each call to get_pg_conn() checks out one connection,
+# uses it, and returns it to the pool — never opening a raw TCP connection
+# per DB operation.
+#
+# Tune via env vars:
+#   PG_POOL_MIN  (default 2) — connections kept warm at all times
+#   PG_POOL_MAX  (default 10) — max concurrent connections to Postgres
+#
+# Supabase free-tier limit is 15 pooled connections.  Keeping PG_POOL_MAX
+# at 10 leaves headroom for migrations, psql sessions, etc.
+# ---------------------------------------------------------------------------
+
+_pg_pool: "Optional[psycopg2.pool.ThreadedConnectionPool]" = None  # type: ignore[name-defined]
+_pg_pool_lock = __import__("threading").Lock()
+
+
+def _get_pg_pool():
+    """Return (creating if necessary) the shared ThreadedConnectionPool."""
+    global _pg_pool
+    if _pg_pool is not None:
+        return _pg_pool
+    with _pg_pool_lock:
+        if _pg_pool is not None:  # double-check inside lock
+            return _pg_pool
+        db_url = os.environ.get("DATABASE_URL", "")
+        if not (_PG_AVAILABLE and db_url):
+            raise RuntimeError(
+                "PostgreSQL is not configured (DATABASE_URL missing or psycopg2 not installed)."
+            )
+        minconn = int(os.environ.get("PG_POOL_MIN", "2"))
+        maxconn = int(os.environ.get("PG_POOL_MAX", "10"))
+        _pg_pool = psycopg2.pool.ThreadedConnectionPool(minconn, maxconn, db_url)
+        logger.info(f"[PG] Connection pool created (min={minconn}, max={maxconn}).")
+        return _pg_pool
+
 
 @contextmanager
 def get_pg_conn() -> Generator:
     """
-    Context manager that yields a psycopg2 connection.
-    Commits on clean exit, rolls back and re-raises on exception.
+    Context manager that checks out a connection from the shared pool.
+    Commits on clean exit, rolls back and re-raises on exception,
+    and always returns the connection to the pool in the finally block.
+
+    If the pool hasn't been created yet (e.g. DATABASE_URL just set),
+    it is initialised on the first call.
     """
-    db_url = os.environ.get("DATABASE_URL", "")
-    if not (_PG_AVAILABLE and db_url):
-        raise RuntimeError("PostgreSQL is not configured (DATABASE_URL missing or psycopg2 not installed).")
-    conn = psycopg2.connect(db_url)
+    pool = _get_pg_pool()
+    conn = pool.getconn()
     try:
+        # --- Stale-connection detection (two-pass) ---
+        # Pass 1: psycopg2-level closed flag (catches explicit disconnects).
+        if conn.closed:
+            pool.putconn(conn, close=True)
+            conn = pool.getconn()
+        # Pass 2: TCP-level ping — a Supabase/PgBouncer idle-timeout or a
+        # network blip can leave conn.closed==False while the socket is dead.
+        # A lightweight SELECT 1 surfaces that before the real query runs.
+        else:
+            try:
+                conn.cursor().execute("SELECT 1")
+                conn.rollback()  # don't leave an open transaction
+            except Exception:
+                # Connection is broken at TCP level — discard it and get a fresh one.
+                pool.putconn(conn, close=True)
+                conn = pool.getconn()
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
-        conn.close()
+        pool.putconn(conn)
 
 
 def _pg_cursor(conn):
     """Return a RealDictCursor so rows come back as dicts."""
     return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
+
+def pg_pool_alive() -> bool:
+    """
+    Lightweight health-check: verify the pool can hand out a connection
+    without issuing any query.  Used by /health and watchdog so a probe
+    doesn't burn a full SELECT 1 round-trip per poll.
+
+    Returns True if the pool is operational, False if PG is unreachable.
+    """
+    try:
+        pool = _get_pg_pool()
+        conn = pool.getconn()
+        pool.putconn(conn)
+        return True
+    except Exception as exc:
+        logger.error(f"[PG] Health-check pool probe failed: {exc}")
+        return False
 
 def init_pg_tables() -> None:
     """
@@ -845,7 +920,8 @@ def add_reminder(
     type_val: str, title: str, time_val: str,
     frequency: str, phone: str,
     notes: Optional[str] = None, db_path: Optional[str] = None,
-) -> int:
+) -> str:
+    """Insert a reminder and return its UUID (or str rowid for SQLite)."""
     if _use_postgres() and _PG_AVAILABLE:
         with get_pg_conn() as conn:
             with _pg_cursor(conn) as cur:
@@ -858,8 +934,9 @@ def add_reminder(
                     "frequency": frequency, "phone": phone, "notes": notes
                 })
                 row = cur.fetchone()
-                return int(row["id"]) if row else 0
+                return str(row["id"]) if row else ""
 
+    # SQLite fallback (local dev / testing)
     db_path = _resolve_db_path(db_path)
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -870,7 +947,7 @@ def add_reminder(
     row_id = cur.lastrowid
     conn.commit()
     conn.close()
-    return int(row_id) if row_id else 0
+    return str(row_id) if row_id else ""
 
 
 def get_reminders(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -890,11 +967,12 @@ def get_reminders(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     return rows
 
 
-def delete_reminder(reminder_id: int, db_path: Optional[str] = None) -> bool:
+def delete_reminder(reminder_id: str, db_path: Optional[str] = None) -> bool:
+    """Delete a reminder by its UUID string id."""
     if _use_postgres() and _PG_AVAILABLE:
         with get_pg_conn() as conn:
             with _pg_cursor(conn) as cur:
-                cur.execute("DELETE FROM reminders WHERE id = %s", (reminder_id,))
+                cur.execute("DELETE FROM reminders WHERE id = %s::uuid", (reminder_id,))
                 return cur.rowcount > 0
 
     db_path = _resolve_db_path(db_path)
@@ -907,11 +985,15 @@ def delete_reminder(reminder_id: int, db_path: Optional[str] = None) -> bool:
     return deleted
 
 
-def update_reminder_trigger(reminder_id: int, timestamp: str, db_path: Optional[str] = None) -> bool:
+def update_reminder_trigger(reminder_id: str, timestamp: str, db_path: Optional[str] = None) -> bool:
+    """Record the last-triggered timestamp for a reminder by its UUID string id."""
     if _use_postgres() and _PG_AVAILABLE:
         with get_pg_conn() as conn:
             with _pg_cursor(conn) as cur:
-                cur.execute("UPDATE reminders SET last_triggered = %s WHERE id = %s", (timestamp, reminder_id))
+                cur.execute(
+                    "UPDATE reminders SET last_triggered = %s WHERE id = %s::uuid",
+                    (timestamp, reminder_id),
+                )
                 return cur.rowcount > 0
 
     db_path = _resolve_db_path(db_path)
