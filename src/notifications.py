@@ -385,8 +385,8 @@ def trigger_alerts_if_needed(
                 caregiver_name=name,
             )
 
-    elif risk_level == "MEDIUM":
-        # Routine update for MEDIUM check-ins — always notify family
+    elif risk_level in ("MEDIUM", "LOW"):
+        # Routine update for MEDIUM and LOW check-ins — always notify family
         # that the elder answered and completed the check-in.
         for contact in family_contacts:
             phone = contact["phone"]

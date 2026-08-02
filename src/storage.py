@@ -93,7 +93,7 @@ async def upload_recording_to_b2(original_url: str, phone: str = "unknown") -> s
 
     try:
         # 1. Download audio from Bolna
-        async with httpx.AsyncClient(timeout=60) as http:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as http:
             resp = await http.get(original_url)
         if resp.status_code != 200:
             logger.error(f"[B2] Failed to download recording ({resp.status_code}): {original_url}")

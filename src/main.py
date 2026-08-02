@@ -295,15 +295,17 @@ async def lifespan(app: FastAPI):
         logger.error(f"[SEED] Demo data seeding failed (non-fatal): {e}")
     scheduler_task = asyncio.create_task(run_reminder_scheduler())
     watchdog_task = asyncio.create_task(run_watchdog())  # 🧠 Nemotron system watchdog
-    yield
-    # ---- shutdown ----
-    for task in (scheduler_task, watchdog_task):
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+    try:
+        yield
+    finally:
+        # ---- shutdown ----
+        for task in (scheduler_task, watchdog_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
 app = FastAPI(
     title="WellRing Health Risk API",
