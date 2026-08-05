@@ -10,8 +10,9 @@ Scenarios:
   5. "I feel fine" — NO tool call    -> not applicable to /assess directly; documented below
 """
 
+import json
 import os
-import requests, json
+import requests
 
 ASSESS_URL = "https://wellring-backend-production.up.railway.app/assess"
 _api_key = os.environ.get("WELLRING_API_KEY")
@@ -22,19 +23,19 @@ HEADERS = {"X-API-Key": _api_key, "Content-Type": "application/json"}
 scenarios = [
     {
         "label": "1. CRITICAL: chest_pain only",
-        "tool_args": {"symptoms": ["chest_pain"], "severity": "critical"},
+        "tool_args": {"intent": "health_issue", "symptoms": ["chest_pain"], "severity": "critical"},
     },
     {
         "label": "2. CRITICAL dominates: chest_pain + headache",
-        "tool_args": {"symptoms": ["chest_pain", "headache"], "severity": "critical"},
+        "tool_args": {"intent": "health_issue", "symptoms": ["chest_pain", "headache"], "severity": "critical"},
     },
     {
         "label": "3. MODERATE+MINOR: dizziness + headache (severity=medium, not low)",
-        "tool_args": {"symptoms": ["dizziness", "headache"], "severity": "medium"},
+        "tool_args": {"intent": "health_issue", "symptoms": ["dizziness", "headache"], "severity": "medium"},
     },
     {
         "label": "4. MINOR only: headache + fatigue (severity=low)",
-        "tool_args": {"symptoms": ["headache", "fatigue"], "severity": "low"},
+        "tool_args": {"intent": "health_issue", "symptoms": ["headache", "fatigue"], "severity": "low"},
     },
 ]
 

@@ -300,9 +300,18 @@ async def _execute_action(action: Dict[str, Any]) -> None:
     }
 
     try:
-        from src.notifications import trigger_alerts_if_needed
-        import asyncio as _asyncio
-        await _asyncio.to_thread(
+        from src.notifications import trigger_alerts_if_needed, twilio_quota_exhausted
+
+        # If Twilio is currently rate-limited (daily quota hit), retrying is
+        # pointless and would just fail again. Pause until the cooldown expires.
+        if twilio_quota_exhausted():
+            logger.warning(
+                f"[WATCHDOG] ⏸ Skipping retry for {assessment_id} — Twilio quota exhausted. "
+                "Alerts will resume automatically once the account limit resets."
+            )
+            return
+
+        await asyncio.to_thread(
             trigger_alerts_if_needed,
             assessment_id,
             response_data,
@@ -467,7 +476,7 @@ def audit_and_correct_assessment(
         self_corrected  = True
         audit_status    = "OVERRIDDEN"
         override_reason = (
-            f"Chest pain detected" if "chest_pain" in critical_hit
+            "Chest pain detected" if "chest_pain" in critical_hit
             else f"Critical symptom '{symptom_name}' detected"
         ) + f": auto-escalated to CRITICAL. Original risk was {assessment.get('risk_level', 'UNKNOWN')}."
 

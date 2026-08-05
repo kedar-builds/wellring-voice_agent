@@ -22,11 +22,152 @@ Environment variables (set in .env):
 import logging
 import os
 import datetime
+import time as _time
+import threading as _threading
 from typing import Optional, Tuple, Union
 from src.database import log_alert, get_family_contacts
 from src.users import get_user
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Twilio quota / daily-limit detection
+# ---------------------------------------------------------------------------
+# Twilio returns error 63038 when a trial account hits its daily message cap
+# ("Account ... exceeded the 50 daily messages limit"). Treat these as a
+# distinct, developer-actionable condition instead of a generic send failure.
+# NOTE: 63016 (failed send) / 63017 (blocked message) are deliberately NOT
+# included — they are not quota errors and must not suppress watchdog retries.
+TWILIO_QUOTA_MARKERS = (
+    "63038",                       # Account exceeded the daily messages limit
+    "daily messages limit",
+    "message limit",
+    "quota",
+)
+
+# Optional dev-notification webhook (Slack / Discord / ntfy / etc.)
+DEV_ALERT_WEBHOOK_URL = os.environ.get("DEV_ALERT_WEBHOOK_URL", "")
+
+_quota_lock = _threading.Lock()
+_quota_exhausted_ts = 0.0
+# Once a quota error is seen, pause retries + dev-alert spam for this window.
+QUOTA_COOLDOWN_SECONDS = 3600.0
+
+
+def _is_twilio_quota_error(err_msg: Optional[str]) -> bool:
+    """Return True if a Twilio error message indicates an account quota/limit."""
+    if not err_msg:
+        return False
+    low = err_msg.lower()
+    return any(marker.lower() in low for marker in TWILIO_QUOTA_MARKERS)
+
+
+def _mark_twilio_quota_exhausted() -> None:
+    """Record the moment a Twilio quota error was observed (thread-safe)."""
+    global _quota_exhausted_ts
+    with _quota_lock:
+        _quota_exhausted_ts = _time.time()
+
+
+def twilio_quota_exhausted() -> bool:
+    """
+    True if a Twilio quota error was seen recently (within the cooldown window).
+    Lets the watchdog skip futile retries while the account is rate-limited.
+    """
+    with _quota_lock:
+        return _time.time() - _quota_exhausted_ts < QUOTA_COOLDOWN_SECONDS
+
+
+def _notify_dev_via_webhook(err_msg: str) -> None:
+    """POST a dev alert to DEV_ALERT_WEBHOOK_URL (Slack/Discord/ntfy style)."""
+    if not DEV_ALERT_WEBHOOK_URL:
+        logger.error(
+            "[TWILIO-QUOTA] Set DEV_ALERT_WEBHOOK_URL to get notified the next time "
+            "Twilio hits its message quota."
+        )
+        return
+    try:
+        import httpx
+
+        payload = {
+            "text": (
+                "🚨 *WellRing: Twilio message quota exceeded!*\n\n"
+                f"{err_msg}\n\n"
+                "WhatsApp/SMS alerts are NOT being delivered. "
+                "Check the account at https://console.twilio.com and upgrade the plan "
+                "or wait for the daily limit to reset."
+            )
+        }
+        resp = httpx.post(DEV_ALERT_WEBHOOK_URL, json=payload, timeout=10)
+        if resp.status_code >= 400:
+            logger.error(f"[TWILIO-QUOTA] Dev webhook returned HTTP {resp.status_code}")
+        else:
+            logger.info(f"[TWILIO-QUOTA] Dev webhook notified ({resp.status_code}).")
+    except Exception as exc:
+        logger.error(f"[TWILIO-QUOTA] Dev webhook notification failed: {exc}")
+
+
+_last_dev_alert_ts = 0.0
+
+
+def _handle_twilio_quota_error(to_phone: str, err_msg: str) -> None:
+    """
+    Loudly flag a Twilio quota error and notify the developer — at most once
+    per cooldown window so a burst of failed sends doesn't spam the webhook.
+    """
+    global _last_dev_alert_ts
+    _mark_twilio_quota_exhausted()
+    logger.critical(
+        "[TWILIO-QUOTA] ⛔ Twilio account has hit its message quota/limit — "
+        f"WhatsApp/SMS alerts are NOT being delivered. Last failed send to "
+        f"{to_phone}: {err_msg} "
+        "(fix: upgrade the Twilio plan or wait for the daily limit to reset)."
+    )
+    with _quota_lock:
+        now = _time.time()
+        if now - _last_dev_alert_ts >= QUOTA_COOLDOWN_SECONDS:
+            _last_dev_alert_ts = now
+            should_notify = True
+        else:
+            should_notify = False
+    if should_notify:
+        _notify_dev_via_webhook(err_msg)
+
+
+# ---------------------------------------------------------------------------
+# Recording URL helper
+# ---------------------------------------------------------------------------
+
+def _truncate_transcript(transcript: Optional[str], limit: int = 1500) -> Optional[str]:
+    """
+    Keep the WhatsApp body under Twilio's 4096-char limit.
+    Long call transcripts are truncated with an ellipsis so the send
+    never fails silently with error 21617 (Message Body too long).
+    """
+    if not transcript:
+        return transcript
+    if len(transcript) <= limit:
+        return transcript
+    return transcript[:limit].rstrip() + "…"
+
+
+def _presign_recording_url(recording_url: Optional[str]) -> Optional[str]:
+    """
+    Convert a private Backblaze B2 object URL into a time-limited presigned
+    link that a caregiver can actually open in WhatsApp.
+
+    B2 buckets are private by default — the raw object URL returns HTTP 401.
+    Falls back to the original URL if storage isn't configured or signing fails.
+    """
+    if not recording_url:
+        return recording_url
+    try:
+        from src.storage import get_presigned_url
+        signed = get_presigned_url(recording_url, expires_in=7 * 24 * 3600)  # 7 days
+        return signed or recording_url
+    except Exception as exc:
+        logger.warning(f"[NOTIFY] Presign failed ({exc}) — sending raw URL.")
+        return recording_url
 
 # ---------------------------------------------------------------------------
 # Credentials — loaded from environment (never hardcoded)
@@ -105,6 +246,7 @@ def build_alert_message(
     action_clean = action.replace("_", " ").title()
 
     call_summary = ""
+    transcript = _truncate_transcript(transcript)
     if transcript:
         call_summary = f"\n\n📝 *Call Summary:*\n{transcript}"
     if recording_url:
@@ -151,6 +293,7 @@ def build_routine_update_message(
         health_line = f"Yeah, {patient_name} is fine and doing well."
 
     call_summary = ""
+    transcript = _truncate_transcript(transcript)
     if transcript:
         call_summary = f"\n\n📝 *Call Summary:*\n{transcript}"
     if recording_url:
@@ -209,7 +352,10 @@ def _twilio_send(to_phone: str, body: str, notification_type: str = "whatsapp") 
 
     except Exception as exc:
         err_msg = str(exc)
-        logger.error(f"[TWILIO] Send failed to {to_phone}: {err_msg}")
+        if _is_twilio_quota_error(err_msg):
+            _handle_twilio_quota_error(to_phone, err_msg)
+        else:
+            logger.error(f"[TWILIO] Send failed to {to_phone}: {err_msg}")
         return False, err_msg
 
 
@@ -234,7 +380,7 @@ def send_whatsapp_alert(
     action     = response_data.get("action", "monitor")
     steps      = response_data.get("steps", [])
     transcript = response_data.get("transcript")
-    recording_url = response_data.get("recording_url")
+    recording_url = _presign_recording_url(response_data.get("recording_url"))
 
     body = build_alert_message(
         patient_name=patient_name,
@@ -388,6 +534,7 @@ def trigger_alerts_if_needed(
     elif risk_level in ("MEDIUM", "LOW"):
         # Routine update for MEDIUM and LOW check-ins — always notify family
         # that the elder answered and completed the check-in.
+        presigned_recording = _presign_recording_url(response_data.get("recording_url"))
         for contact in family_contacts:
             phone = contact["phone"]
             name = contact["name"]
@@ -398,7 +545,7 @@ def trigger_alerts_if_needed(
                 symptoms=response_data.get("symptoms", []),
                 risk_level=risk_level,
                 transcript=response_data.get("transcript"),
-                recording_url=response_data.get("recording_url"),
+                recording_url=presigned_recording,
             )
             sent = False
             err_msg = None

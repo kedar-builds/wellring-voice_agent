@@ -97,7 +97,7 @@ from src.database import (
     add_single_family_contact, get_user_by_phone, get_call_timeline, log_conversation_turn,
     ANONYMOUS_USER_ID,
 )
-from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp, send_unanswered_call_alert
+from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp, send_unanswered_call_alert, twilio_quota_exhausted
 from src.watchdog import run_watchdog
 
 # ---------------------------------------------------------------------------
@@ -106,6 +106,15 @@ from src.watchdog import run_watchdog
 
 async def run_reminder_scheduler():
     logger.info("Starting background reminder scheduler...")
+    processing_reminders = set()
+    # Tracks consecutive failed trigger attempts per reminder (in-memory).
+    # Guards against the retry-loop bug that stormed Twilio: a reminder whose
+    # call/send keeps failing (e.g. a dead demo number) used to re-fire every
+    # 15s forever. After MAX_REMINDER_ATTEMPTS consecutive failures it is
+    # marked triggered for the current period and only fires again next period.
+    consecutive_failures: Dict[str, int] = {}
+    MAX_REMINDER_ATTEMPTS = 3
+
     while True:
         try:
             await asyncio.sleep(15)  # check every 15 seconds for responsive testing
@@ -115,14 +124,27 @@ async def run_reminder_scheduler():
             reminders = await asyncio.to_thread(get_reminders)
             if not reminders:
                 continue
+
                 
             ist_tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
             now = datetime.datetime.now(ist_tz)
-            current_time_str = now.strftime("%H:%M")
             current_date_str = now.strftime("%Y-%m-%d")
+
+            # Twilio quota guard: while the account is rate-limited (error 63038),
+            # every WhatsApp send fails and each attempt burns the account's
+            # request allowance. Defer WhatsApp sends until the cooldown clears.
+            quota_exhausted = twilio_quota_exhausted()
+            if quota_exhausted:
+                logger.warning(
+                    "[SCHEDULER] ⏸ Twilio quota exhausted — deferring WhatsApp sends "
+                    "until the cooldown window clears."
+                )
             
             for reminder in reminders:
                 rem_id = reminder["id"]
+                if rem_id in processing_reminders:
+                    continue
+                
                 rem_type = reminder["type"]
                 rem_title = reminder["title"]
                 rem_time = reminder["time"]
@@ -179,12 +201,40 @@ async def run_reminder_scheduler():
                             if not last_trig:
                                 should_trigger = True
                                 trigger_timestamp = now.isoformat()
-                
+
+                if not should_trigger:
+                    # Clear any stale failure count from a previous period so the
+                    # next due-window starts with a full retry budget. (Also prunes
+                    # entries for reminders that no longer exist.)
+                    consecutive_failures.pop(rem_id, None)
+
                 if should_trigger:
+                    # Break retry loops: after N consecutive failures the reminder
+                    # is marked triggered for this period (so it won't re-fire every
+                    # 15s forever) and is skipped until the next period.
+                    fails = consecutive_failures.get(rem_id, 0)
+                    if fails >= MAX_REMINDER_ATTEMPTS:
+                        logger.warning(
+                            f"[SCHEDULER] Reminder {rem_id} ({rem_title}) failed {fails}x "
+                            "consecutively — marking triggered for this period to break "
+                            "the retry loop. It will fire again next period."
+                        )
+                        await asyncio.to_thread(update_reminder_trigger, rem_id, trigger_timestamp)
+                        consecutive_failures[rem_id] = 0
+                        continue
+
                     logger.info(f"Triggering reminder {rem_id} ({rem_title}) for {rem_phone}")
+                    processing_reminders.add(rem_id)
+
                     if rem_type in ("call", "family_call"):
-                        body = "📞 WellRing check-in call is ringing you now..."
-                        send_whatsapp_reminder(rem_phone, body)
+                        # The "ringing now" WhatsApp is a nicety — skip it while Twilio
+                        # is rate-limited. The Bolna call itself does not consume Twilio
+                        # quota, so the check-in call can still proceed.
+                        if quota_exhausted:
+                            logger.info(f"[SCHEDULER] Skipping 'ringing now' WhatsApp for {rem_id} — Twilio quota exhausted.")
+                        else:
+                            body = "📞 WellRing check-in call is ringing you now..."
+                            send_whatsapp_reminder(rem_phone, body)
                         # Capture loop variables in default args to avoid closure-capture bugs.
                         async def safe_bolna_call(p, rid, ts):
                             try:
@@ -207,24 +257,48 @@ async def run_reminder_scheduler():
                                 # the DB was updated before Bolna even accepted the call.
                                 # Offload to thread — psycopg2 is synchronous.
                                 await asyncio.to_thread(update_reminder_trigger, rid, ts)
+                                consecutive_failures[rid] = 0
                                 logger.info(f"[SCHEDULER] Reminder {rid} marked triggered after successful Bolna call (run_id: {run_id}).")
                             except Exception as e:
-                                logger.error(f"[SCHEDULER] Error initiating voice call for reminder {rid}: {e}. Reminder will retry next cycle.")
+                                consecutive_failures[rid] = consecutive_failures.get(rid, 0) + 1
+                                logger.error(
+                                    f"[SCHEDULER] Error initiating voice call for reminder {rid}: {e} "
+                                    f"(attempt {consecutive_failures[rid]}/{MAX_REMINDER_ATTEMPTS}). "
+                                    "Reminder will retry next cycle."
+                                )
+                            finally:
+                                processing_reminders.discard(rid)
 
                         asyncio.create_task(safe_bolna_call(rem_phone, rem_id, trigger_timestamp))
                     else:
+                        if quota_exhausted:
+                            logger.info(
+                                f"[SCHEDULER] Skipping WhatsApp reminder {rem_id} — Twilio quota exhausted. Will retry after cooldown."
+                            )
+                            processing_reminders.discard(rem_id)
+                            continue
+
                         if rem_type == "medicine":
                             body = f"💊 WellRing Medicine Reminder:\nPlease take {rem_title}.\nNotes: {rem_notes}"
                         elif rem_type == "checkup":
                             body = f"🏥 WellRing Health Checkup Reminder:\nYou have '{rem_title}' scheduled.\nNotes: {rem_notes}"
                         else:
                             body = f"⏰ WellRing Reminder: {rem_title}.\nNotes: {rem_notes}"
-                        
+
                         success = send_whatsapp_reminder(rem_phone, body)
                         if success:
                             # Offload to thread — same reason as get_reminders above:
                             # psycopg2 is synchronous and would stall the event loop.
                             await asyncio.to_thread(update_reminder_trigger, rem_id, trigger_timestamp)
+                            consecutive_failures[rem_id] = 0
+                        else:
+                            consecutive_failures[rem_id] = consecutive_failures.get(rem_id, 0) + 1
+                            logger.error(
+                                f"[SCHEDULER] WhatsApp send for reminder {rem_id} failed "
+                                f"(attempt {consecutive_failures[rem_id]}/{MAX_REMINDER_ATTEMPTS})."
+                            )
+
+                        processing_reminders.discard(rem_id)
         except asyncio.CancelledError:
             logger.info("Reminder scheduler task cancelled.")
             break
@@ -266,14 +340,10 @@ def seed_demo_data():
                 phone="+919876543210",
                 notes="Take with breakfast"
             )
-            add_reminder(
-                type_val="call",
-                title="Weekly Wellness Check-in",
-                time_val="14:00",
-                frequency="weekly",
-                phone="+919876543210",
-                notes="Routine AI check-in"
-            )
+            # NOTE: No call-type demo reminder is seeded. A "weekly check-in call"
+            # pointing at the fake demo number (+919876543210) can never complete,
+            # which previously left the reminder permanently "due" and drove the
+            # scheduler retry loop that stormed Twilio with error 63038.
             logger.info("Demo reminders seeded successfully.")
 
 scheduler_task = None
@@ -993,8 +1063,8 @@ def remove_reminder(reminder_id: str, api_key: str = Depends(get_api_key)):
 # Outbound Call Endpoint (context-aware)
 # ---------------------------------------------------------------------------
 
-BOLNA_API_KEY = os.environ.get("BOLNA_API_KEY") or "bn-0d9f1aa2347d4aa68b593c8e0680aed5"
-BOLNA_AGENT_ID = os.environ.get("BOLNA_AGENT_ID") or "220c3652-eb24-4b9b-b00a-766c8c64bdda"
+BOLNA_API_KEY = os.environ.get("BOLNA_API_KEY", "")
+BOLNA_AGENT_ID = os.environ.get("BOLNA_AGENT_ID", "220c3652-eb24-4b9b-b00a-766c8c64bdda")
 BASE_WEBHOOK_URL = os.environ.get("BASE_WEBHOOK_URL", "https://wellring-backend-production.up.railway.app").rstrip("/")
 
 BASE_SYSTEM_PROMPT = """You are a caring assistant from WellRing calling to check on [elder_name].
@@ -1115,6 +1185,9 @@ def _build_bolna_payload(phone: str, user_name: Optional[str], agent_config: dic
             
         tasks[0] = task_0
         agent_config["tasks"] = tasks
+
+    # 4. Override agent_welcome_message to prevent `{first_name}` missing var crash
+    agent_config["agent_welcome_message"] = f"Hello {resolved_name}, this is WellRing. How are you feeling today? Any discomfort throughout the day?"
 
     webhook_secret = os.environ.get("BOLNA_WEBHOOK_SECRET", "")
     bolna_payload: Dict[str, Any] = {
@@ -1710,10 +1783,12 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                 # Upload to S3 (Backblaze B2) to replace transient Bolna link
                 recording_url = await upload_recording_to_b2(recording_url, phone)
                 
-            # Analyze emotion if we have an audio recording URL
+            # Analyze emotion if we have an audio recording URL.
+            # B2 object URLs are private (401), so presign before downloading.
             emotion_analysis = ""
             if recording_url:
-                emotion_analysis = await analyze_emotion_from_audio(recording_url)
+                signed_url = get_presigned_url(recording_url, expires_in=3600) or recording_url
+                emotion_analysis = await analyze_emotion_from_audio(signed_url)
 
             extracted = _find_extraction_data(payload)
             
@@ -1752,6 +1827,7 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
             # calls and leaving recording_url unsaved in Postgres.
 
             # Prefer metadata.user_id injected at call time; fall back to phone lookup
+            user_id: Optional[str] = None
             if _meta_user_id:
                 user_id = str(_meta_user_id)
                 logger.info(f"[WEBHOOK] Resolved user_id from metadata: {user_id}")

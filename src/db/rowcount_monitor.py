@@ -78,7 +78,8 @@ def get_counts() -> dict:
             cur = conn.cursor()
             for table in TABLES:
                 cur.execute(f"SELECT COUNT(*) FROM {table}")
-                counts[table] = cur.fetchone()[0]
+                row = cur.fetchone()
+                counts[table] = row[0] if row else 0
             conn.close()
             return counts
         except Exception as exc:
@@ -91,15 +92,16 @@ def get_counts() -> dict:
     try:
         import sqlite3
 
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
+        sqlite_conn = sqlite3.connect(db_path)
+        sqlite_cur = sqlite_conn.cursor()
         for table in TABLES:
             try:
-                cur.execute(f"SELECT COUNT(*) FROM {table}")
-                counts[table] = cur.fetchone()[0]
+                sqlite_cur.execute(f"SELECT COUNT(*) FROM {table}")
+                row = sqlite_cur.fetchone()
+                counts[table] = row[0] if row else 0
             except sqlite3.OperationalError:
                 counts[table] = -1  # table doesn't exist in this backend
-        conn.close()
+        sqlite_conn.close()
     except sqlite3.OperationalError as exc:
         logger.error(f"SQLite connection failed: {exc}")
         counts = {t: -2 for t in TABLES}  # sentinel for "unreachable"

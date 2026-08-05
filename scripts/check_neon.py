@@ -73,13 +73,11 @@ def run_neon_check():
         existing_tables = set(r[0] for r in cur.fetchall())
         print(f"  📋 Found {len(existing_tables)} tables in public schema: {sorted(list(existing_tables))}")
         
-        all_tables_exist = True
         for t in expected_tables:
             if t in existing_tables:
                 print(f"  ✅ Table '{t}' exists")
             else:
                 print(f"  ❌ Table '{t}' MISSING")
-                all_tables_exist = False
     except Exception as e:
         print(f"  ❌ Schema verification failed: {e}")
 
@@ -140,7 +138,7 @@ def run_neon_check():
                 (SELECT COUNT(*) FROM health_history) AS hh_count;
         """)
         row = cur.fetchone()
-        print(f"  📊 Row Counts:")
+        print("  📊 Row Counts:")
         print(f"     • Users: {row['users_count']} (System Users: {row['sys_users_count']})")
         print(f"     • Assessments: {row['ass_count']}")
         print(f"     • Conversations: {row['conv_count']}")

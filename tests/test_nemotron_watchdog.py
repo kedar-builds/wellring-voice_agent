@@ -6,18 +6,14 @@ and watchdog endpoints.
 """
 
 from unittest.mock import patch
-import pytest
 
 from src.watchdog import (
     audit_and_correct_assessment,
-    evaluate_pipeline_health,
 )
 from src.database import (
     log_nemotron_audit,
     get_latest_nemotron_audits,
     get_active_watchdog_logs,
-    get_health_facts_for_user,
-    is_call_active,
 )
 
 
@@ -118,7 +114,7 @@ def test_database_nemotron_audit_logging():
     assert audit_id is not None
     logs = get_latest_nemotron_audits(limit=5)
     assert len(logs) > 0
-    target_log = next((l for l in logs if l.get("user_id") == user_id or l.get("id") == audit_id), None)
+    target_log = next((log for log in logs if log.get("user_id") == user_id or log.get("id") == audit_id), None)
     assert target_log is not None
     assert target_log["final_risk"] == "CRITICAL"
     assert target_log["self_corrected"] is True or target_log["self_corrected"] == 1

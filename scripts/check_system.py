@@ -2,7 +2,8 @@
 WellRing System Integrity Check
 Run: python3 check_system.py
 """
-import os, json, time, sys
+import os
+import time
 from pathlib import Path
 
 # Load .env manually so it works standalone

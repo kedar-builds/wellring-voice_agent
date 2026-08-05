@@ -26,12 +26,9 @@ What these tests verify
 import datetime
 import os
 import sqlite3
-import tempfile
-from unittest.mock import patch
 
 import pytest
 
-import src.database as db_module
 from src.database import _symptom_count_sqlite
 
 
