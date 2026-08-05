@@ -11,6 +11,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Inbound Twilio WhatsApp webhook: `POST /twilio-webhook` with `X-Twilio-Signature` validation,
+  form-encoded body parsing, inbound-message logging, and a TwiML reply that replaces Twilio's
+  canned "Standard auto-reply". 5 tests in `tests/test_twilio_webhook.py`.
+  *Verification: `pytest -q` → 57 passed in 12.71s (2026-08-05)*
 - `tests/test_history_sentinel_exclusion.py` — recreated from deleted source; 4 tests covering sentinel
   exclusion, orphan exclusion, real-user counting, and user-scoped isolation. All 4 pass.
   *Verification: `pytest tests/test_history_sentinel_exclusion.py -v` → 4 passed in 0.85s (2026-07-26)*

@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Security, Depends, status, Request, UploadFile, File, Form, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -1363,6 +1363,85 @@ async def manual_notify(request: Request, api_key: str = Depends(get_api_key)):
         "risk_level": risk_level,
         "symptoms": symptoms,
     }
+
+
+# ---------------------------------------------------------------------------
+# Twilio Inbound WhatsApp Webhook
+# ---------------------------------------------------------------------------
+
+def _twilio_request_valid(request: Request, form: Dict[str, str]) -> bool:
+    """
+    Validate the X-Twilio-Signature header on an inbound webhook request.
+
+    Twilio signs every webhook request with an HMAC of the full request URL
+    plus its POST params, keyed by the account auth token. Without this check
+    anyone could spoof inbound WhatsApp messages. If TWILIO_AUTH_TOKEN is not
+    configured we skip validation (dev mode) but warn loudly so it's noticed.
+    """
+    token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+    if not token:
+        logger.warning(
+            "[TWILIO-WEBHOOK] TWILIO_AUTH_TOKEN not set — skipping signature validation (dev mode)."
+        )
+        return True
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature:
+        return False
+    try:
+        from twilio.request_validator import RequestValidator
+        return RequestValidator(token).validate(str(request.url), form, signature)
+    except Exception as exc:
+        logger.error(f"[TWILIO-WEBHOOK] Signature validation error: {exc}")
+        return False
+
+
+@app.post("/twilio-webhook", tags=["Webhooks"])
+async def twilio_webhook(request: Request):
+    """
+    Inbound WhatsApp/SMS webhook for Twilio.
+
+    Twilio POSTs form-encoded fields (From, To, Body, MessageSid, ...) here
+    whenever someone messages the WellRing number. We validate the Twilio
+    signature, log the inbound message, and reply with TwiML so the sender
+    gets a friendly WellRing response instead of Twilio's canned
+    "Standard auto-reply".
+
+    Configure in Twilio Console → WhatsApp Sandbox → Sandbox Settings →
+    "When a message comes in" → https://<host>/twilio-webhook
+    """
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type not in ("application/x-www-form-urlencoded", "multipart/form-data"):
+        raise HTTPException(status_code=400, detail="Expected application/x-www-form-urlencoded body")
+    try:
+        form = await request.form()
+    except Exception as exc:
+        logger.warning(f"[TWILIO-WEBHOOK] Could not parse form body: {exc}")
+        raise HTTPException(status_code=400, detail="Expected application/x-www-form-urlencoded body")
+
+    params: Dict[str, str] = {k: str(v) for k, v in form.items()}
+    if not _twilio_request_valid(request, params):
+        logger.warning("[TWILIO-WEBHOOK] Rejected request with invalid/missing Twilio signature.")
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    sender = params.get("From", "unknown")
+    to_number = params.get("To", "")
+    message_sid = params.get("MessageSid", "")
+    body = params.get("Body", "")
+    logger.info(
+        f"[TWILIO-WEBHOOK] Inbound WhatsApp from {sender} (to {to_number}): {body!r} | SID {message_sid}"
+    )
+
+    reply = (
+        "Hi! 👋 This is Alice from WellRing. "
+        "You'll get health check-in alerts and reminders for your loved one here. "
+        "No reply is needed — we'll reach out if anything needs attention. Take care! 💙"
+    )
+    from xml.sax.saxutils import escape
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<Response><Message>{escape(reply)}</Message></Response>"
+    )
+    return Response(content=twiml, media_type="application/xml")
 
 
 # ===========================================================================
