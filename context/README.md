@@ -99,4 +99,57 @@ On detection, the assistant is instructed to immediately tell the patient to cal
 - CORS is restricted to known frontend domains.
 - File uploads are validated for allowed types (PDF, images only).
 - **Never commit `.env` to git.** Use `.env.example` as a template.
+
+## 🔌 Frontend ↔ Backend Connection
+
+The caregiver dashboard is a **separate React repo** deployed on Vercel
+(`https://wellring-frontend.vercel.app`). It calls this backend at
+`https://wellring-backend-production.up.railway.app` (the `BASE_WEBHOOK_URL` in `.env`).
+
+### ⚠️ API key must match on both sides (read before redeploying the frontend)
+
+Every dashboard request sends `X-API-Key` and is rejected with `401` if the value differs
+from the backend's `WELLRING_API_KEY` env var.
+
+- The old hardcoded key `wellring-secure-2026` was **removed** from the backend in the
+  Phase 6.1 security cleanup — the deployed backend now rejects it with `401`.
+- **Any frontend build that still hardcodes `wellring-secure-2026` will show empty/error
+  states for every authenticated feature** (dashboard feed, timeline, reminders,
+  profile, family contacts, appointments).
+- To fix: rebuild/redeploy the frontend with the **current** `WELLRING_API_KEY` value
+  (the same value set in the deployed backend's Railway env).
+
+### Frontend feature → backend endpoint map
+
+| Frontend feature | Backend route |
+|---|---|
+| Health indicator | `GET /health` |
+| Dashboard feed | `GET /assessments?limit=50` |
+| Call timeline | `GET /timeline?phone=…&limit=365` |
+| Reminders (list/add/delete) | `GET/POST /reminders`, `DELETE /reminders/{id}` |
+| Appointments (book/cancel) | `GET/POST /appointments`, `DELETE /appointments/{id}` |
+| Profile | `GET/POST /setup-profile` |
+| Family contacts | `GET/POST /family-contacts`, `DELETE /family-contacts/{id}` |
+| Outbound call (immediate) | `POST /call` `{phone}` |
+| Scheduled AI check-in call | `POST /reminders` `{type: "call", time, frequency, phone}` |
+
+> The frontend also calls Vercel-relative paths (`/api/ai-simulator`, `/api/ai-evaluate`,
+> `/api/profile*`) that are served by the frontend repo's own serverless functions — not
+> by this backend. Those return 405 if the functions are missing on Vercel.
+
+### Fix checklist (frontend repo) — required for the app to work end-to-end
+
+1. **Rebuild with the current API key.** The deployed bundle hardcodes the removed key
+   `wellring-secure-2026` → every authenticated request gets `401`. Set the frontend's
+   key to the backend's current `WELLRING_API_KEY` value.
+2. **Wire the scheduling buttons to the backend.** The "Schedule Event" form calls
+   `addAppointment`, which is **local-only** (adds to React state, posts nothing).
+   Point it at the real calls: `POST /call` for an immediate check-in, or
+   `POST /reminders` with `type: "call"` for a scheduled one (the backend scheduler
+   then fires the Bolna call). "Schedule AI Call" currently does the same — nothing
+   is sent to the backend.
+3. **Add Vercel serverless functions** (or rewrites) for `/api/ai-simulator`,
+   `/api/ai-evaluate`, and `/api/profile*` — they currently return 405.
+4. **Give the appointments renderer defaults** for UI-only fields (`iconName`, `color`,
+   `border`, `startHour`, `durationHours`) since the backend only stores data fields.
 # SQLite fallback active - Sat Jun 20 11:16:46 PM IST 2026

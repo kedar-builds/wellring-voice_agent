@@ -265,3 +265,27 @@ CREATE TABLE IF NOT EXISTS reminders (
     notes           TEXT,
     last_triggered  TEXT
 );
+
+
+-- ---------------------------------------------------------------------------
+-- 7. APPOINTMENTS
+-- ---------------------------------------------------------------------------
+-- Doctor / therapy / AI check-in appointments booked from the frontend
+-- dashboard. Mirrors the fields the React app sends to /appointments.
+
+CREATE TABLE IF NOT EXISTS appointments (
+    appointment_id  UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
+    title           TEXT            NOT NULL,
+    type            TEXT,
+    provider        TEXT,
+    time            TEXT,
+    date            TEXT,
+    location        TEXT,
+    phone           TEXT,
+    status          TEXT            NOT NULL DEFAULT 'upcoming'
+                                    CHECK (status IN ('upcoming', 'past', 'missed')),
+    notes           TEXT,
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_appointments_created_at ON appointments(created_at DESC);

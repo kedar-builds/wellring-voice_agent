@@ -175,6 +175,7 @@ def _presign_recording_url(recording_url: Optional[str]) -> Optional[str]:
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_PHONE  = os.environ.get("TWILIO_FROM_PHONE", "+14155238886")
+TWILIO_CONTENT_SID = os.environ.get("TWILIO_CONTENT_SID", "")
 CAREGIVER_PHONE    = os.environ.get("CAREGIVER_PHONE", "")
 USE_TWILIO         = os.environ.get("USE_TWILIO", "false").lower() == "true"
 USE_WHATSAPP       = os.environ.get("USE_WHATSAPP", "false").lower() == "true"
@@ -346,7 +347,15 @@ def _twilio_send(to_phone: str, body: str, notification_type: str = "whatsapp") 
             from_num = TWILIO_FROM_PHONE
             to_num   = to_phone
 
-        message = client.messages.create(body=body, from_=from_num, to=to_num)
+        kwargs = {"from_": from_num, "to": to_num}
+        if TWILIO_CONTENT_SID and (USE_WHATSAPP or notification_type == "whatsapp"):
+            import json
+            kwargs["content_sid"] = TWILIO_CONTENT_SID
+            kwargs["content_variables"] = json.dumps({"1": body})
+        else:
+            kwargs["body"] = body
+
+        message = client.messages.create(**kwargs)
         logger.info(f"[TWILIO] Sent to {to_phone} | SID: {message.sid}")
         return True, None
 
@@ -354,6 +363,12 @@ def _twilio_send(to_phone: str, body: str, notification_type: str = "whatsapp") 
         err_msg = str(exc)
         if _is_twilio_quota_error(err_msg):
             _handle_twilio_quota_error(to_phone, err_msg)
+        elif "21654" in err_msg or "ContentSid Required" in err_msg:
+            logger.error(
+                f"[TWILIO] Send failed to {to_phone}: Twilio Error 21654 (ContentSid Required). "
+                f"WhatsApp requires a registered Content Template (set TWILIO_CONTENT_SID in .env) "
+                f"or the recipient number must send the sandbox join code to {from_num} on WhatsApp."
+            )
         else:
             logger.error(f"[TWILIO] Send failed to {to_phone}: {err_msg}")
         return False, err_msg

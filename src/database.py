@@ -380,6 +380,22 @@ def init_db(db_path: Optional[str] = None) -> None:
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS appointments (
+            id              TEXT PRIMARY KEY,
+            title           TEXT NOT NULL,
+            type            TEXT,
+            provider        TEXT,
+            time            TEXT,
+            date            TEXT,
+            location        TEXT,
+            phone           TEXT,
+            status          TEXT NOT NULL DEFAULT 'upcoming',
+            notes           TEXT,
+            created_at      TEXT
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS nemotron_audits (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at      TEXT    NOT NULL,
@@ -970,10 +986,14 @@ def get_reminders(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
 def delete_reminder(reminder_id: str, db_path: Optional[str] = None) -> bool:
     """Delete a reminder by its UUID string id."""
     if _use_postgres() and _PG_AVAILABLE:
-        with get_pg_conn() as conn:
-            with _pg_cursor(conn) as cur:
-                cur.execute("DELETE FROM reminders WHERE id = %s::uuid", (reminder_id,))
-                return cur.rowcount > 0
+        try:
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    cur.execute("DELETE FROM reminders WHERE id = %s::uuid", (reminder_id,))
+                    return cur.rowcount > 0
+        except psycopg2.errors.InvalidTextRepresentation:
+            # Non-UUID id (e.g. garbage from a client) → treat as not found, not a 500.
+            return False
 
     db_path = _resolve_db_path(db_path)
     conn = sqlite3.connect(db_path)
@@ -1004,6 +1024,108 @@ def update_reminder_trigger(reminder_id: str, timestamp: str, db_path: Optional[
     conn.commit()
     conn.close()
     return updated
+
+
+# ===========================================================================
+# Appointments (Multi-backend)  — booked via the frontend dashboard
+# ===========================================================================
+
+def add_appointment(
+    title: str,
+    type_val: Optional[str] = None,
+    provider: Optional[str] = None,
+    time_val: Optional[str] = None,
+    date_val: Optional[str] = None,
+    location: Optional[str] = None,
+    phone: Optional[str] = None,
+    status_val: str = "upcoming",
+    notes: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> str:
+    """Insert an appointment and return its UUID (or str id for SQLite)."""
+    if _use_postgres() and _PG_AVAILABLE:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                cur.execute("""
+                    INSERT INTO appointments (title, type, provider, time, date, location, phone, status, notes)
+                    VALUES (%(title)s, %(type)s, %(provider)s, %(time)s, %(date)s, %(location)s, %(phone)s, %(status)s, %(notes)s)
+                    RETURNING appointment_id
+                """, {
+                    "title": title, "type": type_val, "provider": provider,
+                    "time": time_val, "date": date_val, "location": location,
+                    "phone": phone, "status": status_val, "notes": notes,
+                })
+                row = cur.fetchone()
+                return str(row["appointment_id"]) if row else ""
+
+    # SQLite fallback (local dev / testing)
+    import uuid as _uuid
+    appt_id = str(_uuid.uuid4())
+    db_path = _resolve_db_path(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO appointments (id, title, type, provider, time, date, location, phone, status, notes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        appt_id, title, type_val, provider, time_val, date_val,
+        location, phone, status_val, notes,
+        datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat(),
+    ))
+    conn.commit()
+    conn.close()
+    return appt_id
+
+
+def get_appointments(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List all booked appointments, newest first."""
+    if _use_postgres() and _PG_AVAILABLE:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                cur.execute("""
+                    SELECT appointment_id AS id, title, type, provider, time, date,
+                           location, phone, status, notes, created_at
+                    FROM appointments
+                    ORDER BY created_at DESC
+                """)
+                rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            if r.get("id") is not None:
+                r["id"] = str(r["id"])
+            if r.get("created_at") is not None and hasattr(r["created_at"], "isoformat"):
+                r["created_at"] = r["created_at"].isoformat()
+        return rows
+
+    db_path = _resolve_db_path(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM appointments ORDER BY created_at DESC")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def delete_appointment(appointment_id: str, db_path: Optional[str] = None) -> bool:
+    """Delete an appointment by its UUID string id."""
+    if _use_postgres() and _PG_AVAILABLE:
+        try:
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    cur.execute("DELETE FROM appointments WHERE appointment_id = %s::uuid", (appointment_id,))
+                    return cur.rowcount > 0
+        except psycopg2.errors.InvalidTextRepresentation:
+            # Non-UUID id (e.g. garbage from a client) → treat as not found, not a 500.
+            return False
+
+    db_path = _resolve_db_path(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM appointments WHERE id = ?", (appointment_id,))
+    deleted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
 
 
 # ===========================================================================

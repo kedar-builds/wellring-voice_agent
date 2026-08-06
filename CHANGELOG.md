@@ -11,6 +11,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Appointments API for the frontend dashboard: `GET/POST /appointments` and
+  `DELETE /appointments/{id}` with a new `appointments` table (SQLite + Postgres
+  via `schema.sql`). Mirrors the field names the React frontend sends
+  (`title`, `type`, `provider`, `time`, `date`, `location`, `phone`, `status`).
+  3 tests in `tests/test_appointments.py`.
+  *Verification: `pytest -q` → 57 passed in 16.89s (2026-08-06);
+  `pytest tests/test_appointments.py -v` → 3 passed in 8.26s*
+- `context/README.md` — documented the frontend ↔ backend connection and the
+  requirement that the deployed frontend bundle send the current `WELLRING_API_KEY`
+  (the removed `wellring-secure-2026` key is rejected with 401).
 - Inbound Twilio WhatsApp webhook: `POST /twilio-webhook` with `X-Twilio-Signature` validation,
   form-encoded body parsing, inbound-message logging, and a TwiML reply that replaces Twilio's
   canned "Standard auto-reply". 5 tests in `tests/test_twilio_webhook.py`.

@@ -95,6 +95,7 @@ from src.database import (
     get_assessments_list, get_assessment_stats, get_user_health_context,
     upsert_user_profile, get_user_profile, upsert_family_contacts, get_family_contacts, delete_family_contact,
     add_single_family_contact, get_user_by_phone, get_call_timeline, log_conversation_turn,
+    add_appointment, get_appointments, delete_appointment,
     ANONYMOUS_USER_ID,
 )
 from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp, send_unanswered_call_alert, twilio_quota_exhausted
@@ -1057,6 +1058,53 @@ def remove_reminder(reminder_id: str, api_key: str = Depends(get_api_key)):
     if not success:
         raise HTTPException(status_code=404, detail="Reminder not found")
     return {"message": "Reminder deleted successfully"}
+
+
+class AppointmentCreate(BaseModel):
+    title: str = Field(..., description="Appointment title, e.g. 'Cardiologist Check-up'")
+    type: Optional[str] = Field(None, description="e.g. Doctor | Therapy | AI Check-in")
+    provider: Optional[str] = Field(None, description="Provider / doctor name")
+    time: Optional[str] = Field(None, description="Time, e.g. '09:30 AM'")
+    date: Optional[str] = Field(None, description="Date, e.g. '2026-08-10'")
+    location: Optional[str] = Field(None, description="Location, e.g. 'City General Hospital'")
+    phone: Optional[str] = Field(None, description="Phone number")
+    status: Optional[str] = Field("upcoming", description="upcoming | past | missed")
+    notes: Optional[str] = None
+
+
+@app.get("/appointments", tags=["Appointments"])
+def list_appointments(api_key: str = Depends(get_api_key)):
+    """Retrieve all booked appointments for the dashboard."""
+    return get_appointments()
+
+
+@app.post("/appointments", tags=["Appointments"], status_code=status.HTTP_201_CREATED)
+def create_appointment(payload: AppointmentCreate, api_key: str = Depends(get_api_key)):
+    """Book a new appointment."""
+    # Coerce status to the DB CHECK constraint's allowed set — anything else
+    # would fail the INSERT (500) instead of booking with a sensible default.
+    status_val = payload.status if payload.status in ("upcoming", "past", "missed") else "upcoming"
+    appointment_id = add_appointment(
+        title=payload.title,
+        type_val=payload.type,
+        provider=payload.provider,
+        time_val=payload.time,
+        date_val=payload.date,
+        location=payload.location,
+        phone=payload.phone,
+        status_val=status_val,
+        notes=payload.notes,
+    )
+    return {"id": appointment_id, "message": "Appointment booked successfully"}
+
+
+@app.delete("/appointments/{appointment_id}", tags=["Appointments"])
+def cancel_appointment(appointment_id: str, api_key: str = Depends(get_api_key)):
+    """Cancel a booked appointment."""
+    success = delete_appointment(appointment_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    return {"message": "Appointment cancelled successfully"}
 
 
 # ---------------------------------------------------------------------------
