@@ -984,15 +984,19 @@ def get_reminders(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
 
 
 def delete_reminder(reminder_id: str, db_path: Optional[str] = None) -> bool:
-    """Delete a reminder by its UUID string id."""
+    """Delete a reminder by its id."""
     if _use_postgres() and _PG_AVAILABLE:
         try:
             with get_pg_conn() as conn:
                 with _pg_cursor(conn) as cur:
-                    cur.execute("DELETE FROM reminders WHERE id = %s::uuid", (reminder_id,))
+                    # Compare on id::text: the deployed PG table was created by an
+                    # older schema with INTEGER ids (1, 3, ...) while schema.sql now
+                    # uses UUIDs. A %s::uuid cast would throw InvalidTextRepresentation
+                    # on integer ids → every delete 404'd. ::text works for both.
+                    cur.execute("DELETE FROM reminders WHERE id::text = %s", (str(reminder_id),))
                     return cur.rowcount > 0
         except psycopg2.errors.InvalidTextRepresentation:
-            # Non-UUID id (e.g. garbage from a client) → treat as not found, not a 500.
+            # Non-numeric/non-UUID id (e.g. garbage from a client) → not found, not a 500.
             return False
 
     db_path = _resolve_db_path(db_path)
@@ -1107,15 +1111,17 @@ def get_appointments(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
 
 
 def delete_appointment(appointment_id: str, db_path: Optional[str] = None) -> bool:
-    """Delete an appointment by its UUID string id."""
+    """Delete an appointment by its id."""
     if _use_postgres() and _PG_AVAILABLE:
         try:
             with get_pg_conn() as conn:
                 with _pg_cursor(conn) as cur:
-                    cur.execute("DELETE FROM appointments WHERE appointment_id = %s::uuid", (appointment_id,))
+                    # Compare on ::text for the same reason as delete_reminder: the
+                    # deployed table may predate the UUID schema. Works for both.
+                    cur.execute("DELETE FROM appointments WHERE appointment_id::text = %s", (str(appointment_id),))
                     return cur.rowcount > 0
         except psycopg2.errors.InvalidTextRepresentation:
-            # Non-UUID id (e.g. garbage from a client) → treat as not found, not a 500.
+            # Non-numeric/non-UUID id (e.g. garbage from a client) → not found, not a 500.
             return False
 
     db_path = _resolve_db_path(db_path)
