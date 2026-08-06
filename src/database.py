@@ -1009,6 +1009,70 @@ def delete_reminder(reminder_id: str, db_path: Optional[str] = None) -> bool:
     return deleted
 
 
+def claim_reminder_trigger(reminder_id: str, timestamp: str, db_path: Optional[str] = None) -> bool:
+    """
+    Atomically claim a reminder so exactly one scheduler instance dials it.
+
+    The claim is the `last_triggered` write itself, made conditional on the
+    field still being empty. With multiple scheduler replicas polling the same
+    table, every replica would otherwise see `last_triggered IS NULL`, compute
+    `should_trigger=True`, and place N simultaneous calls for one reminder.
+    Only the replica whose UPDATE actually changes a row (rowcount > 0) wins
+    the claim and is allowed to place the call.
+    """
+    if _use_postgres() and _PG_AVAILABLE:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                cur.execute(
+                    "UPDATE reminders SET last_triggered = %s "
+                    "WHERE id::text = %s AND (last_triggered IS NULL OR last_triggered = '')",
+                    (timestamp, str(reminder_id)),
+                )
+                return cur.rowcount > 0
+
+    db_path = _resolve_db_path(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE reminders SET last_triggered = ? "
+        "WHERE id = ? AND (last_triggered IS NULL OR last_triggered = '')",
+        (timestamp, str(reminder_id)),
+    )
+    won = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return won
+
+
+def release_reminder_trigger(reminder_id: str, timestamp: str, db_path: Optional[str] = None) -> bool:
+    """
+    Release a claimed reminder back to "not triggered" so the next scheduler
+    cycle can retry it. Only releases if the stored claim still matches the
+    caller's timestamp (so a release can't clobber another replica's claim).
+    """
+    if _use_postgres() and _PG_AVAILABLE:
+        with get_pg_conn() as conn:
+            with _pg_cursor(conn) as cur:
+                cur.execute(
+                    "UPDATE reminders SET last_triggered = NULL "
+                    "WHERE id::text = %s AND last_triggered = %s",
+                    (str(reminder_id), timestamp),
+                )
+                return cur.rowcount > 0
+
+    db_path = _resolve_db_path(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE reminders SET last_triggered = NULL WHERE id = ? AND last_triggered = ?",
+        (str(reminder_id), timestamp),
+    )
+    released = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return released
+
+
 def update_reminder_trigger(reminder_id: str, timestamp: str, db_path: Optional[str] = None) -> bool:
     """Record the last-triggered timestamp for a reminder by its id."""
     if _use_postgres() and _PG_AVAILABLE:

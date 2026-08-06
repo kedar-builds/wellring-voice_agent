@@ -92,6 +92,7 @@ from src.scoring_engine import calculate_score, determine_action, SYMPTOM_WEIGHT
 from src.database import (
     init_db, log_interaction, get_symptom_repeat_count,
     add_reminder, get_reminders, delete_reminder, update_reminder_trigger,
+    claim_reminder_trigger, release_reminder_trigger,
     get_assessments_list, get_assessment_stats, get_user_health_context,
     upsert_user_profile, get_user_profile, upsert_family_contacts, get_family_contacts, delete_family_contact,
     add_single_family_contact, get_user_by_phone, get_call_timeline, log_conversation_turn,
@@ -225,6 +226,19 @@ async def run_reminder_scheduler():
                         continue
 
                     logger.info(f"Triggering reminder {rem_id} ({rem_title}) for {rem_phone}")
+
+                    # ── Atomic claim ──────────────────────────────────────────────
+                    # Multiple scheduler replicas poll the same table. Without a
+                    # conditional claim, EVERY replica sees last_triggered IS NULL,
+                    # computes should_trigger=True, and places N simultaneous calls
+                    # for ONE reminder. Claiming here (conditional UPDATE that only
+                    # succeeds while last_triggered is still empty) guarantees exactly
+                    # one replica wins and dials; the rest skip this reminder.
+                    claimed = await asyncio.to_thread(claim_reminder_trigger, rem_id, trigger_timestamp)
+                    if not claimed:
+                        logger.info(f"[SCHEDULER] Reminder {rem_id} already claimed by another instance — skipping duplicate.")
+                        continue
+
                     processing_reminders.add(rem_id)
 
                     if rem_type in ("call", "family_call"):
@@ -243,24 +257,19 @@ async def run_reminder_scheduler():
                                 # fully tear down its TTS engine before a new call is placed,
                                 # preventing the "silent second call" race condition.
                                 await asyncio.sleep(5)
-                                
-                                try:
-                                    res = await _do_bolna_call(phone=p, user_name=None)
-                                except RuntimeError as e:
-                                    logger.warning(f"[SCHEDULER] Bolna call failed ({e}). Retrying in 10s...")
-                                    await asyncio.sleep(10)
-                                    res = await _do_bolna_call(phone=p, user_name=None)
-                                
+                                res = await _do_bolna_call(phone=p, user_name=None)
                                 run_id = res.get("run_id", "unknown")
 
-                                # Only mark the reminder as triggered AFTER the call succeeds.
-                                # Moving this here prevents the previous race condition where
-                                # the DB was updated before Bolna even accepted the call.
-                                # Offload to thread — psycopg2 is synchronous.
+                                # The claim already set last_triggered (that is what made
+                                # the conditional UPDATE succeed). Keep the marker for
+                                # consistency and reset the failure budget.
                                 await asyncio.to_thread(update_reminder_trigger, rid, ts)
                                 consecutive_failures[rid] = 0
                                 logger.info(f"[SCHEDULER] Reminder {rid} marked triggered after successful Bolna call (run_id: {run_id}).")
                             except Exception as e:
+                                # Release the claim so the next scheduler cycle can retry
+                                # this reminder (instead of leaving it stuck as triggered).
+                                await asyncio.to_thread(release_reminder_trigger, rid, ts)
                                 consecutive_failures[rid] = consecutive_failures.get(rid, 0) + 1
                                 logger.error(
                                     f"[SCHEDULER] Error initiating voice call for reminder {rid}: {e} "
@@ -276,6 +285,9 @@ async def run_reminder_scheduler():
                             logger.info(
                                 f"[SCHEDULER] Skipping WhatsApp reminder {rem_id} — Twilio quota exhausted. Will retry after cooldown."
                             )
+                            # We already claimed this reminder; release the claim so it
+                            # can still fire once the cooldown clears.
+                            await asyncio.to_thread(release_reminder_trigger, rem_id, trigger_timestamp)
                             processing_reminders.discard(rem_id)
                             continue
 
@@ -288,11 +300,13 @@ async def run_reminder_scheduler():
 
                         success = send_whatsapp_reminder(rem_phone, body)
                         if success:
-                            # Offload to thread — same reason as get_reminders above:
-                            # psycopg2 is synchronous and would stall the event loop.
+                            # The claim already set last_triggered; keep the marker
+                            # consistent and reset the failure budget.
                             await asyncio.to_thread(update_reminder_trigger, rem_id, trigger_timestamp)
                             consecutive_failures[rem_id] = 0
                         else:
+                            # Release the claim so the reminder is retried next cycle.
+                            await asyncio.to_thread(release_reminder_trigger, rem_id, trigger_timestamp)
                             consecutive_failures[rem_id] = consecutive_failures.get(rem_id, 0) + 1
                             logger.error(
                                 f"[SCHEDULER] WhatsApp send for reminder {rem_id} failed "
