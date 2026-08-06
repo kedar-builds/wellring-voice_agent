@@ -1010,13 +1010,17 @@ def delete_reminder(reminder_id: str, db_path: Optional[str] = None) -> bool:
 
 
 def update_reminder_trigger(reminder_id: str, timestamp: str, db_path: Optional[str] = None) -> bool:
-    """Record the last-triggered timestamp for a reminder by its UUID string id."""
+    """Record the last-triggered timestamp for a reminder by its id."""
     if _use_postgres() and _PG_AVAILABLE:
         with get_pg_conn() as conn:
             with _pg_cursor(conn) as cur:
+                # Compare on id::text (same reason as delete_reminder): the deployed
+                # PG reminders table predates the UUID schema and uses INTEGER ids.
+                # A %s::uuid cast throws InvalidTextRepresentation on integer ids,
+                # so the scheduler could never mark a reminder as triggered.
                 cur.execute(
-                    "UPDATE reminders SET last_triggered = %s WHERE id = %s::uuid",
-                    (timestamp, reminder_id),
+                    "UPDATE reminders SET last_triggered = %s WHERE id::text = %s",
+                    (timestamp, str(reminder_id)),
                 )
                 return cur.rowcount > 0
 
