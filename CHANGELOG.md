@@ -11,13 +11,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
-- Appointments API for the frontend dashboard: `GET/POST /appointments` and
-  `DELETE /appointments/{id}` with a new `appointments` table (SQLite + Postgres
-  via `schema.sql`). Mirrors the field names the React frontend sends
-  (`title`, `type`, `provider`, `time`, `date`, `location`, `phone`, `status`).
-  3 tests in `tests/test_appointments.py`.
-  *Verification: `pytest -q` → 57 passed in 16.89s (2026-08-06);
-  `pytest tests/test_appointments.py -v` → 3 passed in 8.26s*
 - `context/README.md` — documented the frontend ↔ backend connection and the
   requirement that the deployed frontend bundle send the current `WELLRING_API_KEY`
   (the removed `wellring-secure-2026` key is rejected with 401).
@@ -45,7 +38,79 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (the actual escalation path); removed stubs for non-existent `trigger_outbound_call` /
   `send_twilio_alert` symbols
 
+### Added
+- `USE_ROUTINE_UPDATES` env gate (default `false`) — LOW/MEDIUM "patient is fine"
+  WhatsApp updates are now opt-in instead of firing on every check-in call (the
+  primary driver of Twilio 63038 daily-quota storms). HIGH/CRITICAL alerts unaffected.
+- `ALLOW_UNSIGNED_TWILIO_WEBHOOKS` env flag — explicit dev bypass for the inbound
+  Twilio webhook; the webhook now FAILS CLOSED when `TWILIO_AUTH_TOKEN` is unset.
+- Phone-normalization regression tests (`tests/test_phone_normalization.py`, 5 tests).
+  *Verification: `pytest -q` → 78 passed in 17.14s (2026-08-07)*
+
+### Fixed
+- Routine WhatsApp updates now respect `twilio_quota_exhausted()` — no Twilio calls
+  are burned during a 63038 cooldown (previously only the scheduler/watchdog checked).
+- Phone lookup consistency: added shared `normalize_phone()` / `phone_match_candidates()`
+  used by `get_user_by_phone`, `_get_user_health_context_pg`, `_get_call_timeline_pg`/
+  `_sqlite`, and `_do_bolna_call`. Stored forms `9004261186`, `919004261186`,
+  `+91 90042 61186` now all match the normalized call phone → health context,
+  family contacts, and unanswered-call alerts resolve correctly again.
+- Scheduler retry-counter wipe: `consecutive_failures` is no longer cleared while a
+  reminder is mid-flight (a slow Bolna call holding its claim no longer resets the
+  `MAX_REMINDER_ATTEMPTS` budget to zero).
+- Scheduler Twilio sends (`send_whatsapp_reminder`) offloaded via `asyncio.to_thread`
+  — no more synchronous Twilio HTTP round-trips stalling the event loop.
+- Reminder input validation: `ReminderCreate` now validates `type`, `frequency`,
+  `time` (HH:MM or ISO), and `phone` (≥10 digits); `/assessments` limit bounded
+  (1–500) and `/timeline` limit bounded (1–2000).
+- Dashboard feed/stats now exclude the anonymous sentinel / `is_system` users and
+  orphan rows (PG, SQLite, and Supabase paths), matching the symptom-count rule.
+- `ANONYMOUS_USER_ID` resolved lazily via `get_anonymous_user_id()` — a Postgres
+  blip at startup no longer freezes the sentinel to `""` (guard fails open).
+- `sanitize_assess_payload` drops `%`-placeholder items inside a symptoms list
+  (e.g. `["%(symptoms)s"]`) instead of silently suppressing the missing-symptoms warning.
+- `calculate_score` unknown-symptom warning now uses `logger.warning` instead of `print`.
+- `/risk-levels` derives score ranges from `baseline._THRESHOLDS` instead of hardcoding.
+- Weekly reminders use ISO week (`%G-W%V`) instead of `%W`. Mid-year the two
+  formats coincide (e.g. `2026-W32`), so existing markers keep working; only
+  reminders due near a year boundary (where `%W` mislabels week 00/53) will
+  re-fire once.
+- `/upload-document`: 10 MB size cap, always deletes the local temp file (success or
+  error), and no longer returns the server filesystem path (sanitized filename only).
+- `analyze_emotion_from_audio` always cleans up its temp audio file, even on Gemini failure.
+- `/bolna-webhook` token check uses `secrets.compare_digest` (timing-safe) and rejects
+  missing tokens. (Secret still travels in the query string — Bolna limitation.)
+- Dashboard "latest conversation" quality fixes:
+  - `/bolna-webhook` is now idempotent — `assessment_exists_for_call()` skips creating a
+    second assessment when Bolna retries delivery (retries were producing up to 3 rows per
+    call and flooding the feed/timeline). Checked before recording upload/emotion analysis.
+  - Prefers the in-call Bolna extraction (symptoms + valid severity) over post-hoc Gemini
+    re-analysis of the ASR transcript, which systematically under-extracted (empty symptoms,
+    `LOW/10` risk for a call where the patient reported fever).
+  - `dedupe_transcript()` collapses repeated/truncated assistant lines before storing and
+    before analysis (the "garbled transcript" on the dashboard).
+  - `analyze_transcript_for_health_issues` prompt now maps patient speech to the exact
+    `SYMPTOM_WEIGHTS` vocabulary.
+  - `get_user_by_phone` prefers the onboarded (`firebase_uid`) profile when multiple users
+    share a phone (e.g. `Test User` vs `Mr. Sharma` both `+918421971145`) — future calls
+    attribute to the real dashboard user.
+  - SQLite `interactions` now persists `bolna_call_id` (CREATE TABLE + `_migrate_sqlite_schema`
+    ALTER for existing DBs).
+  *Verification: `pytest -q` → 88 passed in 17.02s (2026-08-07)*
+
+### Security
+- `/config-check` now requires a valid `X-API-Key` (was unauthenticated — leaked
+  masked-but-identifiable key fragments and service-configuration state).
+- `global_exception_handler` returns a generic `"Internal server error"` — `str(exc)`
+  internals only surface when `DEBUG=true`.
+- Twilio inbound webhook fails closed when `TWILIO_AUTH_TOKEN` is unset unless
+  `ALLOW_UNSIGNED_TWILIO_WEBHOOKS=true` is explicitly set (was fully open in prod
+  if the token was ever missing).
+
 ### Removed
+- Appointment page: removed the `/appointments` API (`GET/POST` + `DELETE /appointments/{id}`),
+  the `appointments` table (SQLite + Postgres `schema.sql`), and `tests/test_appointments.py`
+  (2026-08-07)
 - `render.yaml` — Render is no longer the deployment target; Railway is the sole deploy
   platform (Phase 5.5)
 - Hardcoded `X-API-Key: ***REMOVED***` auth bypass (Phase 6.1)

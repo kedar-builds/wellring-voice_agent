@@ -20,6 +20,7 @@ Expected input from Kedar's Llama module:
     }
 """
 
+import logging
 from typing import List, Dict, Any, Optional
 
 from .rules import (
@@ -29,6 +30,8 @@ from .rules import (
     CATEGORY_PRIORITY,
 )
 from .baseline import RiskLevel, get_risk_level
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_category(symptoms: List[str]) -> str:
@@ -127,7 +130,7 @@ def calculate_score(
     for symptom in symptoms:
         key = symptom.lower().strip()
         if key not in SYMPTOM_WEIGHTS:
-            print(f"[scoring] WARNING: Unknown symptom '{symptom}' — ignored.")
+            logger.warning("[scoring] Unknown symptom '%s' — ignored.", symptom)
             continue
 
         base_weight  = SYMPTOM_WEIGHTS[key]

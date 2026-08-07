@@ -9,6 +9,7 @@
 --   3. alerts         — Stores all alert / notification records
 --   4. conversations  — Stores conversation history between user and Riley
 --   5. health_history — Stores symptom history for escalation & trend analysis
+--   6. reminders      — Stores scheduled reminders for the voice agent
 --
 -- Relationships (all 1:N):
 --   users        → assessments

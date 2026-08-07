@@ -115,7 +115,7 @@ from the backend's `WELLRING_API_KEY` env var.
   Phase 6.1 security cleanup — the deployed backend now rejects it with `401`.
 - **Any frontend build that still hardcodes `wellring-secure-2026` will show empty/error
   states for every authenticated feature** (dashboard feed, timeline, reminders,
-  profile, family contacts, appointments).
+  profile, family contacts).
 - To fix: rebuild/redeploy the frontend with the **current** `WELLRING_API_KEY` value
   (the same value set in the deployed backend's Railway env).
 
@@ -127,7 +127,6 @@ from the backend's `WELLRING_API_KEY` env var.
 | Dashboard feed | `GET /assessments?limit=50` |
 | Call timeline | `GET /timeline?phone=…&limit=365` |
 | Reminders (list/add/delete) | `GET/POST /reminders`, `DELETE /reminders/{id}` |
-| Appointments (book/cancel) | `GET/POST /appointments`, `DELETE /appointments/{id}` |
 | Profile | `GET/POST /setup-profile` |
 | Family contacts | `GET/POST /family-contacts`, `DELETE /family-contacts/{id}` |
 | Outbound call (immediate) | `POST /call` `{phone}` |
@@ -142,14 +141,10 @@ from the backend's `WELLRING_API_KEY` env var.
 1. **Rebuild with the current API key.** The deployed bundle hardcodes the removed key
    `wellring-secure-2026` → every authenticated request gets `401`. Set the frontend's
    key to the backend's current `WELLRING_API_KEY` value.
-2. **Wire the scheduling buttons to the backend.** The "Schedule Event" form calls
-   `addAppointment`, which is **local-only** (adds to React state, posts nothing).
-   Point it at the real calls: `POST /call` for an immediate check-in, or
-   `POST /reminders` with `type: "call"` for a scheduled one (the backend scheduler
-   then fires the Bolna call). "Schedule AI Call" currently does the same — nothing
-   is sent to the backend.
+2. **Wire the scheduling buttons to the backend.** Point them at the real calls:
+   `POST /call` for an immediate check-in, or `POST /reminders` with `type: "call"`
+   for a scheduled one (the backend scheduler then fires the Bolna call).
+   "Schedule AI Call" currently does the same — nothing is sent to the backend.
 3. **Add Vercel serverless functions** (or rewrites) for `/api/ai-simulator`,
    `/api/ai-evaluate`, and `/api/profile*` — they currently return 405.
-4. **Give the appointments renderer defaults** for UI-only fields (`iconName`, `color`,
-   `border`, `startHour`, `durationHours`) since the backend only stores data fields.
 # SQLite fallback active - Sat Jun 20 11:16:46 PM IST 2026

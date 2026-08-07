@@ -191,3 +191,93 @@ def test_robust_parsing_for_stringified_params(client):
     assert data["confidence"] == 0.95
 
 
+# ---------------------------------------------------------------------------
+# sanitize_assess_payload: placeholder inside a list
+# ---------------------------------------------------------------------------
+
+def test_sanitize_drops_placeholder_inside_symptoms_list(client):
+    """A list like ["%(symptoms)s", "dizziness"] must drop the placeholder item."""
+    r = client.post("/assess", json={
+        "intent": "health_issue",
+        "symptoms": ["%(symptoms)s", "dizziness"],
+        "severity": "low",
+        "confidence": 1.0,
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert "dizziness" in data["symptoms"]
+    assert not any(str(s).startswith("%") for s in data["symptoms"])
+
+
+# ---------------------------------------------------------------------------
+# Reminder input validation (POST /reminders)
+# ---------------------------------------------------------------------------
+
+def test_reminder_rejects_unknown_type(client):
+    r = client.post("/reminders", json={
+        "type": "teleport", "title": "X", "time": "10:00",
+        "frequency": "daily", "phone": "+919004261186",
+    })
+    assert r.status_code == 422
+
+
+def test_reminder_rejects_unknown_frequency(client):
+    r = client.post("/reminders", json={
+        "type": "medicine", "title": "Pill", "time": "10:00",
+        "frequency": "hourly", "phone": "+919004261186",
+    })
+    assert r.status_code == 422
+
+
+def test_reminder_rejects_bad_time(client):
+    r = client.post("/reminders", json={
+        "type": "medicine", "title": "Pill", "time": "25:99",
+        "frequency": "daily", "phone": "+919004261186",
+    })
+    assert r.status_code == 422
+
+
+def test_reminder_rejects_short_phone(client):
+    r = client.post("/reminders", json={
+        "type": "medicine", "title": "Pill", "time": "10:00",
+        "frequency": "daily", "phone": "123",
+    })
+    assert r.status_code == 422
+
+
+def test_reminder_accepts_valid_payload(client):
+    r = client.post("/reminders", json={
+        "type": "medicine", "title": "Amlodipine", "time": "09:00",
+        "frequency": "daily", "phone": "+919004261186", "notes": "with food",
+    })
+    assert r.status_code == 201
+
+
+def test_reminder_accepts_iso_time_and_call_type(client):
+    r = client.post("/reminders", json={
+        "type": "call", "title": "Weekly check-in", "time": "2026-08-10T10:00",
+        "frequency": "once", "phone": "+919004261186",
+    })
+    assert r.status_code == 201
+
+
+# ---------------------------------------------------------------------------
+# /config-check requires auth
+# ---------------------------------------------------------------------------
+
+def test_config_check_requires_api_key(client):
+    r = client.get("/config-check", headers={"X-API-Key": "definitely-wrong"})
+    assert r.status_code == 401
+
+
+def test_config_check_ok_with_valid_key(client):
+    r = client.get("/config-check")
+    assert r.status_code == 200
+    body = r.json()
+    assert "BOLNA_AGENT_ID" in body
+    # Keys must be masked or marked unconfigured — never a raw secret value.
+    for key in ("BOLNA_AGENT_ID", "BOLNA_API_KEY", "GEMINI_API_KEY", "TWILIO_ACCOUNT_SID"):
+        val = body[key]
+        assert val in ("not_configured", "***") or ("..." in val)
+
+

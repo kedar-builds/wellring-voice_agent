@@ -11,6 +11,7 @@ import datetime
 from src.database import log_alert
 from src.notifications import (
     send_whatsapp_alert,
+    trigger_alerts_if_needed,
     _is_twilio_quota_error,
     _handle_twilio_quota_error,
     twilio_quota_exhausted,
@@ -115,6 +116,85 @@ class TestTwilioQuotaDetection(unittest.TestCase):
             _notify_dev_via_webhook("Error 63038: quota exceeded")
         mock_logger.assert_called_once()
         self.assertIn("DEV_ALERT_WEBHOOK_URL", mock_logger.call_args.args[0])
+
+
+class TestRoutineUpdateGateAndQuotaGuard(unittest.TestCase):
+    """
+    LOW/MEDIUM routine updates are gated behind USE_ROUTINE_UPDATES (opt-in)
+    and every send path defers while the Twilio quota cooldown is active.
+    """
+
+    @patch("src.notifications.log_alert")
+    @patch("src.notifications.get_family_contacts")
+    @patch("src.notifications.get_user")
+    @patch("src.notifications._twilio_send")
+    def test_routine_updates_disabled_by_default(self, mock_send, mock_user, mock_contacts, mock_log):
+        """LOW/MEDIUM must NOT send when USE_ROUTINE_UPDATES=false (default)."""
+        with patch("src.notifications.USE_ROUTINE_UPDATES", False):
+            trigger_alerts_if_needed(
+                interaction_id="i1",
+                response_data={"risk_level": "LOW", "symptoms": [], "score": 5},
+                user_id="u1",
+            )
+        mock_send.assert_not_called()
+        mock_contacts.assert_not_called()  # gate returns before DB lookups
+
+    @patch("src.notifications.log_alert")
+    @patch("src.notifications._twilio_send", return_value=(True, None))
+    def test_high_alerts_still_send_when_routine_disabled(self, mock_send, mock_log):
+        """HIGH/CRITICAL alerts send even when routine updates are off."""
+        with patch("src.notifications.USE_ROUTINE_UPDATES", False), \
+             patch("src.notifications.USE_TWILIO", True), \
+             patch("src.notifications.get_user", return_value={"name": "Sharma"}), \
+             patch("src.notifications.get_family_contacts", return_value=[{"name": "Son", "phone": "+919004261186"}]):
+            trigger_alerts_if_needed(
+                interaction_id="i2",
+                response_data={
+                    "risk_level": "HIGH", "score": 75,
+                    "symptoms": ["chest_pain"], "action": "notify_caregiver", "steps": [],
+                },
+                user_id="u1",
+            )
+        mock_send.assert_called_once()
+
+    @patch("src.notifications.log_alert")
+    @patch("src.notifications._twilio_send", return_value=(True, None))
+    def test_quota_guard_skips_routine_updates_during_cooldown(self, mock_send, mock_log):
+        """Routine (LOW/MEDIUM) sends are skipped during a 63038 cooldown."""
+        with patch("src.notifications.USE_ROUTINE_UPDATES", True), \
+             patch("src.notifications.twilio_quota_exhausted", return_value=True), \
+             patch("src.notifications.USE_TWILIO", True), \
+             patch("src.notifications.get_user", return_value={"name": "Sharma"}), \
+             patch("src.notifications.get_family_contacts", return_value=[{"name": "Son", "phone": "+919004261186"}]):
+            trigger_alerts_if_needed(
+                interaction_id="i3",
+                response_data={
+                    "risk_level": "LOW", "score": 5,
+                    "symptoms": [], "action": "monitor", "steps": [],
+                },
+                user_id="u1",
+            )
+        mock_send.assert_not_called()
+
+    @patch("src.notifications.log_alert")
+    @patch("src.notifications._twilio_send", return_value=(True, None))
+    def test_high_alerts_still_attempted_during_cooldown(self, mock_send, mock_log):
+        """HIGH/CRITICAL alerts still attempt sends during a cooldown (urgent +
+        keeps failed-alert logging so the watchdog can retry)."""
+        with patch("src.notifications.USE_ROUTINE_UPDATES", False), \
+             patch("src.notifications.twilio_quota_exhausted", return_value=True), \
+             patch("src.notifications.USE_TWILIO", True), \
+             patch("src.notifications.get_user", return_value={"name": "Sharma"}), \
+             patch("src.notifications.get_family_contacts", return_value=[{"name": "Son", "phone": "+919004261186"}]):
+            trigger_alerts_if_needed(
+                interaction_id="i4",
+                response_data={
+                    "risk_level": "HIGH", "score": 75,
+                    "symptoms": ["chest_pain"], "action": "notify_caregiver", "steps": [],
+                },
+                user_id="u1",
+            )
+        mock_send.assert_called_once()
 
 
 class TestNotifications(unittest.TestCase):

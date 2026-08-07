@@ -179,6 +179,10 @@ TWILIO_CONTENT_SID = os.environ.get("TWILIO_CONTENT_SID", "")
 CAREGIVER_PHONE    = os.environ.get("CAREGIVER_PHONE", "")
 USE_TWILIO         = os.environ.get("USE_TWILIO", "false").lower() == "true"
 USE_WHATSAPP       = os.environ.get("USE_WHATSAPP", "false").lower() == "true"
+# Routine (LOW/MEDIUM) "patient is fine" updates are OPT-IN: a trial Twilio
+# account (50 msgs/day) can be exhausted by one check-in call producing
+# 1 + N routine WhatsApps. HIGH/CRITICAL alerts are unaffected by this flag.
+USE_ROUTINE_UPDATES = os.environ.get("USE_ROUTINE_UPDATES", "false").lower() == "true"
 
 DASHBOARD_URL = "https://wellring-frontend.vercel.app"
 
@@ -492,6 +496,17 @@ def trigger_alerts_if_needed(
     """
     risk_level = response_data.get("risk_level", "LOW")
 
+    # Routine (LOW/MEDIUM) updates are gated behind USE_ROUTINE_UPDATES (opt-in).
+    # Without the gate, every check-in call — even "patient is fine" — sends a
+    # WhatsApp to every family contact, which is the primary driver of the
+    # Twilio 63038 daily-quota storms. HIGH/CRITICAL alerts always send.
+    if risk_level in ("MEDIUM", "LOW") and not USE_ROUTINE_UPDATES:
+        logger.info(
+            "[NOTIFY] Routine updates disabled (USE_ROUTINE_UPDATES=false) — "
+            f"skipping {risk_level} WhatsApp update."
+        )
+        return
+
     # Resolve patient & caregiver info
     patient_name   = "the patient"
     family_contacts = []
@@ -547,8 +562,19 @@ def trigger_alerts_if_needed(
             )
 
     elif risk_level in ("MEDIUM", "LOW"):
-        # Routine update for MEDIUM and LOW check-ins — always notify family
-        # that the elder answered and completed the check-in.
+        # Twilio quota guard: routine updates are non-essential — never burn
+        # Twilio calls during a 63038 cooldown (the scheduler and watchdog
+        # already defer; this path must too). HIGH/CRITICAL alerts are NOT
+        # gated here: they are urgent and the attempt-and-log keeps the
+        # watchdog retry pipeline (failed alerts) informed.
+        if twilio_quota_exhausted():
+            logger.warning(
+                "[NOTIFY] Twilio quota exhausted — skipping routine update "
+                "(LOW/MEDIUM) until the cooldown window clears."
+            )
+            return
+        # Routine update for MEDIUM and LOW check-ins — notify family that the
+        # elder answered and completed the check-in.
         presigned_recording = _presign_recording_url(response_data.get("recording_url"))
         for contact in family_contacts:
             phone = contact["phone"]

@@ -3,9 +3,13 @@ test_twilio_webhook.py
 ======================
 Tests for the inbound Twilio WhatsApp webhook (POST /twilio-webhook).
 
+The webhook FAILS CLOSED by default: unsigned requests are rejected unless
+TWILIO_AUTH_TOKEN is set (real signature validation) or the explicit dev
+bypass ALLOW_UNSIGNED_TWILIO_WEBHOOKS=true is set.
+
 Covers:
-    - Happy path: form-encoded inbound message → 200 TwiML reply
-      (signature validation skipped when TWILIO_AUTH_TOKEN is unset)
+    - Dev bypass: unsigned request → 200 TwiML reply with the flag set
+    - Fail closed: no token + no flag → 403
     - Signature enforcement once TWILIO_AUTH_TOKEN is set:
       missing / invalid signature → 403, valid signature → 200
     - Non-form bodies → 400
@@ -24,15 +28,24 @@ def _twilio_form_data(**overrides):
     return data
 
 
-def test_twilio_webhook_returns_twiml_reply(client, monkeypatch):
-    # No TWILIO_AUTH_TOKEN configured → dev mode, validation skipped.
+def test_twilio_webhook_returns_twiml_reply_with_dev_flag(client, monkeypatch):
+    # No TWILIO_AUTH_TOKEN → only accepted with the explicit dev bypass.
     monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("ALLOW_UNSIGNED_TWILIO_WEBHOOKS", "true")
     r = client.post("/twilio-webhook", data=_twilio_form_data(Body="hii"))
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("application/xml")
     assert "<Response>" in r.text
     assert "<Message>" in r.text
     assert "WellRing" in r.text
+
+
+def test_twilio_webhook_fails_closed_without_token_or_flag(client, monkeypatch):
+    # No TWILIO_AUTH_TOKEN and no dev flag → the webhook must reject.
+    monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ALLOW_UNSIGNED_TWILIO_WEBHOOKS", raising=False)
+    r = client.post("/twilio-webhook", data=_twilio_form_data(Body="hii"))
+    assert r.status_code == 403
 
 
 def test_twilio_webhook_rejects_missing_signature_when_token_set(client, monkeypatch):
