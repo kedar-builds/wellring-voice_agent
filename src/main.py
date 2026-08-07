@@ -96,8 +96,7 @@ from src.database import (
     get_assessments_list, get_assessment_stats, get_user_health_context,
     upsert_user_profile, get_user_profile, upsert_family_contacts, get_family_contacts, delete_family_contact,
     add_single_family_contact, get_user_by_phone, get_call_timeline, log_conversation_turn,
-    add_appointment, get_appointments, delete_appointment,
-    ANONYMOUS_USER_ID,
+    normalize_phone, get_anonymous_user_id, assessment_exists_for_call,
 )
 from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp, send_unanswered_call_alert, twilio_quota_exhausted
 from src.watchdog import run_watchdog
@@ -185,7 +184,9 @@ async def run_reminder_scheduler():
                                 should_trigger = True
                                 trigger_timestamp = current_date_str
                         elif rem_freq == "weekly":
-                            current_week = now.strftime("%Y-W%W")
+                            # ISO week (%G/%V, Monday-based with correct year-end
+                            # rollover) instead of %W, which mislabels week 52/01.
+                            current_week = now.strftime("%G-W%V")
                             if last_trig != current_week:
                                 should_trigger = True
                                 trigger_timestamp = current_week
@@ -208,7 +209,12 @@ async def run_reminder_scheduler():
                     # Clear any stale failure count from a previous period so the
                     # next due-window starts with a full retry budget. (Also prunes
                     # entries for reminders that no longer exist.)
-                    consecutive_failures.pop(rem_id, None)
+                    # NOTE: never clear while the reminder is mid-flight — a slow
+                    # Bolna call (30s httpx timeout > 15s tick) holds its claim, and
+                    # popping the counter here would wipe the retry budget the
+                    # MAX_REMINDER_ATTEMPTS guard relies on.
+                    if rem_id not in processing_reminders:
+                        consecutive_failures.pop(rem_id, None)
 
                 if should_trigger:
                     # Break retry loops: after N consecutive failures the reminder
@@ -249,7 +255,9 @@ async def run_reminder_scheduler():
                             logger.info(f"[SCHEDULER] Skipping 'ringing now' WhatsApp for {rem_id} — Twilio quota exhausted.")
                         else:
                             body = "📞 WellRing check-in call is ringing you now..."
-                            send_whatsapp_reminder(rem_phone, body)
+                            # Sync Twilio HTTP round-trip — offload so a slow send
+                            # can't stall the whole scheduler loop.
+                            await asyncio.to_thread(send_whatsapp_reminder, rem_phone, body)
                         # Capture loop variables in default args to avoid closure-capture bugs.
                         async def safe_bolna_call(p, rid, ts):
                             try:
@@ -298,7 +306,9 @@ async def run_reminder_scheduler():
                         else:
                             body = f"⏰ WellRing Reminder: {rem_title}.\nNotes: {rem_notes}"
 
-                        success = send_whatsapp_reminder(rem_phone, body)
+                        # Sync Twilio HTTP round-trip — offload so a slow send
+                        # can't stall the whole scheduler loop.
+                        success = await asyncio.to_thread(send_whatsapp_reminder, rem_phone, body)
                         if success:
                             # The claim already set last_triggered; keep the marker
                             # consistent and reset the failure budget.
@@ -406,10 +416,16 @@ app = FastAPI(
 async def global_exception_handler(request: Request, exc: Exception):
     import traceback
     logger.exception("Unhandled exception occurred")
+    # Never surface str(exc) to clients — DB error strings or attribute errors
+    # (e.g. None.lower()) can leak internals. Full detail only under DEBUG=true.
     _debug = os.environ.get("DEBUG", "false").lower() == "true"
-    content: Dict[str, Any] = {"error": str(exc)}
     if _debug:
-        content["traceback"] = traceback.format_exception(type(exc), exc, exc.__traceback__)
+        content: Dict[str, Any] = {
+            "error": str(exc),
+            "traceback": traceback.format_exception(type(exc), exc, exc.__traceback__),
+        }
+    else:
+        content = {"error": "Internal server error"}
     return JSONResponse(status_code=500, content=content)
 
 
@@ -555,9 +571,11 @@ def storage_status(api_key: str = Depends(get_api_key)):
 
 
 @app.get("/config-check", tags=["Health"])
-def config_check():
+def config_check(api_key: str = Depends(get_api_key)):
     """
     Check environment configuration and return masked API keys to debug credential issues.
+    Requires a valid X-API-Key — masked key fragments and service-configuration
+    state must not be exposed to unauthenticated callers.
     """
     def mask_key(val: str) -> str:
         if not val:
@@ -744,7 +762,9 @@ async def process_assessment_data(
         # Skip for unmatched callers (user_id is None or the shared Anonymous sentinel)
         # — the sentinel is a cross-patient bucket; applying its accumulated history
         # to any individual caller would silently inflate their score.
-        is_identified = user_id and user_id != ANONYMOUS_USER_ID
+        # get_anonymous_user_id() resolves lazily so a PG blip at startup can't
+        # freeze the sentinel to "" and fail this guard open.
+        is_identified = user_id and user_id != get_anonymous_user_id()
         if is_identified:
             history_counts = {}
             for s in normalized_symptoms:
@@ -826,7 +846,13 @@ def sanitize_assess_payload(body: dict) -> dict:
                         symptoms_list.append(p_clean)
                 sanitized["symptoms"] = symptoms_list
         elif isinstance(symptoms_raw, list):
-            sanitized["symptoms"] = [str(s).strip() for s in symptoms_raw if s]
+            # Drop template placeholders (e.g. "%(symptoms)s") that slip through
+            # as list items — they'd otherwise pass to scoring, get silently
+            # dropped, and suppress the "missing symptoms" warning.
+            sanitized["symptoms"] = [
+                str(s).strip() for s in symptoms_raw
+                if s and not str(s).strip().startswith("%")
+            ]
 
     # 2. Parse confidence
     if "confidence" in sanitized:
@@ -949,25 +975,26 @@ def list_symptoms():
 def list_risk_levels():
     """
     Returns the risk level thresholds and what action each triggers.
+    Score ranges are DERIVED from baseline._THRESHOLDS so they can't drift
+    from the actual scoring logic.
     """
     from src.scoring_engine.alerts import _ESCALATION
-    from src.scoring_engine.baseline import RiskLevel
-    return {
-        "levels": [
-            {
-                "level": level.value,
-                "score_range": ranges,
-                "action": _ESCALATION[level]["action"],
-                "message": _ESCALATION[level]["message"],
-            }
-            for level, ranges in [
-                (RiskLevel.LOW,      "0–30"),
-                (RiskLevel.MEDIUM,   "31–60"),
-                (RiskLevel.HIGH,     "61–100"),
-                (RiskLevel.CRITICAL, "101+"),
-            ]
-        ]
-    }
+    from src.scoring_engine.baseline import _THRESHOLDS
+
+    sorted_thr = sorted(_THRESHOLDS)  # [(0, LOW), (31, MEDIUM), (61, HIGH), (101, CRITICAL)]
+    levels = []
+    for idx, (threshold, level) in enumerate(sorted_thr):
+        if idx == len(sorted_thr) - 1:
+            score_range = f"{threshold}+"
+        else:
+            score_range = f"{threshold}–{sorted_thr[idx + 1][0] - 1}"
+        levels.append({
+            "level": level.value,
+            "score_range": score_range,
+            "action": _ESCALATION[level]["action"],
+            "message": _ESCALATION[level]["message"],
+        })
+    return {"levels": levels}
 
 
 # ---------------------------------------------------------------------------
@@ -975,21 +1002,33 @@ def list_risk_levels():
 # ---------------------------------------------------------------------------
 
 @app.get("/assessments", tags=["Dashboard"])
-def get_assessments(limit: int = 50, risk_level: Optional[str] = None, api_key: str = Depends(get_api_key)):
+def get_assessments(
+    limit: int = Query(50, ge=1, le=500),
+    risk_level: Optional[str] = None,
+    firebase_uid: Optional[str] = Query(None, description="Filter to a specific user's assessments"),
+    api_key: str = Depends(get_api_key),
+):
     """Returns recent assessments (interactions) for the dashboard feed."""
-    return get_assessments_list(limit=limit, risk_level=risk_level)
+    if not firebase_uid:
+        return []
+    return get_assessments_list(limit=limit, risk_level=risk_level, firebase_uid=firebase_uid)
 
 
 @app.get("/assessments/stats", tags=["Dashboard"])
-def get_assessment_stats_endpoint(api_key: str = Depends(get_api_key)):
+def get_assessment_stats_endpoint(
+    firebase_uid: Optional[str] = Query(None, description="Filter stats to a specific user"),
+    api_key: str = Depends(get_api_key)
+):
     """Returns counts for dashboard cards."""
-    return get_assessment_stats()
+    if not firebase_uid:
+        return {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
+    return get_assessment_stats(firebase_uid=firebase_uid)
 
 
 @app.get("/timeline", tags=["Timeline"])
 def get_call_timeline_endpoint(
-    phone: str,
-    limit: int = 365,
+    phone: str = Query(..., min_length=5),
+    limit: int = Query(365, ge=1, le=2000),
     api_key: str = Depends(get_api_key),
 ):
     """
@@ -1016,39 +1055,78 @@ def get_call_timeline_endpoint(
 
 
 @app.get("/patients", tags=["Dashboard"])
-def get_patients(api_key: str = Depends(get_api_key)):
-    """Returns all registered elderly patients from the database."""
+def get_patients(
+    firebase_uid: Optional[str] = Query(None, description="Return only the elder for this caregiver"),
+    api_key: str = Depends(get_api_key),
+):
+    """Returns elderly patients registered by the requesting caregiver."""
+    if not firebase_uid:
+        return []
     from src.database import get_all_patients
-    patients = get_all_patients()
+    patients = get_all_patients(firebase_uid=firebase_uid)
     if patients:
         return patients
-    # Fallback for when no DB patients exist (e.g. fresh SQLite)
-    return [
-        {
-            "id": 1,
-            "name": "Mr. Sharma",
-            "age": 72,
-            "conditions": ["Hypertension", "Diabetes"],
-            "emergency_contact": "+91-9876543210",
-            "language": "English",
-            "status": "active"
-        }
-    ]
+    # Fallback — return empty list for new users who haven't onboarded yet
+    return []
 
 
 class ReminderCreate(BaseModel):
-    type: str = Field(..., description="call | medicine | checkup")
+    type: str = Field(..., description="call | family_call | medicine | checkup | general")
     title: str = Field(..., description="Title/name of the reminder")
     time: str = Field(..., description="Time (HH:MM) or datetime (ISO string)")
-    frequency: str = Field(..., description="daily | monthly | yearly | once")
+    frequency: str = Field(..., description="daily | weekly | monthly | yearly | once")
     phone: str = Field(..., description="WhatsApp phone number")
     notes: Optional[str] = None
 
+    @field_validator("type")
+    @classmethod
+    def _validate_type(cls, v: str) -> str:
+        allowed = {"call", "family_call", "medicine", "checkup", "general"}
+        val = v.strip().lower()
+        if val not in allowed:
+            raise ValueError(f"type must be one of {sorted(allowed)}, got '{v}'")
+        return val
+
+    @field_validator("frequency")
+    @classmethod
+    def _validate_frequency(cls, v: str) -> str:
+        allowed = {"daily", "weekly", "monthly", "yearly", "once"}
+        val = v.strip().lower()
+        if val not in allowed:
+            raise ValueError(f"frequency must be one of {sorted(allowed)}, got '{v}'")
+        return val
+
+    @field_validator("time")
+    @classmethod
+    def _validate_time(cls, v: str) -> str:
+        t = v.strip()
+        try:
+            if "T" in t:
+                datetime.datetime.fromisoformat(t.replace("Z", ""))
+            else:
+                datetime.datetime.strptime(t, "%H:%M")
+        except ValueError:
+            raise ValueError(f"time must be HH:MM or an ISO datetime, got '{v}'")
+        return t
+
+    @field_validator("phone")
+    @classmethod
+    def _validate_phone(cls, v: str) -> str:
+        digits = "".join(ch for ch in v if ch.isdigit())
+        if len(digits) < 10:
+            raise ValueError("phone must contain at least 10 digits")
+        return v.strip()
+
 
 @app.get("/reminders", tags=["Reminders"])
-def list_reminders(api_key: str = Depends(get_api_key)):
-    """Retrieve all reminders."""
-    return get_reminders()
+def list_reminders(
+    firebase_uid: Optional[str] = Query(None, description="Return only reminders for this user's elder"),
+    api_key: str = Depends(get_api_key),
+):
+    """Retrieve reminders, scoped to the requesting user's elder when firebase_uid is supplied."""
+    if not firebase_uid:
+        return []
+    return get_reminders(firebase_uid=firebase_uid)
 
 
 @app.post("/reminders", tags=["Reminders"], status_code=status.HTTP_201_CREATED)
@@ -1073,52 +1151,6 @@ def remove_reminder(reminder_id: str, api_key: str = Depends(get_api_key)):
         raise HTTPException(status_code=404, detail="Reminder not found")
     return {"message": "Reminder deleted successfully"}
 
-
-class AppointmentCreate(BaseModel):
-    title: str = Field(..., description="Appointment title, e.g. 'Cardiologist Check-up'")
-    type: Optional[str] = Field(None, description="e.g. Doctor | Therapy | AI Check-in")
-    provider: Optional[str] = Field(None, description="Provider / doctor name")
-    time: Optional[str] = Field(None, description="Time, e.g. '09:30 AM'")
-    date: Optional[str] = Field(None, description="Date, e.g. '2026-08-10'")
-    location: Optional[str] = Field(None, description="Location, e.g. 'City General Hospital'")
-    phone: Optional[str] = Field(None, description="Phone number")
-    status: Optional[str] = Field("upcoming", description="upcoming | past | missed")
-    notes: Optional[str] = None
-
-
-@app.get("/appointments", tags=["Appointments"])
-def list_appointments(api_key: str = Depends(get_api_key)):
-    """Retrieve all booked appointments for the dashboard."""
-    return get_appointments()
-
-
-@app.post("/appointments", tags=["Appointments"], status_code=status.HTTP_201_CREATED)
-def create_appointment(payload: AppointmentCreate, api_key: str = Depends(get_api_key)):
-    """Book a new appointment."""
-    # Coerce status to the DB CHECK constraint's allowed set — anything else
-    # would fail the INSERT (500) instead of booking with a sensible default.
-    status_val = payload.status if payload.status in ("upcoming", "past", "missed") else "upcoming"
-    appointment_id = add_appointment(
-        title=payload.title,
-        type_val=payload.type,
-        provider=payload.provider,
-        time_val=payload.time,
-        date_val=payload.date,
-        location=payload.location,
-        phone=payload.phone,
-        status_val=status_val,
-        notes=payload.notes,
-    )
-    return {"id": appointment_id, "message": "Appointment booked successfully"}
-
-
-@app.delete("/appointments/{appointment_id}", tags=["Appointments"])
-def cancel_appointment(appointment_id: str, api_key: str = Depends(get_api_key)):
-    """Cancel a booked appointment."""
-    success = delete_appointment(appointment_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Appointment not found")
-    return {"message": "Appointment cancelled successfully"}
 
 
 # ---------------------------------------------------------------------------
@@ -1321,13 +1353,10 @@ async def _do_bolna_call(phone: str, user_name: Optional[str] = None) -> dict:
     if not BOLNA_API_KEY:
         raise RuntimeError("BOLNA_API_KEY not configured")
 
-    # Normalize phone number (add +91 for 10-digit Indian numbers)
-    raw = str(phone).strip().replace(' ', '').replace('-', '')
-    if raw.startswith('0'):
-        raw = '+91' + raw[1:]
-    elif not raw.startswith('+') and len(raw) == 10:
-        raw = '+91' + raw
-    phone = raw
+    # Normalize phone number using the shared helper so every downstream
+    # lookup (profile by phone, health context, call timeline, family contacts)
+    # matches the same canonical form regardless of how the number is stored.
+    phone = normalize_phone(phone)
 
     async with httpx.AsyncClient(timeout=30) as client:
         # 1. Fetch current agent config to avoid dropping settings like transcriber, llm_config, etc.
@@ -1446,10 +1475,21 @@ def _twilio_request_valid(request: Request, form: Dict[str, str]) -> bool:
     """
     token = os.environ.get("TWILIO_AUTH_TOKEN", "")
     if not token:
-        logger.warning(
-            "[TWILIO-WEBHOOK] TWILIO_AUTH_TOKEN not set — skipping signature validation (dev mode)."
+        # Fail closed: if the token is missing in production the webhook would
+        # otherwise be fully open to spoofed inbound messages. An explicit dev
+        # bypass (ALLOW_UNSIGNED_TWILIO_WEBHOOKS=true) keeps local testing easy.
+        dev_bypass = os.environ.get("ALLOW_UNSIGNED_TWILIO_WEBHOOKS", "false").lower() == "true"
+        if dev_bypass:
+            logger.warning(
+                "[TWILIO-WEBHOOK] TWILIO_AUTH_TOKEN not set and ALLOW_UNSIGNED_TWILIO_WEBHOOKS=true — "
+                "accepting unsigned webhook (dev mode only)."
+            )
+            return True
+        logger.error(
+            "[TWILIO-WEBHOOK] TWILIO_AUTH_TOKEN not set and ALLOW_UNSIGNED_TWILIO_WEBHOOKS not enabled — "
+            "rejecting unsigned webhook (fail closed). Set TWILIO_AUTH_TOKEN in production."
         )
-        return True
+        return False
     signature = request.headers.get("X-Twilio-Signature", "")
     if not signature:
         return False
@@ -1641,6 +1681,8 @@ async def upload_document(
             detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
         )
 
+    MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+    file_path = None
     try:
         upload_dir = os.path.join(os.path.dirname(__file__), "..", "uploads")
         os.makedirs(upload_dir, exist_ok=True)
@@ -1656,8 +1698,19 @@ async def upload_document(
         if not os.path.abspath(file_path).startswith(os.path.abspath(upload_dir)):
             raise HTTPException(status_code=400, detail="Invalid file path")
         
+        # Stream in chunks so we can enforce a size cap without buffering an
+        # unbounded upload into memory.
+        content = bytearray()
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="File too large (max 10 MB)")
+
         with open(file_path, "wb") as f:
-            f.write(await file.read())
+            f.write(content)
             
         extracted_notes = ""
         gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -1689,10 +1742,11 @@ async def upload_document(
             except Exception as gemini_err:
                 logger.error(f"Gemini parsing failed: {gemini_err}")
                 
+        # NOTE: only the sanitised filename is returned — never the server
+        # filesystem path.
         return {
             "status": "success", 
-            "filename": unique_filename, 
-            "path": file_path,
+            "filename": unique_filename,
             "parsed": bool(extracted_notes)
         }
     except HTTPException:
@@ -1700,6 +1754,14 @@ async def upload_document(
     except Exception as e:
         logger.error(f"Error uploading document: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # The uploads dir is a scratch area — Gemini keeps its own copy of any
+        # file it uploaded, so the local temp file is always cleaned up.
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
 
 # ---------------------------------------------------------------------------
 # Emotion Analysis
@@ -1711,6 +1773,7 @@ async def analyze_emotion_from_audio(recording_url: str) -> str:
     if not gemini_key or not recording_url:
         return ""
         
+    tmp_path = None
     try:
         import tempfile
 
@@ -1740,15 +1803,54 @@ async def analyze_emotion_from_audio(recording_url: str) -> str:
             contents=[uploaded_file, prompt]
         )
 
-        os.remove(tmp_path)
         return (response.text or "").strip()
     except Exception as e:
         logger.error(f"Error analyzing emotion: {e}")
         return ""
+    finally:
+        # Always clean up the temp audio file — even on Gemini failure.
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 # ---------------------------------------------------------------------------
 # Bolna Webhooks
 # ---------------------------------------------------------------------------
+
+def dedupe_transcript(transcript: str) -> str:
+    """
+    Clean a raw Bolna transcript for display AND for analysis:
+      - collapse exact consecutive duplicate lines (the agent often repeats a
+        sentence, e.g. "Just give me a moment, I'll be back with you.")
+      - drop a line that is only a strict prefix of the previous line (ASR / TTS
+        truncation repeats, e.g. "I will notify your family immediately." then
+        "I will notify your family immediately. Til")
+
+    Non-consecutive repeats are preserved — only exact/truncated re-speaks of
+    the immediately preceding utterance are removed.
+    """
+    if not transcript:
+        return transcript
+    lines = transcript.split("\n")
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            cleaned.append(line)
+            continue
+        prev = cleaned[-1].strip() if cleaned else ""
+        if stripped == prev:
+            continue  # exact repeat
+        if prev and (stripped.startswith(prev) or prev.startswith(stripped)):
+            # One is a prefix of the other → keep the LONGER, more complete one.
+            if len(stripped) >= len(prev):
+                cleaned[-1] = line
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
 
 async def analyze_transcript_for_health_issues(transcript: str) -> dict:
     """Uses Gemini to extract symptoms, severity, and intent from the full call transcript."""
@@ -1757,12 +1859,26 @@ async def analyze_transcript_for_health_issues(transcript: str) -> dict:
         logger.warning("No GEMINI_API_KEY for transcript analysis.")
         return {"symptoms": [], "severity": "low", "intent": "health_check"}
 
+    # The exact canonical symptom vocabulary the scoring engine recognises.
+    # Mapping the patient's words to these keys is what makes the extracted
+    # symptoms actually score (a free-text "fever" string would be dropped).
+    vocab = ", ".join(sorted(SYMPTOM_WEIGHTS))
     prompt = f"""
-Analyze the following conversation transcript between a health assistant and a patient.
+You are a clinical transcription analyst. Analyze the following conversation transcript
+between a health assistant and an elderly patient.
+
 Extract the following information:
-1. symptoms: A list of medical symptoms or complaints the patient mentioned (e.g. ["chest pain", "fever"]). Empty list if none.
-2. severity: The overall risk severity of the condition ('low', 'medium', 'high', 'critical'). Critical/high if emergency symptoms like chest pain or breathing issues are present.
-3. intent: The primary intent of the call (e.g. 'health_check', 'emergency').
+1. symptoms: EVERY medical symptom or complaint the patient mentioned, mapped to the EXACT
+   canonical keys below. The transcript may be imperfect (speech-to-text errors, stutters,
+   repeated words) — extract from what the patient actually said (e.g. "i have received the
+   fever" → "fever"). Empty list ONLY if the patient reported no symptoms at all.
+   Canonical symptom keys (use exactly these):
+   {vocab}
+2. severity: overall risk severity — 'critical' if any emergency symptom was mentioned
+   (chest pain, breathing problem, unconscious, stroke symptoms, severe bleeding),
+   'high' for serious complaints, 'medium' for real but non-urgent symptoms
+   (fever, cold, dizziness, body pain...), 'low' only when the patient is fine.
+3. intent: 'health_check' for routine check-ins, 'emergency' for urgent issues.
 
 Respond ONLY with a valid JSON object matching this exact schema:
 {{
@@ -1807,8 +1923,10 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
     If the call failed or was unanswered, notify family members.
     """
     expected_token = os.environ.get("BOLNA_WEBHOOK_SECRET")
-    if expected_token and token != expected_token:
-        raise HTTPException(status_code=401, detail="Invalid webhook token")
+    if expected_token:
+        # Timing-safe comparison (and a missing token is rejected, not passed).
+        if not token or not secrets.compare_digest(token, expected_token):
+            raise HTTPException(status_code=401, detail="Invalid webhook token")
     try:
         payload = await request.json()
         logger.info(f"[WEBHOOK] Received Bolna webhook: {payload}")
@@ -1864,6 +1982,17 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                 logger.warning(f"[WEBHOOK] Could not find contacts for {phone}. No unanswered call alert sent.")
         
         elif status in ("completed", "success", "done", "call.ended", "call.completed", "call_ended", "call_completed"):
+            # Idempotency: Bolna retries webhook delivery on HTTP 500, and each
+            # retry used to create a NEW assessment row for the same call → the
+            # duplicate (and often worse-quality) entries seen in the dashboard
+            # feed/timeline. Only log each call once — checked BEFORE the
+            # expensive recording upload / emotion analysis so retries short-circuit.
+            if call_id and call_id != "bolna_missed_call" and assessment_exists_for_call(call_id):
+                logger.warning(
+                    f"[WEBHOOK] Assessment for call {call_id} already logged — skipping duplicate (idempotency)."
+                )
+                return {"status": "ok"}
+
             # A successful call might have extracted health data
             # --- User resolution: prefer metadata.user_id (injected at call time) ---
             # This avoids a DB lookup by phone which can fail if numbers don't match exactly.
@@ -1920,6 +2049,11 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                 elif isinstance(raw_transcript, str):
                     formatted_transcript = raw_transcript
 
+            # Collapse repeated/truncated lines so the stored transcript (and the
+            # Gemini analysis below) isn't polluted by the agent re-speaking the
+            # same sentence (the "garbled transcript" seen on the dashboard).
+            formatted_transcript = dedupe_transcript(formatted_transcript)
+
             # Use the nested-key finder so recording_url is captured regardless of
             # how deeply Bolna nests it in the payload (root, call_data, etc.)
             recording_url = _find_key(payload, ["recording_url", "record_url", "audio_url"])
@@ -1936,33 +2070,34 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
                 emotion_analysis = await analyze_emotion_from_audio(signed_url)
 
             extracted = _find_extraction_data(payload)
-            
+            bolna_symptoms_raw = extracted.get("symptoms", []) if extracted else []
+            if isinstance(bolna_symptoms_raw, str):
+                bolna_symptoms_raw = [bolna_symptoms_raw]
+            bolna_symptoms = [s for s in bolna_symptoms_raw if s] if isinstance(bolna_symptoms_raw, list) else []
+            bolna_severity = ((extracted.get("severity") or "") if extracted else "").lower().strip()
+
             symptoms = []
             severity = "low"
             intent = "health_check"
 
-            if formatted_transcript:
-                logger.info("[WEBHOOK] Analyzing transcript with Gemini for health issues...")
+            if bolna_symptoms and bolna_severity in {"low", "medium", "high", "critical"}:
+                # Prefer the in-call Bolna extraction: it was produced in context
+                # during the conversation. Post-hoc Gemini analysis of a noisy ASR
+                # transcript regularly under-extracts (e.g. empty symptoms for a
+                # call where the patient reported fever) — which was showing up as
+                # wrong risk/symptoms on the dashboard.
+                # (Only trusted when both symptoms AND a valid severity are present
+                # so a loose nested-match can't override Gemini with garbage.)
+                logger.info(f"[WEBHOOK] Using Bolna extraction data: {extracted}")
+                symptoms = bolna_symptoms
+                severity = bolna_severity
+                intent = (extracted.get("intent") or "health_check").lower()
+            elif formatted_transcript:
+                logger.info("[WEBHOOK] No Bolna extraction — analyzing transcript with Gemini for health issues...")
                 analysis = await analyze_transcript_for_health_issues(formatted_transcript)
                 symptoms = analysis.get("symptoms", [])
                 severity = analysis.get("severity", "low")
                 intent = analysis.get("intent", "health_check")
-                
-                # Fallback to Bolna extraction if Gemini found nothing
-                if extracted and not symptoms:
-                    bolna_symptoms = extracted.get("symptoms", [])
-                    if isinstance(bolna_symptoms, str):
-                        bolna_symptoms = [bolna_symptoms]
-                    symptoms = bolna_symptoms
-                    severity = extracted.get("severity", severity)
-                    intent = extracted.get("intent", intent)
-            elif extracted:
-                logger.info(f"[WEBHOOK] No transcript, using Bolna extraction data: {extracted}")
-                symptoms = extracted.get("symptoms", [])
-                if isinstance(symptoms, str):
-                    symptoms = [symptoms]
-                severity = extracted.get("severity", "medium")
-                intent = extracted.get("intent", "health_check")
             else:
                 logger.info("[WEBHOOK] Call completed with no transcript or extraction data — logging as healthy check-in.")
 
