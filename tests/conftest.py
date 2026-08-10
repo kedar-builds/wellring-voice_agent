@@ -49,6 +49,11 @@ def client(_init_test_db):
     Session-scoped FastAPI TestClient.
     Uses a temporary SQLite DB — Postgres is patched out so the real
     local database is never touched during tests.
+
+    NOTE: Twilio is NOT mocked here at the session level to avoid
+    interfering with test_notifications.py unit tests.  The webhook
+    integration tests that trigger notifications patch _twilio_send
+    locally via the `mock_twilio_send` fixture.
     """
     from fastapi.testclient import TestClient
     from src.main import app
@@ -59,3 +64,15 @@ def client(_init_test_db):
         with TestClient(app) as c:
             c.headers.update({"X-API-Key": os.environ["WELLRING_API_KEY"]})
             yield c
+
+
+@pytest.fixture()
+def mock_twilio_send():
+    """
+    Function-scoped fixture: patches src.notifications._twilio_send to a
+    no-op so individual webhook integration tests never make real Twilio
+    API calls (avoids HTTP 429 rate-limit errors in CI).
+    """
+    with patch("src.notifications._twilio_send", return_value=(True, None)):
+        yield
+

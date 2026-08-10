@@ -2,18 +2,21 @@
 users.py
 ========
 User Profile system. Handles fetching patient and caregiver info
-from either Supabase or the local SQLite database.
+from either PostgreSQL or the local SQLite database.
 """
 
 import sqlite3
 import logging
 from typing import Optional, Dict, Any
 from src.database import (
-    get_supabase, _resolve_db_path, USE_SUPABASE,
+    _resolve_db_path,
     _use_postgres, _PG_AVAILABLE, get_pg_conn, _pg_cursor
 )
 
 logger = logging.getLogger(__name__)
+
+# Supabase was removed; constant kept for backward compatibility with tests.
+USE_SUPABASE: bool = False
 
 def get_user(user_id: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Fetch user profile by UUID or string ID."""
@@ -29,18 +32,7 @@ def get_user(user_id: str, db_path: Optional[str] = None) -> Optional[Dict[str, 
                         r_dict["id"] = str(r_dict["user_id"])
                         return r_dict
         except Exception as e:
-            logger.error(f"Postgres get_user failed: {e}. Falling back to SQLite/Supabase.")
-
-    # -- Supabase --
-    if USE_SUPABASE:
-        supabase = get_supabase()
-        if supabase:
-            try:
-                res = supabase.table("users").select("*").eq("id", user_id).execute()
-                if res.data and len(res.data) > 0:
-                    return dict(res.data[0]) # type: ignore
-            except Exception as e:
-                logger.error(f"Supabase get_user failed: {e}. Falling back to SQLite.")
+            logger.error(f"Postgres get_user failed: {e}. Falling back to SQLite.")
 
     # SQLite Fallback
     db_path = _resolve_db_path(db_path)

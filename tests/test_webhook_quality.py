@@ -137,15 +137,16 @@ def _latest_interaction_for_call(call_id: str):
     db_path = os.environ["WELLRING_DB_PATH"]
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    # Data is written to the 'assessments' table by _log_interaction_sqlite.
     row = conn.execute(
-        "SELECT * FROM interactions WHERE bolna_call_id = ? ORDER BY id DESC LIMIT 1",
+        "SELECT * FROM assessments WHERE bolna_call_id = ? ORDER BY id DESC LIMIT 1",
         (call_id,),
     ).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def test_webhook_uses_bolna_extraction_and_dedupes_transcript(client):
+def test_webhook_uses_bolna_extraction_and_dedupes_transcript(client, mock_twilio_send):
     """The stored assessment must carry the in-call Bolna symptoms (not empty)
     and a deduped transcript."""
     r = client.post("/bolna-webhook", json=_webhook_payload())
@@ -162,7 +163,7 @@ def test_webhook_uses_bolna_extraction_and_dedupes_transcript(client):
     assert row["bolna_call_id"] == "call-integration-1"
 
 
-def test_webhook_second_delivery_is_idempotent(client):
+def test_webhook_second_delivery_is_idempotent(client, mock_twilio_send):
     """A retried webhook delivery must NOT create a second assessment row."""
     call_id = "call-integration-2"  # distinct from the extraction test's call
     payload = _webhook_payload(call_id=call_id)
@@ -171,8 +172,9 @@ def test_webhook_second_delivery_is_idempotent(client):
 
     db_path = os.environ["WELLRING_DB_PATH"]
     conn = sqlite3.connect(db_path)
+    # Data is written to the 'assessments' table by _log_interaction_sqlite.
     n = conn.execute(
-        "SELECT COUNT(*) FROM interactions WHERE bolna_call_id = ?",
+        "SELECT COUNT(*) FROM assessments WHERE bolna_call_id = ?",
         (call_id,),
     ).fetchone()[0]
     conn.close()

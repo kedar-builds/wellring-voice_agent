@@ -5,7 +5,6 @@ Unified data-access layer for WellRing.
 
 Backend priority (controlled by env vars):
   1. PostgreSQL  — if DATABASE_URL is set
-  2. Supabase    — if USE_SUPABASE=true and SUPABASE_URL + SUPABASE_KEY are set
   3. SQLite      — local fallback (tests, offline dev)
 
 Public API (signatures unchanged so existing code/tests keep working):
@@ -52,15 +51,12 @@ def _use_postgres() -> bool:
     """Return True if a Postgres DATABASE_URL is currently configured."""
     return bool(os.environ.get("DATABASE_URL", ""))
 
-USE_SUPABASE: bool = os.environ.get("USE_SUPABASE", "false").lower() == "true"
-SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY: str = os.environ.get("SUPABASE_KEY", "")
 
 # SQLite fallback path
 DB_PATH: str = os.environ.get("WELLRING_DB_PATH", "wellring.db")
 
 # ---------------------------------------------------------------------------
-# Optional imports (Postgres / Supabase)
+# Optional imports (Postgres)
 # ---------------------------------------------------------------------------
 try:
     import psycopg2
@@ -71,12 +67,6 @@ try:
 except ImportError:
     _PG_AVAILABLE = False
 
-try:
-    from supabase import create_client, Client as SupabaseClient
-    _SUPABASE_AVAILABLE = True
-except ImportError:
-    SupabaseClient = Any  # type: ignore[misc,assignment]
-    _SUPABASE_AVAILABLE = False
 
 
 # ===========================================================================
@@ -91,7 +81,7 @@ except ImportError:
 #   PG_POOL_MIN  (default 2) — connections kept warm at all times
 #   PG_POOL_MAX  (default 10) — max concurrent connections to Postgres
 #
-# Supabase free-tier limit is 15 pooled connections.  Keeping PG_POOL_MAX
+# Neon free-tier limit is 15 pooled connections.  Keeping PG_POOL_MAX
 # at 10 leaves headroom for migrations, psql sessions, etc.
 # ---------------------------------------------------------------------------
 
@@ -137,7 +127,7 @@ def get_pg_conn() -> Generator:
         if conn.closed:
             pool.putconn(conn, close=True)
             conn = pool.getconn()
-        # Pass 2: TCP-level ping — a Supabase/PgBouncer idle-timeout or a
+        # Pass 2: TCP-level ping — a PgBouncer idle-timeout or a
         # network blip can leave conn.closed==False while the socket is dead.
         # A lightweight SELECT 1 surfaces that before the real query runs.
         else:
@@ -208,7 +198,7 @@ def init_pg_tables() -> None:
         # Self-healing migrations for column updates
         columns_to_ensure = {
             "users": [
-                ("firebase_uid", "TEXT UNIQUE"),
+                ("clerk_id", "TEXT UNIQUE"),
                 ("name", "TEXT NOT NULL DEFAULT 'Elderly'"),
                 ("age", "INTEGER"),
                 ("role", "TEXT NOT NULL DEFAULT 'elderly'"),
@@ -246,6 +236,14 @@ def init_pg_tables() -> None:
                 ("transcript", "TEXT"),
                 ("emotion_analysis", "TEXT"),
                 ("assessed_at", "TIMESTAMPTZ NOT NULL DEFAULT now()")
+            ],
+            # user_id = owning elder (users.user_id). New reminders carry it so
+            # get_reminders(clerk_id) can scope strictly by owner instead of
+            # by phone (two accounts sharing an elder phone no longer see each
+            # other's reminders). Legacy rows keep user_id NULL and fall back to
+            # phone matching.
+            "reminders": [
+                ("user_id", "TEXT")
             ]
         }
         
@@ -284,16 +282,9 @@ def init_pg_tables() -> None:
 
 
 # ===========================================================================
-# Supabase helper
-# ===========================================================================
-
-def get_supabase() -> Optional['SupabaseClient']:
-    if USE_SUPABASE and _SUPABASE_AVAILABLE and SUPABASE_URL and SUPABASE_KEY:
-        return create_client(SUPABASE_URL, SUPABASE_KEY)
-    return None
-
 
 # ===========================================================================
+
 # SQLite helpers (fallback)
 # ===========================================================================
 
@@ -337,10 +328,36 @@ def init_db(db_path: Optional[str] = None) -> None:
         )
     """)
 
+    # `assessments` is the canonical table used by _log_interaction_sqlite.
+    # The legacy `interactions` table above is kept for existing DBs.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS assessments (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp       TEXT    NOT NULL,
+            intent          TEXT    NOT NULL DEFAULT 'health_check',
+            symptoms        TEXT    NOT NULL DEFAULT '[]',
+            severity        TEXT    NOT NULL DEFAULT 'low',
+            confidence      REAL    NOT NULL DEFAULT 1.0,
+            score           INTEGER NOT NULL DEFAULT 0,
+            base_score      INTEGER NOT NULL DEFAULT 0,
+            risk_level      TEXT    NOT NULL DEFAULT 'LOW',
+            category        TEXT    NOT NULL DEFAULT 'GENERAL',
+            action          TEXT    NOT NULL DEFAULT 'monitor',
+            message         TEXT    NOT NULL DEFAULT '',
+            steps           TEXT,
+            breakdown       TEXT,
+            user_id         TEXT,
+            recording_url   TEXT,
+            transcript      TEXT,
+            emotion_analysis TEXT,
+            bolna_call_id   TEXT
+        )
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id             TEXT PRIMARY KEY,
-            firebase_uid        TEXT UNIQUE,
+            clerk_id        TEXT UNIQUE,
             name                TEXT NOT NULL,
             phone               TEXT,
             age                 INTEGER,
@@ -377,6 +394,7 @@ def init_db(db_path: Optional[str] = None) -> None:
             frequency       TEXT NOT NULL,
             phone           TEXT NOT NULL,
             notes           TEXT,
+            user_id         TEXT,
             last_triggered  TEXT
         )
     """)
@@ -429,7 +447,7 @@ def _migrate_sqlite_schema(conn: sqlite3.Connection) -> None:
 
     # Columns that must exist in the new schema but may be absent in old DBs
     needed_cols = {
-        "firebase_uid": "TEXT",
+        "clerk_id": "TEXT",
         "phone": "TEXT",
         "medical_notes": "TEXT",
         "role": "TEXT",
@@ -470,6 +488,33 @@ def _migrate_sqlite_schema(conn: sqlite3.Connection) -> None:
         except Exception as e:
             logger.warning(f"[DB-MIGRATE] Could not add column 'bolna_call_id' to interactions: {e}")
 
+    # Add user_id (owner elder) to reminders if missing — lets get_reminders
+    # scope by owner rather than by phone only.
+    cur.execute("PRAGMA table_info(reminders)")
+    existing_rem_cols = {row[1] for row in cur.fetchall()}
+    if "user_id" not in existing_rem_cols:
+        try:
+            cur.execute("ALTER TABLE reminders ADD COLUMN user_id TEXT")
+            logger.info("[DB-MIGRATE] Added column 'user_id' to reminders table")
+        except Exception as e:
+            logger.warning(f"[DB-MIGRATE] Could not add column 'user_id' to reminders: {e}")
+
+    # Add new columns to assessments if table existed before they were added
+    cur.execute("PRAGMA table_info(assessments)")
+    existing_assess_cols = {row[1] for row in cur.fetchall()}
+    needed_assess_cols = {
+        "base_score": "INTEGER NOT NULL DEFAULT 0",
+        "steps": "TEXT",
+        "breakdown": "TEXT",
+    }
+    for col, col_type in needed_assess_cols.items():
+        if col not in existing_assess_cols:
+            try:
+                cur.execute(f"ALTER TABLE assessments ADD COLUMN {col} {col_type}")
+                logger.info(f"[DB-MIGRATE] Added column '{col}' to assessments table")
+            except Exception as e:
+                logger.warning(f"[DB-MIGRATE] Could not add column '{col}' to assessments: {e}")
+
     conn.commit()
 
 
@@ -482,17 +527,11 @@ def log_interaction(data: Dict[str, Any], db_path: Optional[str] = None) -> Unio
     Log an assessment result.
 
     Returns:
-        UUID string (Postgres) or integer row id (SQLite/Supabase).
+        UUID string (Postgres) or integer row id (SQLite).
     """
     # -- Postgres --
     if _use_postgres() and _PG_AVAILABLE:
         return _log_interaction_pg(data)
-
-    # -- Supabase --
-    if USE_SUPABASE and _SUPABASE_AVAILABLE:
-        result = _log_interaction_supabase(data)
-        if result is not None:
-            return result
 
     # -- SQLite fallback --
     return _log_interaction_sqlite(data, db_path)
@@ -546,6 +585,50 @@ def _log_interaction_pg(data: Dict[str, Any]) -> str:
 
     logger.info(f"[PG] Assessment logged: {assessment_id}")
     return assessment_id
+
+
+def _log_interaction_sqlite(data: Dict[str, Any], db_path: Optional[str]) -> int:
+    """Insert into SQLite `assessments` table, returns row id."""
+    db_path = _resolve_db_path(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO assessments
+                (user_id, intent, symptoms, severity, confidence, score, base_score,
+                 risk_level, category, action, message, steps, breakdown,
+                 bolna_call_id, recording_url, transcript, emotion_analysis, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data.get("user_id"),
+                data.get("intent", "health_issue"),
+                json.dumps(data.get("symptoms", [])),
+                data.get("severity", "low"),
+                data.get("confidence", 1.0),
+                data.get("score", 0),
+                data.get("base_score", 0),
+                data.get("risk_level", "LOW"),
+                data.get("category", "GENERAL"),
+                data.get("action", "monitor"),
+                data.get("message", ""),
+                json.dumps(data.get("steps", [])),
+                json.dumps(data.get("breakdown", [])),
+                data.get("bolna_call_id"),
+                data.get("recording_url"),
+                data.get("transcript"),
+                data.get("emotion_analysis"),
+                data.get("timestamp", datetime.datetime.now(datetime.UTC).isoformat()),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid or 0
+    except Exception as exc:
+        logger.error(f"[SQLITE] log_interaction error: {exc}")
+        return 0
+    finally:
+        conn.close()
 
 
 def _ensure_anonymous_user_pg() -> str:
@@ -605,68 +688,6 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module 'src.database' has no attribute {name!r}")
 
 
-def _log_interaction_supabase(data: Dict[str, Any]) -> Optional[int]:
-    supabase = get_supabase()
-    if not supabase:
-        return None
-    try:
-        res = supabase.table("interactions").insert({
-            "timestamp":     data.get("timestamp", datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z"),
-            "intent":        data.get("intent", ""),
-            "symptoms":      data.get("symptoms", []),
-            "severity":      data.get("severity", ""),
-            "confidence":    data.get("confidence", 1.0),
-            "score":         data.get("score", 0),
-            "risk_level":    data.get("risk_level", "LOW"),
-            "category":      data.get("category", ""),
-            "action":        data.get("action", ""),
-            "message":       data.get("message", ""),
-            "user_id":       data.get("user_id"),
-            "recording_url": data.get("recording_url"),
-            "transcript":    data.get("transcript"),
-            "emotion_analysis": data.get("emotion_analysis"),
-        }).execute()
-        if res.data:
-            return int(res.data[0]["id"]) # type: ignore
-    except Exception as exc:
-        logger.error(f"Supabase insert failed: {exc}. Falling back to SQLite.")
-    return None
-
-
-def _log_interaction_sqlite(data: Dict[str, Any], db_path: Optional[str]) -> int:
-    db_path = _resolve_db_path(db_path)
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO interactions (
-            timestamp, intent, symptoms, severity, confidence,
-            score, risk_level, category, action, message, user_id, recording_url,
-            transcript, emotion_analysis, bolna_call_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        data.get("timestamp", datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z"),
-        data.get("intent", ""),
-        json.dumps(data.get("symptoms", [])),
-        data.get("severity", ""),
-        data.get("confidence", 1.0),
-        data.get("score", 0),
-        data.get("risk_level", "LOW"),
-        data.get("category", ""),
-        data.get("action", ""),
-        data.get("message", ""),
-        data.get("user_id"),
-        data.get("recording_url"),
-        data.get("transcript"),
-        data.get("emotion_analysis"),
-        data.get("bolna_call_id"),
-    ))
-    row_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return int(row_id) if row_id else 0
-
-
-# ===========================================================================
 # get_symptom_repeat_count
 # ===========================================================================
 
@@ -677,11 +698,6 @@ def get_symptom_repeat_count(symptom: str, days: int = 3, db_path: Optional[str]
     """
     if _use_postgres() and _PG_AVAILABLE:
         return _symptom_count_pg(symptom, days, user_id)
-
-    if USE_SUPABASE and _SUPABASE_AVAILABLE:
-        result = _symptom_count_supabase(symptom, days)
-        if result >= 0:
-            return result
 
     return _symptom_count_sqlite(symptom, days, db_path, user_id)
 
@@ -707,65 +723,28 @@ def _symptom_count_pg(symptom: str, days: int, user_id: Optional[str]) -> int:
             return int(cur.fetchone()["cnt"])
 
 
-def _symptom_count_supabase(symptom: str, days: int) -> int:
-    supabase = get_supabase()
-    if not supabase:
-        return -1
-    try:
-        cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days)).isoformat() + "Z"
-        res = (
-            supabase.table("interactions")
-            .select("id", count="exact") # type: ignore
-            .gte("timestamp", cutoff)
-            .contains("symptoms", [symptom])
-            .execute()
-        )
-        return res.count if res.count is not None else 0
-    except Exception as exc:
-        logger.error(f"Supabase symptom count failed: {exc}")
-        return -1
-
-
-def _symptom_count_sqlite(symptom: str, days: int, db_path: Optional[str], user_id: Optional[str] = None) -> int:
+def _symptom_count_sqlite(symptom: str, days: int, db_path: Optional[str], user_id: Optional[str]) -> int:
+    cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days)).isoformat()
     db_path = _resolve_db_path(db_path)
     conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    # Exclude the Anonymous sentinel user (is_system=TRUE)
-    # so its accumulated history never inflates real users' multipliers.
-    # When a user_id is provided, scope the count to that specific user.
-    # Use i.user_id IS NOT NULL to exclude orphan rows (no user reference).
-    if user_id:
-        cur.execute(
-            """
-            SELECT COUNT(DISTINCT i.id)
-            FROM   interactions i, json_each(i.symptoms) je
-            LEFT JOIN users u ON u.user_id = i.user_id
-            WHERE  je.value = ?
-              AND  i.timestamp >= datetime('now', ? || ' days')
-              AND  i.user_id = ?
-              AND  (u.is_system IS NULL OR u.is_system = 0)
-            """,
-            (symptom, f"-{days}", user_id),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT COUNT(DISTINCT i.id)
-            FROM   interactions i, json_each(i.symptoms) je
-            LEFT JOIN users u ON u.user_id = i.user_id
-            WHERE  je.value = ?
-              AND  i.timestamp >= datetime('now', ? || ' days')
-              AND  i.user_id IS NOT NULL
-              AND  (u.is_system IS NULL OR u.is_system = 0)
-            """,
-            (symptom, f"-{days}"),
-        )
-    count = cur.fetchone()[0]
-    conn.close()
-    return count
+    try:
+        if user_id:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM assessments WHERE ? IN symptoms AND timestamp >= ? AND user_id = ?",
+                (symptom, cutoff, user_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM assessments WHERE symptoms LIKE ? AND timestamp >= ?",
+                (f"%{symptom}%", cutoff),
+            ).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+    finally:
+        conn.close()
 
 
-# ===========================================================================
 # log_alert
 # ===========================================================================
 
@@ -787,21 +766,6 @@ def log_alert(
         _log_alert_pg(interaction_id, risk_level, notification_type, status,
                       recipient_name, recipient_phone, recipient_email, error_message)
         return
-
-    if USE_SUPABASE and _SUPABASE_AVAILABLE:
-        supabase = get_supabase()
-        if supabase:
-            try:
-                supabase.table("alerts_log").insert({
-                    "interaction_id":   interaction_id,
-                    "timestamp":        timestamp,
-                    "risk_level":       risk_level,
-                    "notification_type": notification_type,
-                    "status":           status,
-                }).execute()
-                return
-            except Exception as exc:
-                logger.error(f"Supabase alert log failed: {exc}")
 
     # SQLite fallback
     db_path = _resolve_db_path(db_path)
@@ -887,7 +851,7 @@ def upsert_health_history(
     Called automatically after every Postgres assessment write.
     """
     if not (_use_postgres() and _PG_AVAILABLE):
-        return  # No-op for SQLite/Supabase
+        return  # No-op for SQLite
 
     now = datetime.datetime.now(datetime.UTC)
     window_start = now - datetime.timedelta(days=window_days)
@@ -971,18 +935,23 @@ def add_reminder(
     type_val: str, title: str, time_val: str,
     frequency: str, phone: str,
     notes: Optional[str] = None, db_path: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> str:
-    """Insert a reminder and return its UUID (or str rowid for SQLite)."""
+    """Insert a reminder and return its UUID (or str rowid for SQLite).
+
+    user_id is the owning elder (users.user_id). New reminders store it so
+    get_reminders(clerk_id) can scope by owner instead of by phone.
+    """
     if _use_postgres() and _PG_AVAILABLE:
         with get_pg_conn() as conn:
             with _pg_cursor(conn) as cur:
                 cur.execute("""
-                    INSERT INTO reminders (type, title, time, frequency, phone, notes, last_triggered)
-                    VALUES (%(type)s, %(title)s, %(time)s, %(frequency)s, %(phone)s, %(notes)s, NULL)
+                    INSERT INTO reminders (type, title, time, frequency, phone, notes, user_id, last_triggered)
+                    VALUES (%(type)s, %(title)s, %(time)s, %(frequency)s, %(phone)s, %(notes)s, %(user_id)s, NULL)
                     RETURNING id
                 """, {
                     "type": type_val, "title": title, "time": time_val,
-                    "frequency": frequency, "phone": phone, "notes": notes
+                    "frequency": frequency, "phone": phone, "notes": notes, "user_id": user_id
                 })
                 row = cur.fetchone()
                 return str(row["id"]) if row else ""
@@ -992,28 +961,41 @@ def add_reminder(
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO reminders (type, title, time, frequency, phone, notes, last_triggered)
-        VALUES (?, ?, ?, ?, ?, ?, NULL)
-    """, (type_val, title, time_val, frequency, phone, notes))
+        INSERT INTO reminders (type, title, time, frequency, phone, notes, user_id, last_triggered)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+    """, (type_val, title, time_val, frequency, phone, notes, user_id))
     row_id = cur.lastrowid
     conn.commit()
     conn.close()
     return str(row_id) if row_id else ""
 
 
-def get_reminders(firebase_uid: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_reminders(clerk_id: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     if _use_postgres() and _PG_AVAILABLE:
         with get_pg_conn() as conn:
             with _pg_cursor(conn) as cur:
-                if firebase_uid:
-                    # Return only reminders whose phone belongs to the caregiver's elder
+                if clerk_id:
+                    # Owner-scoped: reminders owned by the caregiver's elder
+                    # (user_id set), plus legacy rows (user_id NULL) whose phone
+                    # matches the elder — preserves pre-ownership behaviour while
+                    # isolating reminders created after this fix.
                     cur.execute("""
                         SELECT r.* FROM reminders r
-                        WHERE r.phone IN (
-                            SELECT phone FROM users
-                            WHERE firebase_uid = %s AND role = 'elderly'
+                        WHERE (
+                            r.user_id IS NOT NULL
+                            AND r.user_id IN (
+                                SELECT user_id::text FROM users
+                                WHERE clerk_id = %s AND role = 'elderly'
+                            )
                         )
-                    """, (firebase_uid,))
+                        OR (
+                            r.user_id IS NULL
+                            AND r.phone IN (
+                                SELECT phone FROM users
+                                WHERE clerk_id = %s AND role = 'elderly'
+                            )
+                        )
+                    """, (clerk_id, clerk_id))
                 else:
                     cur.execute("SELECT * FROM reminders")
                 return [dict(r) for r in cur.fetchall()]
@@ -1022,14 +1004,24 @@ def get_reminders(firebase_uid: Optional[str] = None, db_path: Optional[str] = N
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    if firebase_uid:
+    if clerk_id:
         cur.execute("""
             SELECT r.* FROM reminders r
-            WHERE r.phone IN (
-                SELECT phone FROM users
-                WHERE firebase_uid = ? AND role = 'elderly'
+            WHERE (
+                r.user_id IS NOT NULL
+                AND r.user_id IN (
+                    SELECT user_id FROM users
+                    WHERE clerk_id = ? AND role = 'elderly'
+                )
             )
-        """, (firebase_uid,))
+            OR (
+                r.user_id IS NULL
+                AND r.phone IN (
+                    SELECT phone FROM users
+                    WHERE clerk_id = ? AND role = 'elderly'
+                )
+            )
+        """, (clerk_id, clerk_id))
     else:
         cur.execute("SELECT * FROM reminders")
     rows = [dict(r) for r in cur.fetchall()]
@@ -1258,7 +1250,7 @@ def delete_appointment(appointment_id: str, db_path: Optional[str] = None) -> bo
 # History Retrieval and Stats (Unified Multi-backend)
 # ===========================================================================
 
-def _get_assessments_pg(limit: int = 50, risk_level: Optional[str] = None, firebase_uid: Optional[str] = None) -> List[Dict[str, Any]]:
+def _get_assessments_pg(limit: int = 50, risk_level: Optional[str] = None, clerk_id: Optional[str] = None) -> List[Dict[str, Any]]:
     sql = """
         SELECT assessment_id AS id,
                assessment_id,
@@ -1289,12 +1281,12 @@ def _get_assessments_pg(limit: int = 50, risk_level: Optional[str] = None, fireb
         "NOT EXISTS (SELECT 1 FROM users u WHERE u.user_id = assessments.user_id AND u.is_system IS TRUE)",
     ]
     params: List[Any] = []
-    if firebase_uid:
+    if clerk_id:
         # Scope to assessments for the elder registered by this caregiver
         conditions.append(
-            "assessments.user_id IN (SELECT user_id FROM users WHERE firebase_uid = %s AND role = 'elderly')"
+            "assessments.user_id IN (SELECT user_id FROM users WHERE clerk_id = %s AND role = 'elderly')"
         )
-        params.append(firebase_uid)
+        params.append(clerk_id)
     if risk_level:
         conditions.append("risk_level = %s")
         params.append(risk_level.upper())
@@ -1331,7 +1323,7 @@ def _get_assessments_pg(limit: int = 50, risk_level: Optional[str] = None, fireb
     return result
 
 
-def _get_assessment_stats_pg(firebase_uid: Optional[str] = None) -> Dict[str, Any]:
+def _get_assessment_stats_pg(clerk_id: Optional[str] = None) -> Dict[str, Any]:
     sql = """
         SELECT 
             COUNT(*) as total_today,
@@ -1345,9 +1337,9 @@ def _get_assessment_stats_pg(firebase_uid: Optional[str] = None) -> Dict[str, An
           AND NOT EXISTS (SELECT 1 FROM users u WHERE u.user_id = assessments.user_id AND u.is_system IS TRUE)
     """
     params: List[Any] = []
-    if firebase_uid:
-        sql += " AND assessments.user_id IN (SELECT user_id FROM users WHERE firebase_uid = %s AND role = 'elderly')"
-        params.append(firebase_uid)
+    if clerk_id:
+        sql += " AND assessments.user_id IN (SELECT user_id FROM users WHERE clerk_id = %s AND role = 'elderly')"
+        params.append(clerk_id)
         
     with get_pg_conn() as conn:
         with _pg_cursor(conn) as cur:
@@ -1366,207 +1358,6 @@ def _get_assessment_stats_pg(firebase_uid: Optional[str] = None) -> Dict[str, An
     }
 
 
-def _get_assessments_supabase(limit: int = 50, risk_level: Optional[str] = None, firebase_uid: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
-    supabase = get_supabase()
-    if not supabase:
-        return None
-    try:
-        valid_user_ids = None
-        if firebase_uid:
-            u_res = supabase.table("users").select("user_id").eq("firebase_uid", firebase_uid).eq("role", "elderly").execute()
-            valid_user_ids = [r["user_id"] for r in (u_res.data or [])]
-            if not valid_user_ids:
-                return []
-                
-        q = supabase.table("interactions").select("*").not_.is_("user_id", "null")
-        if risk_level:
-            q = q.eq("risk_level", risk_level.upper())
-        if valid_user_ids is not None:
-            q = q.in_("user_id", valid_user_ids)
-        res = q.order("timestamp", desc=True).limit(limit).execute()
-        
-        result = []
-        for r in (res.data or []):
-            r_dict = dict(r) # type: ignore
-            if isinstance(r_dict.get("symptoms"), str):
-                try:
-                    r_dict["symptoms"] = json.loads(str(r_dict["symptoms"]))
-                except Exception:
-                    pass
-            elif r_dict.get("symptoms") is None:
-                r_dict["symptoms"] = []
-            result.append(r_dict)
-        return result
-    except Exception as exc:
-        logger.error(f"Supabase get_assessments failed: {exc}")
-    return None
-
-
-def _get_assessment_stats_supabase(firebase_uid: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    supabase = get_supabase()
-    if not supabase:
-        return None
-    try:
-        valid_user_ids = None
-        if firebase_uid:
-            u_res = supabase.table("users").select("user_id").eq("firebase_uid", firebase_uid).eq("role", "elderly").execute()
-            valid_user_ids = [r["user_id"] for r in (u_res.data or [])]
-            if not valid_user_ids:
-                return {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
-
-        today_start = datetime.datetime.now(datetime.UTC).date().isoformat() + "T00:00:00Z"
-        q = supabase.table("interactions").select("risk_level,user_id").gte("timestamp", today_start)
-        if valid_user_ids is not None:
-            q = q.in_("user_id", valid_user_ids)
-        res = q.execute()
-        
-        counts = {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
-        for r in (res.data or []):
-            r_dict = dict(r)
-            if not r_dict.get("user_id"):
-                continue  # orphan rows / anonymous sentinel → don't count on the dashboard
-            rl = str(r_dict.get("risk_level", "")).upper() # type: ignore
-            counts["total_today"] += 1
-            if rl == "LOW":
-                counts["low"] += 1
-            elif rl == "MEDIUM":
-                counts["medium"] += 1
-            elif rl == "HIGH":
-                counts["high"] += 1
-            elif rl == "CRITICAL":
-                counts["critical"] += 1
-        return counts
-    except Exception as exc:
-        logger.error(f"Supabase get_assessment_stats failed: {exc}")
-    return None
-
-
-def _get_assessments_sqlite(limit: int = 50, risk_level: Optional[str] = None, firebase_uid: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
-    db_path = _resolve_db_path(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT name FROM sqlite_master 
-        WHERE type='table' AND name='interactions'
-    """)
-    if not cursor.fetchone():
-        conn.close()
-        return []
-    
-    conditions = [
-        "user_id IS NOT NULL",
-        "NOT EXISTS (SELECT 1 FROM users u WHERE u.user_id = interactions.user_id AND u.is_system = 1)",
-    ]
-    params: List[Any] = []
-    if firebase_uid:
-        conditions.append("interactions.user_id IN (SELECT user_id FROM users WHERE firebase_uid = ? AND role = 'elderly')")
-        params.append(firebase_uid)
-    if risk_level:
-        conditions.append("risk_level = ?")
-        params.append(risk_level.upper())  # type: ignore
-    params.append(limit)
-    query = "SELECT * FROM interactions WHERE " + " AND ".join(conditions) + " ORDER BY timestamp DESC LIMIT ?"
-    
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
-    conn.close()
-    
-    result = []
-    for row in rows:
-        r_dict = dict(row)
-        if isinstance(r_dict.get("symptoms"), str):
-            try:
-                r_dict["symptoms"] = json.loads(r_dict["symptoms"])
-            except Exception:
-                pass
-        elif r_dict.get("symptoms") is None:
-            r_dict["symptoms"] = []
-        result.append(r_dict)
-        
-    return result
-
-
-def _get_assessment_stats_sqlite(firebase_uid: Optional[str] = None, db_path: Optional[str] = None) -> Dict[str, Any]:
-    db_path = _resolve_db_path(db_path)
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT name FROM sqlite_master 
-        WHERE type='table' AND name='interactions'
-    """)
-    if not cursor.fetchone():
-        conn.close()
-        return {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
-        
-    query = """
-        SELECT 
-            COUNT(*) as total_today,
-            SUM(CASE WHEN risk_level = 'LOW' THEN 1 ELSE 0 END) as low,
-            SUM(CASE WHEN risk_level = 'MEDIUM' THEN 1 ELSE 0 END) as medium,
-            SUM(CASE WHEN risk_level = 'HIGH' THEN 1 ELSE 0 END) as high,
-            SUM(CASE WHEN risk_level = 'CRITICAL' THEN 1 ELSE 0 END) as critical
-        FROM interactions 
-        WHERE date(timestamp) = date('now')
-          AND user_id IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM users u WHERE u.user_id = interactions.user_id AND u.is_system = 1)
-    """
-    params: List[Any] = []
-    if firebase_uid:
-        query += " AND interactions.user_id IN (SELECT user_id FROM users WHERE firebase_uid = ? AND role = 'elderly')"
-        params.append(firebase_uid)
-        
-    cursor.execute(query, params)
-    row = cursor.fetchone()
-    conn.close()
-    
-    if not row:
-        return {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
-        
-    return {
-        "total_today": row[0] or 0,
-        "low": row[1] or 0,
-        "medium": row[2] or 0,
-        "high": row[3] or 0,
-        "critical": row[4] or 0
-    }
-
-
-def get_assessments_list(limit: int = 50, risk_level: Optional[str] = None, firebase_uid: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Retrieve interactions/assessments based on the configured database backend."""
-    # -- Postgres --
-    if _use_postgres() and _PG_AVAILABLE:
-        return _get_assessments_pg(limit, risk_level, firebase_uid)
-
-    # -- Supabase --
-    if USE_SUPABASE and _SUPABASE_AVAILABLE:
-        result = _get_assessments_supabase(limit, risk_level, firebase_uid)
-        if result is not None:
-            return result
-
-    # -- SQLite fallback --
-    return _get_assessments_sqlite(limit, risk_level, firebase_uid, db_path)
-
-
-def get_assessment_stats(firebase_uid: Optional[str] = None, db_path: Optional[str] = None) -> Dict[str, Any]:
-    """Retrieve interaction statistics based on the configured database backend."""
-    # -- Postgres --
-    if _use_postgres() and _PG_AVAILABLE:
-        return _get_assessment_stats_pg(firebase_uid)
-
-    # -- Supabase --
-    if USE_SUPABASE and _SUPABASE_AVAILABLE:
-        result = _get_assessment_stats_supabase(firebase_uid)
-        if result is not None:
-            return result
-
-    # -- SQLite fallback --
-    return _get_assessment_stats_sqlite(firebase_uid, db_path)
-
-
-# ===========================================================================
 # get_user_health_context  — used by /call to inject memory into Bolna prompt
 # ===========================================================================
 
@@ -1719,7 +1510,7 @@ def _get_user_health_context_pg(phone: str, days: int) -> Dict[str, Any]:
 # Onboarding & User Profile Management
 # ===========================================================================
 
-def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[int], 
+def upsert_user_profile(clerk_id: str, name: str, phone: str, age: Optional[int], 
                         conditions: List[str], notes: str,
                         voice_id: Optional[str] = None, tts_provider: str = "elevenlabs") -> str:
     """Upsert the elder user's profile, returns the Postgres UUID."""
@@ -1734,9 +1525,9 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO users (user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes, role, voice_id, tts_provider, updated_at)
+            INSERT INTO users (user_id, clerk_id, name, phone, age, medical_conditions, medical_notes, role, voice_id, tts_provider, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'elderly', ?, ?, ?)
-            ON CONFLICT(firebase_uid) DO UPDATE SET
+            ON CONFLICT(clerk_id) DO UPDATE SET
                 name = excluded.name,
                 phone = excluded.phone,
                 age = excluded.age,
@@ -1745,10 +1536,10 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
                 voice_id = excluded.voice_id,
                 tts_provider = excluded.tts_provider,
                 updated_at = excluded.updated_at
-        """, (user_id, firebase_uid, name, phone, age, json.dumps(conditions), notes, voice_id, tts_provider, now_str))
+        """, (user_id, clerk_id, name, phone, age, json.dumps(conditions), notes, voice_id, tts_provider, now_str))
         conn.commit()
         # Fetch actual user_id in case of update
-        cur.execute("SELECT user_id FROM users WHERE firebase_uid = ?", (firebase_uid,))
+        cur.execute("SELECT user_id FROM users WHERE clerk_id = ?", (clerk_id,))
         row = cur.fetchone()
         conn.close()
         return row[0] if row else ""
@@ -1756,9 +1547,9 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
     with get_pg_conn() as conn:
         with _pg_cursor(conn) as cur:
             cur.execute("""
-                INSERT INTO users (firebase_uid, name, phone, age, medical_conditions, medical_notes, role, voice_id, tts_provider)
+                INSERT INTO users (clerk_id, name, phone, age, medical_conditions, medical_notes, role, voice_id, tts_provider)
                 VALUES (%(uid)s, %(name)s, %(phone)s, %(age)s, %(conds)s, %(notes)s, 'elderly', %(voice_id)s, %(tts_provider)s)
-                ON CONFLICT (firebase_uid) DO UPDATE SET
+                ON CONFLICT (clerk_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     phone = EXCLUDED.phone,
                     age = EXCLUDED.age,
@@ -1769,7 +1560,7 @@ def upsert_user_profile(firebase_uid: str, name: str, phone: str, age: Optional[
                     updated_at = now()
                 RETURNING user_id
             """, {
-                "uid": firebase_uid,
+                "uid": clerk_id,
                 "name": name,
                 "phone": phone,
                 "age": age,
@@ -1847,12 +1638,12 @@ def get_user_by_phone(phone: str, db_path: Optional[str] = None) -> Optional[Dic
     Look up a user profile by their phone number.
 
     When multiple users share a phone (e.g. a real onboarded profile and an
-    older test row), prefer the one with a firebase_uid — that is the profile
+    older test row), prefer the one with a clerk_id — that is the profile
     the frontend dashboard is bound to — then the most recently created.
     """
     candidates = phone_match_candidates(phone)
     order_by = (
-        "ORDER BY (firebase_uid IS NOT NULL AND firebase_uid <> '') DESC, "
+        "ORDER BY (clerk_id IS NOT NULL AND clerk_id <> '') DESC, "
         "created_at DESC LIMIT 1"
     )
     if _use_postgres() and _PG_AVAILABLE:
@@ -1886,7 +1677,7 @@ def get_user_by_phone(phone: str, db_path: Optional[str] = None) -> Optional[Dic
         return dict(row)
     return None
 
-def get_user_profile(firebase_uid: str) -> Optional[Dict[str, Any]]:
+def get_user_profile(clerk_id: str) -> Optional[Dict[str, Any]]:
     """Retrieve an elder's profile by Firebase UID."""
     if not _use_postgres() or not _PG_AVAILABLE:
         import json
@@ -1895,10 +1686,10 @@ def get_user_profile(firebase_uid: str) -> Optional[Dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("""
-            SELECT user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes, voice_id, tts_provider
+            SELECT user_id, clerk_id, name, phone, age, medical_conditions, medical_notes, voice_id, tts_provider
             FROM users
-            WHERE firebase_uid = ? AND role = 'elderly'
-        """, (firebase_uid,))
+            WHERE clerk_id = ? AND role = 'elderly'
+        """, (clerk_id,))
         row = cur.fetchone()
         conn.close()
         if not row:
@@ -1914,10 +1705,10 @@ def get_user_profile(firebase_uid: str) -> Optional[Dict[str, Any]]:
     with get_pg_conn() as conn:
         with _pg_cursor(conn) as cur:
             cur.execute("""
-                SELECT user_id, firebase_uid, name, phone, age, medical_conditions, medical_notes, voice_id, tts_provider
+                SELECT user_id, clerk_id, name, phone, age, medical_conditions, medical_notes, voice_id, tts_provider
                 FROM users
-                WHERE firebase_uid = %s AND role = 'elderly'
-            """, (firebase_uid,))
+                WHERE clerk_id = %s AND role = 'elderly'
+            """, (clerk_id,))
             row = cur.fetchone()
             return dict(row) if row else None
 
@@ -2033,27 +1824,231 @@ def delete_family_contact(contact_id: str) -> bool:
 
 
 # ===========================================================================
+# get_assessments_list / get_assessment_stats  (for /assessments endpoints)
+# ===========================================================================
+
+def get_assessments_list(
+    limit: int = 50,
+    risk_level: Optional[str] = None,
+    clerk_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return recent assessments for the dashboard feed, scoped to a caregiver's elders."""
+    # --- Postgres path ---
+    if _use_postgres() and _PG_AVAILABLE:
+        try:
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    params: list = []
+                    where_clauses = ["u.is_system IS NOT TRUE"]
+
+                    if clerk_id:
+                        where_clauses.append(
+                            "a.user_id IN (SELECT user_id FROM users WHERE clerk_id = %s AND role = 'elderly')"
+                        )
+                        params.append(clerk_id)
+
+                    if risk_level:
+                        where_clauses.append("a.risk_level = %s")
+                        params.append(risk_level.upper())
+
+                    where_sql = " AND ".join(where_clauses)
+                    params.append(limit)
+
+                    cur.execute(
+                        f"""
+                        SELECT
+                            a.assessment_id,
+                            a.assessed_at   AS timestamp,
+                            a.risk_level,
+                            a.symptoms,
+                            a.score,
+                            a.severity,
+                            a.action,
+                            a.message,
+                            a.recording_url,
+                            a.bolna_call_id,
+                            u.name          AS patient_name,
+                            u.phone         AS patient_phone
+                        FROM assessments a
+                        LEFT JOIN users u ON u.user_id = a.user_id
+                        WHERE {where_sql}
+                        ORDER BY a.assessed_at DESC
+                        LIMIT %s
+                        """,
+                        params,
+                    )
+                    rows = cur.fetchall()
+                    return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.error(f"[DB] get_assessments_list (pg) error: {exc}")
+            return []
+
+    # --- SQLite fallback ---
+    if not clerk_id:
+        return []  # data-isolation: no clerk_id → empty
+    db_path = _resolve_db_path(None)
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        where_clauses = [
+            "a.user_id IN (SELECT user_id FROM users WHERE clerk_id = ? AND role = 'elderly')",
+            "COALESCE(u.is_system, 0) = 0",
+        ]
+        params_sq: list = [clerk_id]
+        if risk_level:
+            where_clauses.append("a.risk_level = ?")
+            params_sq.append(risk_level.upper())
+        params_sq.append(limit)
+        where_sql = " AND ".join(where_clauses)
+        cur.execute(
+            f"""
+            SELECT
+                a.id          AS assessment_id,
+                a.timestamp,
+                a.risk_level,
+                a.symptoms,
+                a.score,
+                a.severity,
+                a.action,
+                a.message,
+                a.recording_url,
+                a.bolna_call_id,
+                u.name        AS patient_name,
+                u.phone       AS patient_phone
+            FROM assessments a
+            LEFT JOIN users u ON u.user_id = a.user_id
+            WHERE {where_sql}
+            ORDER BY a.timestamp DESC
+            LIMIT ?
+            """,
+            params_sq,
+        )
+        rows = cur.fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["symptoms"] = json.loads(d.get("symptoms") or "[]")
+            except Exception:
+                d["symptoms"] = []
+            result.append(d)
+        return result
+    except Exception as exc:
+        logger.error(f"[DB] get_assessments_list (sqlite) error: {exc}")
+        return []
+
+
+def get_assessment_stats(clerk_id: Optional[str] = None) -> Dict[str, int]:
+    """Return dashboard card counts (total today, per risk-level) scoped to a caregiver."""
+    empty = {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
+
+    # --- Postgres path ---
+    if _use_postgres() and _PG_AVAILABLE:
+        try:
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    params: list = []
+                    scope_clause = ""
+                    if clerk_id:
+                        scope_clause = (
+                            "AND a.user_id IN "
+                            "(SELECT user_id FROM users WHERE clerk_id = %s AND role = 'elderly')"
+                        )
+                        params.append(clerk_id)
+
+                    cur.execute(
+                        f"""
+                        SELECT
+                            COUNT(*) FILTER (WHERE a.assessed_at::date = CURRENT_DATE)   AS total_today,
+                            COUNT(*) FILTER (WHERE a.risk_level = 'LOW')                  AS low,
+                            COUNT(*) FILTER (WHERE a.risk_level = 'MEDIUM')               AS medium,
+                            COUNT(*) FILTER (WHERE a.risk_level = 'HIGH')                 AS high,
+                            COUNT(*) FILTER (WHERE a.risk_level = 'CRITICAL')             AS critical
+                        FROM assessments a
+                        LEFT JOIN users u ON u.user_id = a.user_id
+                        WHERE u.is_system IS NOT TRUE
+                        {scope_clause}
+                        """,
+                        params,
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return {
+                            "total_today": row["total_today"] or 0,
+                            "low":         row["low"]         or 0,
+                            "medium":      row["medium"]       or 0,
+                            "high":        row["high"]         or 0,
+                            "critical":    row["critical"]     or 0,
+                        }
+        except Exception as exc:
+            logger.error(f"[DB] get_assessment_stats (pg) error: {exc}")
+        return empty
+
+    # --- SQLite fallback ---
+    if not clerk_id:
+        return empty  # data-isolation: no clerk_id → zeroed
+    db_path = _resolve_db_path(None)
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        today = datetime.date.today().isoformat()
+        cur.execute(
+            """
+            SELECT
+                SUM(CASE WHEN a.timestamp LIKE ? || '%' THEN 1 ELSE 0 END) AS total_today,
+                SUM(CASE WHEN a.risk_level = 'LOW'      THEN 1 ELSE 0 END) AS low,
+                SUM(CASE WHEN a.risk_level = 'MEDIUM'   THEN 1 ELSE 0 END) AS medium,
+                SUM(CASE WHEN a.risk_level = 'HIGH'     THEN 1 ELSE 0 END) AS high,
+                SUM(CASE WHEN a.risk_level = 'CRITICAL' THEN 1 ELSE 0 END) AS critical
+            FROM assessments a
+            LEFT JOIN users u ON u.user_id = a.user_id
+            WHERE a.user_id IN (
+                SELECT user_id FROM users WHERE clerk_id = ? AND role = 'elderly'
+            )
+            AND COALESCE(u.is_system, 0) = 0
+            """,
+            (today, clerk_id),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return {
+                "total_today": row["total_today"] or 0,
+                "low":         row["low"]         or 0,
+                "medium":      row["medium"]       or 0,
+                "high":        row["high"]         or 0,
+                "critical":    row["critical"]     or 0,
+            }
+    except Exception as exc:
+        logger.error(f"[DB] get_assessment_stats (sqlite) error: {exc}")
+    return empty
+
+
+# ===========================================================================
 # get_all_patients  (for /patients endpoint)
 # ===========================================================================
 
-def get_all_patients(firebase_uid: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Retrieve elderly patient profiles, optionally scoped to a caregiver by firebase_uid."""
+def get_all_patients(clerk_id: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Retrieve elderly patient profiles, optionally scoped to a caregiver by clerk_id."""
     if _use_postgres() and _PG_AVAILABLE:
-        return _get_all_patients_pg(firebase_uid)
+        return _get_all_patients_pg(clerk_id)
     return _get_all_patients_sqlite(db_path)
 
 
-def _get_all_patients_pg(firebase_uid: Optional[str] = None) -> List[Dict[str, Any]]:
+def _get_all_patients_pg(clerk_id: Optional[str] = None) -> List[Dict[str, Any]]:
     with get_pg_conn() as conn:
         with _pg_cursor(conn) as cur:
-            if firebase_uid:
+            if clerk_id:
                 cur.execute("""
                     SELECT user_id, name, age, phone, medical_conditions,
                            medical_notes, caregiver_name, caregiver_phone
                     FROM users
-                    WHERE role = 'elderly' AND firebase_uid = %s
+                    WHERE role = 'elderly' AND clerk_id = %s
                     ORDER BY name
-                """, (firebase_uid,))
+                """, (clerk_id,))
             else:
                 cur.execute("""
                     SELECT user_id, name, age, phone, medical_conditions,
@@ -2142,9 +2137,14 @@ def _make_diary_line(name: str, symptoms: List[str], risk_level: str, message: s
     return f"{name} was feeling good and well"
 
 
-def get_call_timeline(phone: str, limit: int = 365) -> List[Dict[str, Any]]:
+def get_call_timeline(phone: str, limit: int = 365, clerk_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Fetch the full conversation/call history for an elder by phone number.
+
+    clerk_id (optional) is a cross-account guard: when supplied, only the
+    elder whose users row carries that clerk_id may be resolved by phone.
+    A caller can no longer read any other account's timeline by guessing a
+    phone number.
 
     Returns a list ordered oldest → newest, each entry containing:
         assessment_id  — unique ID
@@ -2156,11 +2156,11 @@ def get_call_timeline(phone: str, limit: int = 365) -> List[Dict[str, Any]]:
         score          — integer risk score
     """
     if _use_postgres() and _PG_AVAILABLE:
-        return _get_call_timeline_pg(phone, limit)
-    return _get_call_timeline_sqlite(phone, limit)
+        return _get_call_timeline_pg(phone, limit, clerk_id)
+    return _get_call_timeline_sqlite(phone, limit, clerk_id=clerk_id)
 
 
-def _get_call_timeline_pg(phone: str, limit: int) -> List[Dict[str, Any]]:
+def _get_call_timeline_pg(phone: str, limit: int, clerk_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """PostgreSQL implementation."""
     candidates = phone_match_candidates(phone)
     user_placeholders = ", ".join(["%s"] * len(candidates))
@@ -2168,8 +2168,13 @@ def _get_call_timeline_pg(phone: str, limit: int) -> List[Dict[str, Any]]:
         SELECT user_id, name
         FROM   users
         WHERE  REPLACE(REPLACE(phone, ' ', ''), '-', '') IN ({user_placeholders})
-        LIMIT  1
     """
+    user_params: List[Any] = list(candidates)
+    if clerk_id:
+        # Only the elder owned by this clerk_id may be looked up by phone.
+        user_sql += "\n        AND clerk_id = %s AND role = 'elderly'"
+        user_params.append(clerk_id)
+    user_sql += "\n        LIMIT  1"
     assess_sql = """
         SELECT assessment_id, assessed_at, symptoms, risk_level,
                score, message, severity
@@ -2182,7 +2187,7 @@ def _get_call_timeline_pg(phone: str, limit: int) -> List[Dict[str, Any]]:
     try:
         with get_pg_conn() as conn:
             with _pg_cursor(conn) as cur:
-                cur.execute(user_sql, candidates)
+                cur.execute(user_sql, user_params)
                 user_row = cur.fetchone()
                 if not user_row:
                     return []
@@ -2224,7 +2229,9 @@ def _get_call_timeline_pg(phone: str, limit: int) -> List[Dict[str, Any]]:
         return []
 
 
-def _get_call_timeline_sqlite(phone: str, limit: int, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+def _get_call_timeline_sqlite(
+    phone: str, limit: int, db_path: Optional[str] = None, clerk_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """SQLite fallback — looks up user by phone, then queries interactions table."""
     db_path = _resolve_db_path(db_path)
     candidates = phone_match_candidates(phone)
@@ -2234,41 +2241,39 @@ def _get_call_timeline_sqlite(phone: str, limit: int, db_path: Optional[str] = N
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        # Find user by phone (any stored variant)
+        # Find user by phone (any stored variant); when clerk_id is given,
+        # only the elder owned by that uid may be resolved.
         placeholders = ", ".join(["?"] * len(candidates))
-        cur.execute(
-            f"SELECT user_id, name FROM users WHERE REPLACE(REPLACE(phone, ' ', ''), '-', '') IN ({placeholders}) LIMIT 1",
-            candidates,
+        user_sql = (
+            "SELECT user_id, name FROM users "
+            f"WHERE REPLACE(REPLACE(phone, ' ', ''), '-', '') IN ({placeholders})"
         )
+        user_params: List[Any] = list(candidates)
+        if clerk_id:
+            user_sql += " AND clerk_id = ? AND role = 'elderly'"
+            user_params.append(clerk_id)
+        user_sql += " LIMIT 1"
+        cur.execute(user_sql, user_params)
         user_row = cur.fetchone()
 
+        rows = []
+        user_name = "the patient"
         if user_row:
             user_id   = str(user_row["user_id"])
             user_name = user_row["name"] or "the patient"
             cur.execute(
                 """
                 SELECT id, timestamp, symptoms, risk_level, score, message
-                FROM   interactions
+                FROM   assessments
                 WHERE  user_id = ?
                 ORDER  BY timestamp ASC
                 LIMIT  ?
                 """,
                 (user_id, limit),
             )
-        else:
-            # Fallback: no user filter, return all interactions
-            user_name = "the patient"
-            cur.execute(
-                """
-                SELECT id, timestamp, symptoms, risk_level, score, message
-                FROM   interactions
-                ORDER  BY timestamp ASC
-                LIMIT  ?
-                """,
-                (limit,),
-            )
-
-        rows = cur.fetchall()
+            rows = cur.fetchall()
+        # else: the phone did not resolve to an elder (or not to one owned by
+        # clerk_id) — return [] instead of every user's interactions.
         conn.close()
 
         result = []
@@ -2666,21 +2671,36 @@ def assessment_exists_for_call(call_id: str, db_path: Optional[str] = None) -> b
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        # _log_interaction_sqlite doesn't persist bolna_call_id, so the column
-        # may not exist on SQLite — dedup only when it does (fail-open otherwise).
-        has_col = cur.execute(
+
+        # Check the canonical 'assessments' table first (new writes go here).
+        has_assessments_col = cur.execute(
+            "SELECT 1 FROM pragma_table_info('assessments') WHERE name = 'bolna_call_id'"
+        ).fetchone()
+        if has_assessments_col:
+            cur.execute(
+                "SELECT 1 FROM assessments WHERE bolna_call_id = ? LIMIT 1",
+                (call_id,),
+            )
+            if cur.fetchone() is not None:
+                conn.close()
+                return True
+
+        # Backward compat: also check the legacy 'interactions' table.
+        has_legacy_col = cur.execute(
             "SELECT 1 FROM pragma_table_info('interactions') WHERE name = 'bolna_call_id'"
         ).fetchone()
-        if not has_col:
-            conn.close()
-            return False
-        cur.execute(
-            "SELECT 1 FROM interactions WHERE bolna_call_id = ? LIMIT 1",
-            (call_id,),
-        )
-        found = cur.fetchone() is not None
+        if has_legacy_col:
+            cur.execute(
+                "SELECT 1 FROM interactions WHERE bolna_call_id = ? LIMIT 1",
+                (call_id,),
+            )
+            if cur.fetchone() is not None:
+                conn.close()
+                return True
+
         conn.close()
-        return found
+        return False
     except Exception as exc:
         logger.error(f"[ASSESSMENT-EXISTS] SQLite query failed: {exc}")
         return False
+
