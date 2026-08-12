@@ -38,3 +38,10 @@ verified_agent_config.json
 uploads/
 backups/
 vercel_env.txt
+
+# Local diagnostic artifacts (may contain patient data / credentials) — never commit
+scratch.py
+execs.json
+output.json
+scratch/postgres_data.txt
+scratch/matched_recordings.json
