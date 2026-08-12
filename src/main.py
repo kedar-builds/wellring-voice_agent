@@ -88,6 +88,63 @@ def get_api_key_lenient(api_key_header: str = Security(api_key_header)):
         detail="Invalid or missing API Key"
     )
 
+
+_clerk_dev_warned = False
+
+
+async def get_verified_clerk_uid(request: Request) -> Optional[str]:
+    """
+    Verify the Clerk session JWT (Authorization: Bearer ...) and return the
+    verified Clerk user id (the JWT `sub` claim).
+
+    - CLERK_SECRET_KEY unset (local dev / tests): verification is skipped and
+      None is returned so callers fall back to the legacy `clerk_id` field.
+    - CLERK_SECRET_KEY set (production): a valid, unexpired session JWT is
+      REQUIRED — missing, invalid or expired tokens are rejected with 401
+      (fail closed), and the verified uid overrides any `clerk_id` the client
+      sends, so a caller can never impersonate another account.
+
+    JWKS signing keys are fetched once from Clerk and cached by the SDK, so
+    verification is a local JWT check after the first call.
+    """
+    secret_key = os.environ.get("CLERK_SECRET_KEY")
+    if not secret_key:
+        global _clerk_dev_warned
+        if not _clerk_dev_warned:
+            _clerk_dev_warned = True
+            logger.warning(
+                "[CLERK-AUTH] CLERK_SECRET_KEY not set — Clerk session verification "
+                "DISABLED (dev mode). Set it in production so dashboard endpoints "
+                "require a verified Clerk session token."
+            )
+        return None
+
+    try:
+        from clerk_backend_api.security.authenticaterequest import authenticate_request_async
+        from clerk_backend_api.security.types import AuthenticateRequestOptions
+
+        state = await authenticate_request_async(
+            request,
+            AuthenticateRequestOptions(secret_key=secret_key, accepts_token=["session_token"]),
+        )
+    except Exception as exc:
+        logger.error(f"[CLERK-AUTH] Token verification error: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not verify Clerk session",
+        )
+
+    if state.is_authenticated and state.payload:
+        sub = state.payload.get("sub")
+        if sub:
+            return str(sub)
+    reason = state.reason.value[1] if state.reason else "invalid token"
+    logger.warning(f"[CLERK-AUTH] Rejected request: {reason}")
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing Clerk session token",
+    )
+
 from src.scoring_engine import calculate_score, determine_action, SYMPTOM_WEIGHTS
 from src.database import (
     init_db, log_interaction, get_symptom_repeat_count,
@@ -599,6 +656,7 @@ def config_check(api_key: str = Depends(get_api_key)):
 async def get_recording(
     assessment_id: str,
     clerk_id: Optional[str] = Query(None, description="Require the assessment to belong to this caregiver's elder"),
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
     api_key: str = Depends(get_api_key),
 ):
     """
@@ -615,6 +673,9 @@ async def get_recording(
     Returns:
         { assessment_id, presigned_url, expires_in_seconds }
     """
+    # A verified Clerk session (production) always wins over the legacy param;
+    # in dev mode (no CLERK_SECRET_KEY) the param is used unchanged.
+    clerk_id = verified_uid or clerk_id
     from src.database import get_pg_conn, _pg_cursor, _use_postgres
     import psycopg2.extras  # noqa: F401 — needed for RealDictCursor
 
@@ -1023,23 +1084,27 @@ def get_assessments(
     limit: int = Query(50, ge=1, le=500),
     risk_level: Optional[str] = None,
     clerk_id: Optional[str] = Query(None, description="Filter to a specific user's assessments"),
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
     api_key: str = Depends(get_api_key),
 ):
     """Returns recent assessments (interactions) for the dashboard feed."""
-    if not clerk_id:
+    uid = verified_uid or clerk_id
+    if not uid:
         return []
-    return get_assessments_list(limit=limit, risk_level=risk_level, clerk_id=clerk_id)
+    return get_assessments_list(limit=limit, risk_level=risk_level, clerk_id=uid)
 
 
 @app.get("/assessments/stats", tags=["Dashboard"])
 def get_assessment_stats_endpoint(
     clerk_id: Optional[str] = Query(None, description="Filter stats to a specific user"),
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
     api_key: str = Depends(get_api_key)
 ):
     """Returns counts for dashboard cards."""
-    if not clerk_id:
+    uid = verified_uid or clerk_id
+    if not uid:
         return {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
-    return get_assessment_stats(clerk_id=clerk_id)
+    return get_assessment_stats(clerk_id=uid)
 
 
 @app.get("/timeline", tags=["Timeline"])
@@ -1047,6 +1112,7 @@ def get_call_timeline_endpoint(
     phone: str = Query(..., min_length=5),
     limit: int = Query(365, ge=1, le=2000),
     clerk_id: Optional[str] = Query(None, description="Scope the lookup to this caregiver's elder (recommended — prevents reading other accounts' timelines by guessing a phone)"),
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
     api_key: str = Depends(get_api_key),
 ):
     """
@@ -1067,7 +1133,7 @@ def get_call_timeline_endpoint(
     """
     if not phone:
         raise HTTPException(status_code=422, detail="phone query parameter is required")
-    entries = get_call_timeline(phone=phone, limit=limit, clerk_id=clerk_id)
+    entries = get_call_timeline(phone=phone, limit=limit, clerk_id=verified_uid or clerk_id)
     return {
         "phone":   phone,
         "total":   len(entries),
@@ -1078,13 +1144,15 @@ def get_call_timeline_endpoint(
 @app.get("/patients", tags=["Dashboard"])
 def get_patients(
     clerk_id: Optional[str] = Query(None, description="Return only the elder for this caregiver"),
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
     api_key: str = Depends(get_api_key),
 ):
     """Returns elderly patients registered by the requesting caregiver."""
-    if not clerk_id:
+    uid = verified_uid or clerk_id
+    if not uid:
         return []
     from src.database import get_all_patients
-    patients = get_all_patients(clerk_id=clerk_id)
+    patients = get_all_patients(clerk_id=uid)
     if patients:
         return patients
     # Fallback — return empty list for new users who haven't onboarded yet
@@ -1143,25 +1211,33 @@ class ReminderCreate(BaseModel):
 @app.get("/reminders", tags=["Reminders"])
 def list_reminders(
     clerk_id: Optional[str] = Query(None, description="Return only reminders for this user's elder"),
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
     api_key: str = Depends(get_api_key),
 ):
     """Retrieve reminders, scoped to the requesting user's elder when clerk_id is supplied."""
-    if not clerk_id:
+    uid = verified_uid or clerk_id
+    if not uid:
         return []
-    return get_reminders(clerk_id=clerk_id)
+    return get_reminders(clerk_id=uid)
 
 
 @app.post("/reminders", tags=["Reminders"], status_code=status.HTTP_201_CREATED)
-def create_reminder(payload: ReminderCreate, api_key: str = Depends(get_api_key)):
+def create_reminder(
+    payload: ReminderCreate,
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
     """Create a new reminder schedule.
 
-    When `clerk_id` is supplied the reminder is owned by that caregiver's
-    elder (user_id is stored on the row) so /reminders scoping never crosses
-    accounts — even when two accounts share the same elder phone.
+    When the caller has a verified Clerk session the reminder is owned by that
+    caregiver's elder (user_id is stored on the row) so /reminders scoping never
+    crosses accounts. In dev mode (no CLERK_SECRET_KEY) the legacy `clerk_id`
+    body field is used instead.
     """
+    owner_uid = verified_uid or payload.clerk_id
     elder_user_id = None
-    if payload.clerk_id:
-        profile = get_user_profile(payload.clerk_id)
+    if owner_uid:
+        profile = get_user_profile(owner_uid)
         if not profile:
             raise HTTPException(status_code=404, detail="Elder profile not found for clerk_id")
         elder_user_id = str(profile["user_id"])
@@ -1179,8 +1255,20 @@ def create_reminder(payload: ReminderCreate, api_key: str = Depends(get_api_key)
 
 
 @app.delete("/reminders/{reminder_id}", tags=["Reminders"])
-def remove_reminder(reminder_id: str, api_key: str = Depends(get_api_key)):
-    """Delete a reminder schedule."""
+def remove_reminder(
+    reminder_id: str,
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
+    """Delete a reminder schedule.
+
+    With a verified Clerk session the reminder must belong to that caller's
+    elder — guessing another account's reminder id returns 404.
+    """
+    if verified_uid:
+        owned_ids = {str(r.get("id")) for r in get_reminders(clerk_id=verified_uid)}
+        if str(reminder_id) not in owned_ids:
+            raise HTTPException(status_code=404, detail="Reminder not found")
     success = delete_reminder(reminder_id)
     if not success:
         raise HTTPException(status_code=404, detail="Reminder not found")
@@ -1226,7 +1314,11 @@ class CallRequest(BaseModel):
 
 
 @app.post("/call", tags=["Outbound Calls"])
-async def initiate_call(payload: CallRequest, api_key: str = Depends(get_api_key)):
+async def initiate_call(
+    payload: CallRequest,
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
     """
     Initiate a context-aware outbound call via Bolna.
 
@@ -1438,7 +1530,11 @@ class TestWhatsAppRequest(BaseModel):
 
 
 @app.post("/test-whatsapp", tags=["WhatsApp"])
-def test_whatsapp(payload: TestWhatsAppRequest, api_key: str = Depends(get_api_key)):
+def test_whatsapp(
+    payload: TestWhatsAppRequest,
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
     """
     Send a test WhatsApp message to verify Twilio integration.
     Set USE_TWILIO=true and USE_WHATSAPP=true in .env to actually send.
@@ -1451,7 +1547,11 @@ def test_whatsapp(payload: TestWhatsAppRequest, api_key: str = Depends(get_api_k
 
 
 @app.post("/notify", tags=["WhatsApp"])
-async def manual_notify(request: Request, api_key: str = Depends(get_api_key)):
+async def manual_notify(
+    request: Request,
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
     """
     Manually trigger a WhatsApp alert to a caregiver.
     Useful for testing the full alert pipeline without a real call.
@@ -1618,11 +1718,15 @@ class ProfileSetupRequest(BaseModel):
     tts_provider: Optional[str] = "elevenlabs"
 
 @app.post("/setup-profile")
-async def setup_profile(req: ProfileSetupRequest, api_key: str = Depends(get_api_key)):
+async def setup_profile(
+    req: ProfileSetupRequest,
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
     """Upsert profile and family contacts from the frontend onboarding."""
     try:
         user_id = upsert_user_profile(
-            clerk_id=req.clerk_id,
+            clerk_id=verified_uid or req.clerk_id,
             name=req.elder_name,
             phone=req.elder_phone,
             age=req.elder_age,
@@ -1643,8 +1747,15 @@ async def setup_profile(req: ProfileSetupRequest, api_key: str = Depends(get_api
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/setup-profile")
-async def get_profile(clerk_id: str, api_key: str = Depends(get_api_key)):
-    profile = get_user_profile(clerk_id)
+async def get_profile(
+    clerk_id: Optional[str] = Query(None, description="Legacy dev-mode identifier — ignored when a verified Clerk session is present"),
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
+    uid = verified_uid or clerk_id
+    if not uid:
+        raise HTTPException(status_code=401, detail="Missing clerk_id")
+    profile = get_user_profile(uid)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
     return profile
@@ -1656,10 +1767,14 @@ class FamilyContactRequest(BaseModel):
     relationship: str
 
 @app.post("/family-contacts")
-async def add_family_contact(req: FamilyContactRequest, api_key: str = Depends(get_api_key)):
+async def add_family_contact(
+    req: FamilyContactRequest,
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
     """Add a single family contact."""
     try:
-        profile = get_user_profile(req.clerk_id)
+        profile = get_user_profile(verified_uid or req.clerk_id)
         if not profile:
             raise HTTPException(status_code=404, detail="Elder profile not found")
             
@@ -1672,12 +1787,19 @@ async def add_family_contact(req: FamilyContactRequest, api_key: str = Depends(g
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/family-contacts")
-async def get_family_contacts_route(clerk_id: str, api_key: str = Depends(get_api_key)):
+async def get_family_contacts_route(
+    clerk_id: Optional[str] = Query(None, description="Legacy dev-mode identifier — ignored when a verified Clerk session is present"),
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
+    uid = verified_uid or clerk_id
+    if not uid:
+        return []
     try:
-        profile = get_user_profile(clerk_id)
+        profile = get_user_profile(uid)
         if not profile:
             # Return empty list rather than 404 — frontend expects an array, not an error
-            logger.warning(f"[FAMILY-CONTACTS] No profile for clerk_id={clerk_id!r}, returning []")
+            logger.warning(f"[FAMILY-CONTACTS] No profile for clerk_id={uid!r}, returning []")
             return []
             
         contacts = get_family_contacts(str(profile["user_id"]))
@@ -1715,8 +1837,9 @@ async def delete_family_contact_route(contact_id: str, api_key: str = Depends(ge
 
 @app.post("/upload-document")
 async def upload_document(
-    file: UploadFile = File(...), 
+    file: UploadFile = File(...),
     clerk_id: str = Form(None),
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
     api_key: str = Depends(get_api_key)
 ):
     """MVP file upload: save to local uploads directory and parse with Gemini."""
@@ -1733,6 +1856,9 @@ async def upload_document(
             detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
         )
 
+    # A verified Clerk session (production) wins over the legacy form field;
+    # in dev mode (no CLERK_SECRET_KEY) the field is used unchanged.
+    uid = verified_uid or clerk_id
     MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
     file_path = None
     try:
@@ -1766,7 +1892,7 @@ async def upload_document(
             
         extracted_notes = ""
         gemini_key = os.environ.get("GEMINI_API_KEY")
-        if gemini_key and clerk_id:
+        if gemini_key and uid:
             try:
                 client = genai.Client(api_key=gemini_key)
                 uploaded_file = client.files.upload(file=file_path)
@@ -1779,12 +1905,12 @@ async def upload_document(
                 
                 # Update the database
                 if extracted_notes:
-                    profile = get_user_profile(clerk_id)
+                    profile = get_user_profile(uid)
                     if profile:
                         existing_notes = profile.get("medical_notes") or ""
                         new_notes = existing_notes + f"\n\n[Extracted from {file.filename}]:\n{extracted_notes}"
                         upsert_user_profile(
-                            clerk_id=clerk_id,
+                            clerk_id=uid,
                             name=profile["name"],
                             phone=profile["phone"],
                             age=profile["age"],
