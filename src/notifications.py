@@ -321,6 +321,24 @@ def build_routine_update_message(
 # Twilio send
 # ---------------------------------------------------------------------------
 
+def _twilio_sid_label(sid: str) -> str:
+    """
+    Classify a Twilio SID so account-vs-API-key mismatches are obvious in logs.
+
+    'AC…' = Account SID — pairs with the Account Auth Token, which is the same
+    secret Twilio uses to sign inbound webhook signatures.
+    'SK…' = API Key SID — pairs with an API Key Secret. Authenticates API calls
+    fine, but CANNOT validate webhook signatures (Twilio always signs with the
+    Account Auth Token), so a backend configured with an SK key rejects every
+    real inbound webhook with 403 → Twilio error 12300.
+    """
+    if sid.startswith("AC"):
+        return "AC Account SID"
+    if sid.startswith("SK"):
+        return "SK API Key SID (webhook signatures will NOT validate — needs the Account Auth Token)"
+    return "Twilio SID"
+
+
 def _twilio_send(to_phone: str, body: str, notification_type: str = "whatsapp") -> Tuple[bool, Optional[str]]:
     """
     Internal: dispatch a message via Twilio.
@@ -332,24 +350,36 @@ def _twilio_send(to_phone: str, body: str, notification_type: str = "whatsapp") 
         logger.warning(f"[TWILIO] {err} — skipping send.")
         return False, err
 
+    # Masked SID in every log line so an account mismatch (AC vs SK, or a wrong
+    # account entirely) is visible at a glance without leaking the full key.
+    masked_sid = (
+        f"{TWILIO_ACCOUNT_SID[:2]}…{TWILIO_ACCOUNT_SID[-4:]}"
+        if len(TWILIO_ACCOUNT_SID) > 6
+        else TWILIO_ACCOUNT_SID
+    )
+
+    if USE_WHATSAPP or notification_type == "whatsapp":
+        from_num = (
+            TWILIO_FROM_PHONE
+            if TWILIO_FROM_PHONE.startswith("whatsapp:")
+            else f"whatsapp:{TWILIO_FROM_PHONE}"
+        )
+        to_num = (
+            to_phone
+            if to_phone.startswith("whatsapp:")
+            else f"whatsapp:{to_phone}"
+        )
+    else:
+        from_num = TWILIO_FROM_PHONE
+        to_num   = to_phone
+
     try:
         from twilio.rest import Client
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-        if USE_WHATSAPP or notification_type == "whatsapp":
-            from_num = (
-                TWILIO_FROM_PHONE
-                if TWILIO_FROM_PHONE.startswith("whatsapp:")
-                else f"whatsapp:{TWILIO_FROM_PHONE}"
-            )
-            to_num = (
-                to_phone
-                if to_phone.startswith("whatsapp:")
-                else f"whatsapp:{to_phone}"
-            )
-        else:
-            from_num = TWILIO_FROM_PHONE
-            to_num   = to_phone
+        logger.info(
+            f"[TWILIO] Sending via {_twilio_sid_label(TWILIO_ACCOUNT_SID)} "
+            f"({masked_sid}) → {to_phone}"
+        )
 
         kwargs = {"from_": from_num, "to": to_num}
         if TWILIO_CONTENT_SID and (USE_WHATSAPP or notification_type == "whatsapp"):
@@ -369,12 +399,17 @@ def _twilio_send(to_phone: str, body: str, notification_type: str = "whatsapp") 
             _handle_twilio_quota_error(to_phone, err_msg)
         elif "21654" in err_msg or "ContentSid Required" in err_msg:
             logger.error(
-                f"[TWILIO] Send failed to {to_phone}: Twilio Error 21654 (ContentSid Required). "
-                f"WhatsApp requires a registered Content Template (set TWILIO_CONTENT_SID in .env) "
+                f"[TWILIO] Send failed to {to_phone} via {_twilio_sid_label(TWILIO_ACCOUNT_SID)} "
+                f"({masked_sid}): Twilio Error 21654 (ContentSid Required). "
+                f"WhatsApp requires a registered Content Template (set TWILIO_CONTENT_SID in .env — "
+                f"currently {'set' if TWILIO_CONTENT_SID else 'UNSET'}) "
                 f"or the recipient number must send the sandbox join code to {from_num} on WhatsApp."
             )
         else:
-            logger.error(f"[TWILIO] Send failed to {to_phone}: {err_msg}")
+            logger.error(
+                f"[TWILIO] Send failed to {to_phone} via {_twilio_sid_label(TWILIO_ACCOUNT_SID)} "
+                f"({masked_sid}): {err_msg}"
+            )
         return False, err_msg
 
 

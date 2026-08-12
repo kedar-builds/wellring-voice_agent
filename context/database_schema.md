@@ -18,7 +18,7 @@ Stores both elderly patients and caregiver profiles.
 | Column | Type | Description |
 |---|---|---|
 | `user_id` | UUID (PK) | Auto-generated primary key |
-| `firebase_uid` | Text (UNIQUE) | Firebase authentication UID |
+| `clerk_id` | Text (UNIQUE) | Firebase authentication UID |
 | `name` | Text | User's name |
 | `age` | Integer | Age (1–149) |
 | `role` | Text | `'elderly'` or `'caregiver'` |

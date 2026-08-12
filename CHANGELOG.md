@@ -11,6 +11,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- `scripts/gen_railway_twilio_env.py` — validates the local `.env` Twilio
+  credentials against the API and prints the exact env-var block to paste into
+  Railway so the deployed backend uses the same Twilio account (the one that
+  owns the WhatsApp number + its Account Auth Token). Warns when the SID is an
+  `SK…` API key (webhook signatures can never validate) or `TWILIO_CONTENT_SID`
+  is unset (outbound 21654 outside the 24h window).
 - `context/README.md` — documented the frontend ↔ backend connection and the
   requirement that the deployed frontend bundle send the current `WELLRING_API_KEY`
   (the removed `wellring-secure-2026` key is rejected with 401).
@@ -77,6 +83,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   re-fire once.
 - `/upload-document`: 10 MB size cap, always deletes the local temp file (success or
   error), and no longer returns the server filesystem path (sanitized filename only).
+- Twilio diagnostics: `_twilio_send` and `_twilio_request_valid` now log the
+  masked Twilio SID plus its kind (`AC…` Account SID vs `SK…` API Key SID) on
+  every send and every webhook rejection — an account mismatch is visible in one
+  log line. Root cause it surfaced: Railway ran an `SK…` API key while Twilio
+  signs webhooks with the Account Auth Token, so every inbound WhatsApp message
+  was 403-rejected (Twilio error 12300) and outbound standalone sends failed
+  with 21654 (no `TWILIO_CONTENT_SID`).
+- `_twilio_send` computes the WhatsApp sender/recipient addresses before the
+  API call, so the 21654 (ContentSid Required) error path can report the `from`
+  number without risking a `NameError`.
+  *Verification: `pytest tests/test_twilio_webhook.py tests/test_notifications.py -q`
+  → 21 passed in 6.58s (2026-08-07)*
+- Cross-account data isolation completed across the remaining dashboard surfaces
+  (the deployed Railway backend was still running the pre-isolation build that
+  returned every account's data — redeploying fixes the reported "common
+  dashboard" leak):
+  - `/timeline` accepts `clerk_id` and only resolves the elder owned by that
+    uid (legacy phone-only lookup preserved when omitted); an unmatched phone now
+    returns `[]` instead of every user's interactions (SQLite fallback removed).
+  - `/recordings/{assessment_id}` accepts `clerk_id` and enforces ownership
+    (404 unless the assessment belongs to the caller's elder).
+  - Reminders now carry an owner `user_id` (`POST /reminders` resolves the elder
+    from the optional `clerk_id` body field) and `GET /reminders?clerk_id=`
+    scopes by owner, falling back to phone matching only for pre-ownership rows.
+    `reminders.user_id` is self-healing on Postgres (startup ALTER) and SQLite
+    (migration).
+  - 5 new regression tests in `tests/test_data_isolation.py` pin the isolation
+    contract; `pytest.ini` `python_files` allowlist updated.
+  *Verification: `pytest -q` → 93 passed in ~16s (2026-08-07)*
 - `analyze_emotion_from_audio` always cleans up its temp audio file, even on Gemini failure.
 - `/bolna-webhook` token check uses `secrets.compare_digest` (timing-safe) and rejects
   missing tokens. (Secret still travels in the query string — Bolna limitation.)
@@ -91,7 +126,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     before analysis (the "garbled transcript" on the dashboard).
   - `analyze_transcript_for_health_issues` prompt now maps patient speech to the exact
     `SYMPTOM_WEIGHTS` vocabulary.
-  - `get_user_by_phone` prefers the onboarded (`firebase_uid`) profile when multiple users
+  - `get_user_by_phone` prefers the onboarded (`clerk_id`) profile when multiple users
     share a phone (e.g. `Test User` vs `Mr. Sharma` both `+918421971145`) — future calls
     attribute to the real dashboard user.
   - SQLite `interactions` now persists `bolna_call_id` (CREATE TABLE + `_migrate_sqlite_schema`

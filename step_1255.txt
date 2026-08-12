@@ -1,0 +1,11 @@
+I've investigated the issue and found exactly why you didn't receive the WhatsApp message despite the call coming through!
+
+There are two main reasons this happened:
+
+### 1. The Call Hit a 2-Minute Time Limit
+Looking at the `output.json` transcript, the call was abruptly terminated at exactly 120.0 seconds (Bolna's default maximum call duration limit for some configurations). The AI was cut off mid-sentence while trying to respond to you: 
+`"Since you've had fever and cold since last night, please make su..."`
+Because the call ended before the AI had a chance to evaluate your symptoms, it never actually triggered the `assess_health_risk` tool! 
+
+### 2. Testing with `test_bolna_call.py` Bypasses Your Local Server
+<truncated 2288 bytes>

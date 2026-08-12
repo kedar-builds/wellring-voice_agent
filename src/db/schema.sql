@@ -29,7 +29,7 @@
 
 CREATE TABLE IF NOT EXISTS users (
     user_id         UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
-    firebase_uid    TEXT            UNIQUE,
+    clerk_id    TEXT            UNIQUE,
     name            TEXT            NOT NULL,
     age             INTEGER         CHECK (age > 0 AND age < 150),
     role            TEXT            NOT NULL DEFAULT 'elderly'
@@ -290,3 +290,29 @@ CREATE TABLE IF NOT EXISTS appointments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_appointments_created_at ON appointments(created_at DESC);
+
+
+-- ---------------------------------------------------------------------------
+-- 8. NEMOTRON_AUDITS
+-- ---------------------------------------------------------------------------
+-- Audit trail for the Nemotron watchdog: every time the watchdog reviews an
+-- assessment, a row is written here (original vs final score/risk, whether it
+-- self-corrected, and why). Mirrors the SQLite table created in init_db.
+
+CREATE TABLE IF NOT EXISTS nemotron_audits (
+    id              BIGSERIAL       PRIMARY KEY,
+    created_at      TEXT            NOT NULL,
+    user_id         TEXT,
+    assessment_id   TEXT,
+    original_score  INTEGER,
+    original_risk   TEXT,
+    final_score     INTEGER,
+    final_risk      TEXT,
+    self_corrected  BOOLEAN         NOT NULL DEFAULT FALSE,
+    override_reason TEXT,
+    raw_payload     JSONB,
+    audit_status    TEXT            NOT NULL DEFAULT 'PASSED'
+);
+
+CREATE INDEX IF NOT EXISTS idx_nemotron_audits_created_at ON nemotron_audits(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_nemotron_audits_self_corrected ON nemotron_audits(self_corrected);

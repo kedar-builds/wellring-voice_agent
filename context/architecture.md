@@ -71,7 +71,7 @@ graph TD;
 erDiagram
     USERS {
         UUID    user_id         PK
-        TEXT    firebase_uid    UK
+        TEXT    clerk_id    UK
         TEXT    name
         INT     age
         TEXT    role
@@ -181,7 +181,7 @@ Primary store for **elderly patients** and their linked **caregivers**.
 | Column | Type | Notes |
 |---|---|---|
 | `user_id` | `UUID PK` | Auto-generated, used for all joins |
-| `firebase_uid` | `TEXT UNIQUE` | Firebase Auth UID — login link |
+| `clerk_id` | `TEXT UNIQUE` | Firebase Auth UID — login link |
 | `name` | `TEXT NOT NULL` | Display name |
 | `age` | `INTEGER` | Validated: 1–149 |
 | `role` | `TEXT` | `'elderly'` or `'caregiver'` |

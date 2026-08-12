@@ -100,6 +100,40 @@ On detection, the assistant is instructed to immediately tell the patient to cal
 - File uploads are validated for allowed types (PDF, images only).
 - **Never commit `.env` to git.** Use `.env.example` as a template.
 
+## 🗄️ Using Supabase as the main database
+
+Supabase is managed PostgreSQL, and the backend is already Postgres-first
+(`DATABASE_URL` + `src/db/schema.sql` + self-healing `init_pg_tables()` at
+startup). Switching to Supabase requires **no code changes** — only a new
+connection string.
+
+### Steps
+
+1. **Create a Supabase project** and open **Project Settings → Database →
+   Connection string**. Copy the **URI** (direct connection, port `5432`) or the
+   Transaction pooler URI (port `6543`, for connection limits).
+2. **Migrate + verify** from this repo (one command):
+
+   ```bash
+   SUPABASE_DATABASE_URL="postgresql://postgres.xxxx:password@aws-0-xx.pooler.supabase.com:5432/postgres" \
+     python scripts/setup_supabase.py
+   ```
+
+   This applies `src/db/schema.sql` (users, assessments, alerts, conversations,
+   health_history, reminders, …) and runs a full verification suite (tables,
+   key columns including `reminders.user_id`, read/write round-trip).
+3. **Set `DATABASE_URL`** to the same connection string in Railway (or `.env`)
+   and redeploy. On startup the app self-heals any missing columns and seeds
+   the anonymous system user.
+
+### Notes
+
+- Supabase's own `auth.users` table lives in the same Postgres instance — if you
+  later switch login to Supabase Auth, the login data and app data stay together.
+  Until then, the app keeps linking accounts via the `users.clerk_id` column.
+- The pooler URI may include `?sslmode=require` — that's fine for psycopg2.
+- Local dev/tests keep using SQLite (`WELLRING_DB_PATH`); they never touch this DB.
+
 ## 🔌 Frontend ↔ Backend Connection
 
 The caregiver dashboard is a **separate React repo** deployed on Vercel
@@ -121,16 +155,26 @@ from the backend's `WELLRING_API_KEY` env var.
 
 ### Frontend feature → backend endpoint map
 
+> **Per-user isolation (required contract):** every data-returning dashboard
+> endpoint scopes by the current Firebase UID. The frontend MUST pass
+> `clerk_id` as a query param (or in the POST body) on every request below.
+> Without it the endpoints return **empty** results — they never fall back to
+> returning every account's data (that fallback was the "common dashboard"
+> cross-account leak).
+
 | Frontend feature | Backend route |
 |---|---|
 | Health indicator | `GET /health` |
-| Dashboard feed | `GET /assessments?limit=50` |
-| Call timeline | `GET /timeline?phone=…&limit=365` |
-| Reminders (list/add/delete) | `GET/POST /reminders`, `DELETE /reminders/{id}` |
-| Profile | `GET/POST /setup-profile` |
-| Family contacts | `GET/POST /family-contacts`, `DELETE /family-contacts/{id}` |
+| Dashboard feed | `GET /assessments?clerk_id=…&limit=50` |
+| Dashboard stats | `GET /assessments/stats?clerk_id=…` |
+| Call timeline | `GET /timeline?phone=…&limit=365&clerk_id=…` |
+| Elder list | `GET /patients?clerk_id=…` |
+| Reminders (list/add/delete) | `GET /reminders?clerk_id=…`, `POST /reminders` (body includes `clerk_id`), `DELETE /reminders/{id}` |
+| Profile | `GET/POST /setup-profile` (body/query `clerk_id`) |
+| Family contacts | `GET/POST /family-contacts` (`clerk_id`), `DELETE /family-contacts/{id}` |
+| Recording playback | `GET /recordings/{assessment_id}?clerk_id=…` |
 | Outbound call (immediate) | `POST /call` `{phone}` |
-| Scheduled AI check-in call | `POST /reminders` `{type: "call", time, frequency, phone}` |
+| Scheduled AI check-in call | `POST /reminders` `{type: "call", time, frequency, phone, clerk_id}` |
 
 > The frontend also calls Vercel-relative paths (`/api/ai-simulator`, `/api/ai-evaluate`,
 > `/api/profile*`) that are served by the frontend repo's own serverless functions — not

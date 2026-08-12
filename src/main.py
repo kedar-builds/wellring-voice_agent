@@ -98,7 +98,7 @@ from src.database import (
     add_single_family_contact, get_user_by_phone, get_call_timeline, log_conversation_turn,
     normalize_phone, get_anonymous_user_id, assessment_exists_for_call,
 )
-from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp, send_unanswered_call_alert, twilio_quota_exhausted
+from src.notifications import trigger_alerts_if_needed, send_whatsapp_reminder, send_test_whatsapp, send_unanswered_call_alert, twilio_quota_exhausted, _twilio_sid_label
 from src.watchdog import run_watchdog
 
 # ---------------------------------------------------------------------------
@@ -347,7 +347,7 @@ def seed_demo_data():
     if not profile:
         logger.info("Seeding demo data for Mr. Sharma...")
         upsert_user_profile(
-            firebase_uid=DEMO_UID,
+            clerk_id=DEMO_UID,
             name="Mr. Sharma",
             phone="+919876543210",
             age=72,
@@ -596,13 +596,21 @@ def config_check(api_key: str = Depends(get_api_key)):
 
 
 @app.get("/recordings/{assessment_id}", tags=["Recordings"])
-async def get_recording(assessment_id: str, api_key: str = Depends(get_api_key)):
+async def get_recording(
+    assessment_id: str,
+    clerk_id: Optional[str] = Query(None, description="Require the assessment to belong to this caregiver's elder"),
+    api_key: str = Depends(get_api_key),
+):
     """
     Fetch a temporary pre-signed URL for the call recording linked to an assessment.
 
     The recording_url stored in Postgres (assessments table) is the permanent B2
     object path. This endpoint signs it so the frontend can stream/download it
     securely without exposing raw B2 credentials.
+
+    Pass `clerk_id` to enforce ownership: the assessment must belong to an
+    elder registered under that uid, otherwise a 404 is returned. This stops a
+    caller from fetching other accounts' recordings by guessing an ID.
 
     Returns:
         { assessment_id, presigned_url, expires_in_seconds }
@@ -616,10 +624,19 @@ async def get_recording(assessment_id: str, api_key: str = Depends(get_api_key))
     try:
         with get_pg_conn() as conn:
             with _pg_cursor(conn) as cur:
-                cur.execute(
-                    "SELECT recording_url FROM assessments WHERE assessment_id = %s",
-                    (assessment_id,)
-                )
+                if clerk_id:
+                    cur.execute(
+                        "SELECT recording_url FROM assessments "
+                        "WHERE assessment_id = %s "
+                        "AND user_id IN (SELECT user_id FROM users "
+                        "WHERE clerk_id = %s AND role = 'elderly')",
+                        (assessment_id, clerk_id),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT recording_url FROM assessments WHERE assessment_id = %s",
+                        (assessment_id,)
+                    )
                 row = cur.fetchone()
     except Exception as exc:
         logger.error(f"[RECORDING] DB error: {exc}")
@@ -1005,30 +1022,31 @@ def list_risk_levels():
 def get_assessments(
     limit: int = Query(50, ge=1, le=500),
     risk_level: Optional[str] = None,
-    firebase_uid: Optional[str] = Query(None, description="Filter to a specific user's assessments"),
+    clerk_id: Optional[str] = Query(None, description="Filter to a specific user's assessments"),
     api_key: str = Depends(get_api_key),
 ):
     """Returns recent assessments (interactions) for the dashboard feed."""
-    if not firebase_uid:
+    if not clerk_id:
         return []
-    return get_assessments_list(limit=limit, risk_level=risk_level, firebase_uid=firebase_uid)
+    return get_assessments_list(limit=limit, risk_level=risk_level, clerk_id=clerk_id)
 
 
 @app.get("/assessments/stats", tags=["Dashboard"])
 def get_assessment_stats_endpoint(
-    firebase_uid: Optional[str] = Query(None, description="Filter stats to a specific user"),
+    clerk_id: Optional[str] = Query(None, description="Filter stats to a specific user"),
     api_key: str = Depends(get_api_key)
 ):
     """Returns counts for dashboard cards."""
-    if not firebase_uid:
+    if not clerk_id:
         return {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
-    return get_assessment_stats(firebase_uid=firebase_uid)
+    return get_assessment_stats(clerk_id=clerk_id)
 
 
 @app.get("/timeline", tags=["Timeline"])
 def get_call_timeline_endpoint(
     phone: str = Query(..., min_length=5),
     limit: int = Query(365, ge=1, le=2000),
+    clerk_id: Optional[str] = Query(None, description="Scope the lookup to this caregiver's elder (recommended — prevents reading other accounts' timelines by guessing a phone)"),
     api_key: str = Depends(get_api_key),
 ):
     """
@@ -1043,10 +1061,13 @@ def get_call_timeline_endpoint(
       - score       : integer risk score
 
     Results are ordered oldest → newest so the frontend can group by date.
+
+    Pass `clerk_id` to enforce ownership: the phone must belong to the
+    elder registered under that uid, otherwise an empty timeline is returned.
     """
     if not phone:
         raise HTTPException(status_code=422, detail="phone query parameter is required")
-    entries = get_call_timeline(phone=phone, limit=limit)
+    entries = get_call_timeline(phone=phone, limit=limit, clerk_id=clerk_id)
     return {
         "phone":   phone,
         "total":   len(entries),
@@ -1056,14 +1077,14 @@ def get_call_timeline_endpoint(
 
 @app.get("/patients", tags=["Dashboard"])
 def get_patients(
-    firebase_uid: Optional[str] = Query(None, description="Return only the elder for this caregiver"),
+    clerk_id: Optional[str] = Query(None, description="Return only the elder for this caregiver"),
     api_key: str = Depends(get_api_key),
 ):
     """Returns elderly patients registered by the requesting caregiver."""
-    if not firebase_uid:
+    if not clerk_id:
         return []
     from src.database import get_all_patients
-    patients = get_all_patients(firebase_uid=firebase_uid)
+    patients = get_all_patients(clerk_id=clerk_id)
     if patients:
         return patients
     # Fallback — return empty list for new users who haven't onboarded yet
@@ -1077,6 +1098,7 @@ class ReminderCreate(BaseModel):
     frequency: str = Field(..., description="daily | weekly | monthly | yearly | once")
     phone: str = Field(..., description="WhatsApp phone number")
     notes: Optional[str] = None
+    clerk_id: Optional[str] = Field(None, description="Owner's Firebase UID — resolves the elder the reminder belongs to, so reminders stay isolated per account")
 
     @field_validator("type")
     @classmethod
@@ -1120,25 +1142,38 @@ class ReminderCreate(BaseModel):
 
 @app.get("/reminders", tags=["Reminders"])
 def list_reminders(
-    firebase_uid: Optional[str] = Query(None, description="Return only reminders for this user's elder"),
+    clerk_id: Optional[str] = Query(None, description="Return only reminders for this user's elder"),
     api_key: str = Depends(get_api_key),
 ):
-    """Retrieve reminders, scoped to the requesting user's elder when firebase_uid is supplied."""
-    if not firebase_uid:
+    """Retrieve reminders, scoped to the requesting user's elder when clerk_id is supplied."""
+    if not clerk_id:
         return []
-    return get_reminders(firebase_uid=firebase_uid)
+    return get_reminders(clerk_id=clerk_id)
 
 
 @app.post("/reminders", tags=["Reminders"], status_code=status.HTTP_201_CREATED)
 def create_reminder(payload: ReminderCreate, api_key: str = Depends(get_api_key)):
-    """Create a new reminder schedule."""
+    """Create a new reminder schedule.
+
+    When `clerk_id` is supplied the reminder is owned by that caregiver's
+    elder (user_id is stored on the row) so /reminders scoping never crosses
+    accounts — even when two accounts share the same elder phone.
+    """
+    elder_user_id = None
+    if payload.clerk_id:
+        profile = get_user_profile(payload.clerk_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail="Elder profile not found for clerk_id")
+        elder_user_id = str(profile["user_id"])
+
     reminder_id = add_reminder(
         type_val=payload.type,
         title=payload.title,
         time_val=payload.time,
         frequency=payload.frequency,
         phone=payload.phone,
-        notes=payload.notes
+        notes=payload.notes,
+        user_id=elder_user_id,
     )
     return {"id": reminder_id, "message": "Reminder scheduled successfully"}
 
@@ -1470,10 +1505,13 @@ def _twilio_request_valid(request: Request, form: Dict[str, str]) -> bool:
 
     Twilio signs every webhook request with an HMAC of the full request URL
     plus its POST params, keyed by the account auth token. Without this check
-    anyone could spoof inbound WhatsApp messages. If TWILIO_AUTH_TOKEN is not
-    configured we skip validation (dev mode) but warn loudly so it's noticed.
+    anyone could spoof inbound WhatsApp messages. The webhook FAILS CLOSED:
+    when TWILIO_AUTH_TOKEN is unset it is rejected unless the explicit dev
+    bypass ALLOW_UNSIGNED_TWILIO_WEBHOOKS=true is set.
     """
     token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+    sid = os.environ.get("TWILIO_ACCOUNT_SID", "")
+    masked_sid = f"{sid[:2]}…{sid[-4:]}" if len(sid) > 6 else (sid or "<unset>")
     if not token:
         # Fail closed: if the token is missing in production the webhook would
         # otherwise be fully open to spoofed inbound messages. An explicit dev
@@ -1487,7 +1525,8 @@ def _twilio_request_valid(request: Request, form: Dict[str, str]) -> bool:
             return True
         logger.error(
             "[TWILIO-WEBHOOK] TWILIO_AUTH_TOKEN not set and ALLOW_UNSIGNED_TWILIO_WEBHOOKS not enabled — "
-            "rejecting unsigned webhook (fail closed). Set TWILIO_AUTH_TOKEN in production."
+            f"rejecting unsigned webhook (fail closed). Backend Twilio SID: {masked_sid} "
+            f"({_twilio_sid_label(sid)}). Set TWILIO_AUTH_TOKEN to the Account Auth Token in production."
         )
         return False
     signature = request.headers.get("X-Twilio-Signature", "")
@@ -1495,7 +1534,15 @@ def _twilio_request_valid(request: Request, form: Dict[str, str]) -> bool:
         return False
     try:
         from twilio.request_validator import RequestValidator
-        return RequestValidator(token).validate(str(request.url), form, signature)
+        valid = RequestValidator(token).validate(str(request.url), form, signature)
+        if not valid:
+            logger.error(
+                "[TWILIO-WEBHOOK] Invalid Twilio signature. If inbound WhatsApp keeps failing with "
+                f"Twilio error 12300, this backend's TWILIO_AUTH_TOKEN does not match the account "
+                f"that owns the WhatsApp number. Backend SID: {masked_sid} ({_twilio_sid_label(sid)}). "
+                "Twilio always signs webhooks with the Account Auth Token."
+            )
+        return valid
     except Exception as exc:
         logger.error(f"[TWILIO-WEBHOOK] Signature validation error: {exc}")
         return False
@@ -1526,7 +1573,12 @@ async def twilio_webhook(request: Request):
 
     params: Dict[str, str] = {k: str(v) for k, v in form.items()}
     if not _twilio_request_valid(request, params):
-        logger.warning("[TWILIO-WEBHOOK] Rejected request with invalid/missing Twilio signature.")
+        logger.warning(
+            "[TWILIO-WEBHOOK] Rejected request with invalid/missing Twilio signature. "
+            "Inbound WhatsApp failing with Twilio error 12300 usually means this backend's "
+            "TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN don't match the account that owns the "
+            "WhatsApp number (Twilio signs webhooks with the Account Auth Token)."
+        )
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     sender = params.get("From", "unknown")
@@ -1555,7 +1607,7 @@ async def twilio_webhook(request: Request):
 # ===========================================================================
 
 class ProfileSetupRequest(BaseModel):
-    firebase_uid: str
+    clerk_id: str
     elder_name: str
     elder_phone: str
     elder_age: Optional[int] = None
@@ -1570,7 +1622,7 @@ async def setup_profile(req: ProfileSetupRequest, api_key: str = Depends(get_api
     """Upsert profile and family contacts from the frontend onboarding."""
     try:
         user_id = upsert_user_profile(
-            firebase_uid=req.firebase_uid,
+            clerk_id=req.clerk_id,
             name=req.elder_name,
             phone=req.elder_phone,
             age=req.elder_age,
@@ -1591,14 +1643,14 @@ async def setup_profile(req: ProfileSetupRequest, api_key: str = Depends(get_api
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/setup-profile")
-async def get_profile(firebase_uid: str, api_key: str = Depends(get_api_key)):
-    profile = get_user_profile(firebase_uid)
+async def get_profile(clerk_id: str, api_key: str = Depends(get_api_key)):
+    profile = get_user_profile(clerk_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
     return profile
 
 class FamilyContactRequest(BaseModel):
-    firebase_uid: str
+    clerk_id: str
     name: str
     phone: str
     relationship: str
@@ -1607,7 +1659,7 @@ class FamilyContactRequest(BaseModel):
 async def add_family_contact(req: FamilyContactRequest, api_key: str = Depends(get_api_key)):
     """Add a single family contact."""
     try:
-        profile = get_user_profile(req.firebase_uid)
+        profile = get_user_profile(req.clerk_id)
         if not profile:
             raise HTTPException(status_code=404, detail="Elder profile not found")
             
@@ -1620,12 +1672,12 @@ async def add_family_contact(req: FamilyContactRequest, api_key: str = Depends(g
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/family-contacts")
-async def get_family_contacts_route(firebase_uid: str, api_key: str = Depends(get_api_key)):
+async def get_family_contacts_route(clerk_id: str, api_key: str = Depends(get_api_key)):
     try:
-        profile = get_user_profile(firebase_uid)
+        profile = get_user_profile(clerk_id)
         if not profile:
             # Return empty list rather than 404 — frontend expects an array, not an error
-            logger.warning(f"[FAMILY-CONTACTS] No profile for firebase_uid={firebase_uid!r}, returning []")
+            logger.warning(f"[FAMILY-CONTACTS] No profile for clerk_id={clerk_id!r}, returning []")
             return []
             
         contacts = get_family_contacts(str(profile["user_id"]))
@@ -1664,7 +1716,7 @@ async def delete_family_contact_route(contact_id: str, api_key: str = Depends(ge
 @app.post("/upload-document")
 async def upload_document(
     file: UploadFile = File(...), 
-    firebase_uid: str = Form(None),
+    clerk_id: str = Form(None),
     api_key: str = Depends(get_api_key)
 ):
     """MVP file upload: save to local uploads directory and parse with Gemini."""
@@ -1714,7 +1766,7 @@ async def upload_document(
             
         extracted_notes = ""
         gemini_key = os.environ.get("GEMINI_API_KEY")
-        if gemini_key and firebase_uid:
+        if gemini_key and clerk_id:
             try:
                 client = genai.Client(api_key=gemini_key)
                 uploaded_file = client.files.upload(file=file_path)
@@ -1727,12 +1779,12 @@ async def upload_document(
                 
                 # Update the database
                 if extracted_notes:
-                    profile = get_user_profile(firebase_uid)
+                    profile = get_user_profile(clerk_id)
                     if profile:
                         existing_notes = profile.get("medical_notes") or ""
                         new_notes = existing_notes + f"\n\n[Extracted from {file.filename}]:\n{extracted_notes}"
                         upsert_user_profile(
-                            firebase_uid=firebase_uid,
+                            clerk_id=clerk_id,
                             name=profile["name"],
                             phone=profile["phone"],
                             age=profile["age"],

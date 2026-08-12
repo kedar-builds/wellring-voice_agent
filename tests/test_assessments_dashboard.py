@@ -8,9 +8,9 @@ Tests for:
 4. users.get_user SQLite and Postgres paths
 
 Data-isolation contract (commit "Fix data leak on endpoints by requiring
-firebase_uid"): every dashboard endpoint must return EMPTY / zeroed results
-when no firebase_uid is supplied, and only the requesting user's data when a
-valid firebase_uid is supplied. These tests pin that behaviour so the "common
+clerk_id"): every dashboard endpoint must return EMPTY / zeroed results
+when no clerk_id is supplied, and only the requesting user's data when a
+valid clerk_id is supplied. These tests pin that behaviour so the "common
 dashboard" bug (every account seeing every other account's data) can't regress.
 """
 
@@ -21,9 +21,9 @@ from unittest.mock import patch, MagicMock
 from src.database import log_interaction
 from src.users import get_user
 
-# The elder row bound to a firebase_uid — the interactions below belong to it.
+# The elder row bound to a clerk_id — the interactions below belong to it.
 TEST_USER_ID = "test_dashboard_user"
-TEST_FIREBASE_UID = "dashboard_uid_001"
+TEST_CLERK_ID = "dashboard_uid_001"
 
 
 def _seed_dashboard_user():
@@ -31,9 +31,9 @@ def _seed_dashboard_user():
     db_path = os.environ["WELLRING_DB_PATH"]
     conn = sqlite3.connect(db_path)
     conn.execute(
-        "INSERT OR REPLACE INTO users (user_id, firebase_uid, name, role, is_system) "
+        "INSERT OR REPLACE INTO users (user_id, clerk_id, name, role, is_system) "
         "VALUES (?, ?, ?, 'elderly', 0)",
-        (TEST_USER_ID, TEST_FIREBASE_UID, "Test Elder"),
+        (TEST_USER_ID, TEST_CLERK_ID, "Test Elder"),
     )
     conn.commit()
     conn.close()
@@ -69,14 +69,14 @@ def test_sqlite_dashboard_endpoints(client):
         "user_id": TEST_USER_ID
     })
 
-    # 0. Data-isolation guard: WITHOUT firebase_uid the dashboard must be EMPTY
+    # 0. Data-isolation guard: WITHOUT clerk_id the dashboard must be EMPTY
     # (never every account's data — that was the "common dashboard" bug).
     r = client.get("/assessments?limit=1")
     assert r.status_code == 200
     assert r.json() == []
 
-    # 1. Test /assessments with limit, scoped to the owner's firebase_uid
-    r = client.get(f"/assessments?limit=1&firebase_uid={TEST_FIREBASE_UID}")
+    # 1. Test /assessments with limit, scoped to the owner's clerk_id
+    r = client.get(f"/assessments?limit=1&clerk_id={TEST_CLERK_ID}")
     assert r.status_code == 200
     data = r.json()
     assert isinstance(data, list)
@@ -85,20 +85,20 @@ def test_sqlite_dashboard_endpoints(client):
     assert data[0]["symptoms"] == ["fall_detected"]
 
     # 2. Test /assessments with risk filter, scoped
-    r = client.get(f"/assessments?risk_level=LOW&firebase_uid={TEST_FIREBASE_UID}")
+    r = client.get(f"/assessments?risk_level=LOW&clerk_id={TEST_CLERK_ID}")
     assert r.status_code == 200
     data = r.json()
     assert len(data) >= 1
     assert all(item["risk_level"] == "LOW" for item in data)
 
-    # 3. Test /assessments/stats — empty without firebase_uid ...
+    # 3. Test /assessments/stats — empty without clerk_id ...
     r = client.get("/assessments/stats")
     assert r.status_code == 200
     empty_stats = r.json()
     assert empty_stats == {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
 
-    # ... and populated for the owner's firebase_uid.
-    r = client.get(f"/assessments/stats?firebase_uid={TEST_FIREBASE_UID}")
+    # ... and populated for the owner's clerk_id.
+    r = client.get(f"/assessments/stats?clerk_id={TEST_CLERK_ID}")
     assert r.status_code == 200
     stats = r.json()
     assert "total_today" in stats
@@ -153,13 +153,13 @@ def test_postgres_dashboard_endpoints(client):
 
         mock_cursor_ctx.return_value.__enter__.return_value = mock_cursor
 
-        # Data-isolation guard: no firebase_uid → empty, no DB round-trip
+        # Data-isolation guard: no clerk_id → empty, no DB round-trip
         r = client.get("/assessments?limit=5")
         assert r.status_code == 200
         assert r.json() == []
 
-        # Test /assessments endpoint scoped by firebase_uid
-        r = client.get(f"/assessments?limit=5&firebase_uid={TEST_FIREBASE_UID}")
+        # Test /assessments endpoint scoped by clerk_id
+        r = client.get(f"/assessments?limit=5&clerk_id={TEST_CLERK_ID}")
         assert r.status_code == 200
         data = r.json()
         assert len(data) == 1
@@ -170,13 +170,13 @@ def test_postgres_dashboard_endpoints(client):
         # Reset cursor mock for stats call
         mock_cursor_ctx.return_value.__enter__.return_value = mock_cursor
 
-        # No firebase_uid → zeroed stats
+        # No clerk_id → zeroed stats
         r = client.get("/assessments/stats")
         assert r.status_code == 200
         assert r.json() == {"total_today": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
 
         # Scoped stats
-        r = client.get(f"/assessments/stats?firebase_uid={TEST_FIREBASE_UID}")
+        r = client.get(f"/assessments/stats?clerk_id={TEST_CLERK_ID}")
         assert r.status_code == 200
         stats = r.json()
         assert stats["total_today"] == 1

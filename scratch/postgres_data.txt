@@ -1,0 +1,626 @@
+Total assessments found: 31
+================================================================================
+ASSESSMENT ID: 264975d9-40b7-4b85-a0c6-94ee3b62fbea
+User: Anonymous (None)
+Date: 2026-07-31 10:06:47.891778+00:00
+Intent: health_check | Symptoms: [] | Severity: low
+Score: 0 | Risk Level: LOW
+Bolna Call ID: 0fb8ae5f-0ced-4730-875e-754ce4585bba
+Recording URL: https://s3.us-east-005.backblazeb2.com/wellring-recordings/recordings/919082487585/2026/07/31/bc67e276529246f69f69e60be343b7cb.mp3
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+assistant: Hello, I'm Alice, speaking from WellRing. So, are you ?
+user:  i am fine
+assistant:  That's really good to hear. Take care and have a lovely day ahead. Goodbye!
+user:  good bye
+
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: e345a8bf-7cf6-4d5c-8054-c5c2b02e8ed3
+User: Anonymous (None)
+Date: 2026-07-31 09:18:52.679702+00:00
+Intent: health_issue | Symptoms: [] | Severity: medium
+Score: 10 | Risk Level: LOW
+Bolna Call ID: integrity-test-1785489529
+Recording URL: None
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+Patient reports chest pain and shortness of breath since morning.
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 6c356766-91c1-4a62-9120-ae4b5d3a23a6
+User: Anonymous (None)
+Date: 2026-07-31 09:10:39.922210+00:00
+Intent: health_issue | Symptoms: [] | Severity: medium
+Score: 10 | Risk Level: LOW
+Bolna Call ID: integrity-test-1785489037
+Recording URL: None
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+Patient reports chest pain and shortness of breath since morning.
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 16229550-4a6c-4a4f-b521-f1153281df52
+User: Anonymous (None)
+Date: 2026-07-31 09:09:46.410033+00:00
+Intent: health_issue | Symptoms: [] | Severity: medium
+Score: 10 | Risk Level: LOW
+Bolna Call ID: integrity-test-1785488983
+Recording URL: None
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+Patient reports chest pain and shortness of breath since morning.
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: f28f3a42-8c0e-4907-8170-6128ff3c43ae
+User: Test User (+919082487585)
+Date: 2026-07-31 08:53:41.920335+00:00
+Intent: health_check | Symptoms: ['fever', 'cold'] | Severity: low
+Score: 28 | Risk Level: LOW
+Bolna Call ID: 6cffc889-0ce1-49f7-917b-a9d22fb8a780
+Recording URL: https://s3.us-east-005.backblazeb2.com/wellring-recordings/recordings/918421971145/2026/07/31/b73d98b9cf094ddd8b7b0811cdc7732c.mp3
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+assistant: Hello, I'm Alice, speaking from WellRing. So, are you ?
+user:  yes it's me
+assistant:  How're you feeling today?
+user:  yeah i'm feeling good
+assistant:  That's wonderful to hear. Take care and have a lovely day! Goodbye!
+user:  ok good bye
+assistant: Just give me a moment, I'll be back with you.
+assistant:  Goodbye! If you need anything, we'll check in again soon.
+user:  hello i have a question
+assistant:  Hi there! I’m glad you called. I’m just checking in today, so if you have something on your mind, I’ll make sure to pass it along to the right folks. How can I help?
+user:  so what's your name can you tell me
+assistant:   Of course! I'm Alice, calling from WellRing. How're you doing today?
+user:  so what's doing do you know
+assistant: I’m here to check in on how you’re feeling and make sure you’re doing okay. If there’s an
+user:  so are you a human or an ai bot
+assistant: I’m a friendly voice assistant, here to check in on you and make sure you’re feeling alright. Think of
+user:  means real person or an
+assistant:  I’m not a real person, but I’m here to listen and help just like one. How’re you feeling today?
+user:  not a real person so
+user:  you mean you are an ai
+assistant:  Yes, I’m an AI assistant here to check in on you and make sure you’re doing okay. How’re you feeling today?
+user:  ok
+assistant: Glad to hear that.
+user:  i just have little bit fever and cold
+assistant:  Sorry to hear that. How long have you been feeling feverish and cold?
+user:  since last night
+assistant: Just give me a moment, I'll be back with you.
+assistant: Thanks for letting me know. Since you've had fever and cold since last night, please make su
+
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: dad9bfa7-c961-45c5-8879-c79507f02b9e
+User: Test User (+919082487585)
+Date: 2026-07-31 07:58:17.281190+00:00
+Intent: health_check | Symptoms: ['fever', 'cold'] | Severity: low
+Score: 24 | Risk Level: LOW
+Bolna Call ID: 6cffc889-0ce1-49f7-917b-a9d22fb8a780
+Recording URL: https://s3.us-east-005.backblazeb2.com/wellring-recordings/recordings/918421971145/2026/07/31/8bd1861ea2aa4864a2b14bedac5bfa29.mp3
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+assistant: Hello, I'm Alice, speaking from WellRing. So, are you ?
+user:  yes it's me
+assistant:  How're you feeling today?
+user:  yeah i'm feeling good
+assistant:  That's wonderful to hear. Take care and have a lovely day! Goodbye!
+user:  ok good bye
+assistant: Just give me a moment, I'll be back with you.
+assistant:  Goodbye! If you need anything, we'll check in again soon.
+user:  hello i have a question
+assistant:  Hi there! I’m glad you called. I’m just checking in today, so if you have something on your mind, I’ll make sure to pass it along to the right folks. How can I help?
+user:  so what's your name can you tell me
+assistant:   Of course! I'm Alice, calling from WellRing. How're you doing today?
+user:  so what's doing do you know
+assistant: I’m here to check in on how you’re feeling and make sure you’re doing okay. If there’s an
+user:  so are you a human or an ai bot
+assistant: I’m a friendly voice assistant, here to check in on you and make sure you’re feeling alright. Think of
+user:  means real person or an
+assistant:  I’m not a real person, but I’m here to listen and help just like one. How’re you feeling today?
+user:  not a real person so
+user:  you mean you are an ai
+assistant:  Yes, I’m an AI assistant here to check in on you and make sure you’re doing okay. How’re you feeling today?
+user:  ok
+assistant: Glad to hear that.
+user:  i just have little bit fever and cold
+assistant:  Sorry to hear that. How long have you been feeling feverish and cold?
+user:  since last night
+assistant: Just give me a moment, I'll be back with you.
+assistant: Thanks for letting me know. Since you've had fever and cold since last night, please make su
+
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: fed0bbed-37e9-40a0-a51c-36c666874dc6
+User: Test User (+919082487585)
+Date: 2026-07-31 07:35:49.338596+00:00
+Intent: health_check | Symptoms: ['dizziness'] | Severity: low
+Score: 30 | Risk Level: LOW
+Bolna Call ID: bolna_missed_call
+Recording URL: https://example.com/audio.mp3
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+**Assistant**: How are you?
+
+**User**: I feel a bit dizzy
+----------------------------------------
+CONVERSATION LOG:
+  [2026-07-31 07:35:59.843375+00:00] ASSISTANT: How are you?
+  [2026-07-31 07:36:02.211221+00:00] USER: I feel a bit dizzy
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 7843715e-1d62-4f81-960a-dd2a68e2953a
+User: Test User (+919082487585)
+Date: 2026-07-31 07:35:18.868744+00:00
+Intent: symptom_report | Symptoms: ['dizziness'] | Severity: low
+Score: 25 | Risk Level: LOW
+Bolna Call ID: bolna_missed_call
+Recording URL: https://example.com/audio.mp3
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+**Assistant**: How are you?
+
+**User**: I feel a bit dizzy
+----------------------------------------
+CONVERSATION LOG:
+  [2026-07-31 07:35:26.799255+00:00] ASSISTANT: How are you?
+  [2026-07-31 07:35:28.684317+00:00] USER: I feel a bit dizzy
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 54a4e555-56ef-43d7-8718-004aed2ce347
+User: Test User (+919082487585)
+Date: 2026-07-31 06:58:54.525971+00:00
+Intent: health_check | Symptoms: ['fever', 'cold'] | Severity: low
+Score: 20 | Risk Level: LOW
+Bolna Call ID: 6cffc889-0ce1-49f7-917b-a9d22fb8a780
+Recording URL: https://s3.us-east-005.backblazeb2.com/wellring-recordings/recordings/user/2026/07/31/c264332378b14b6a9a7279b3d917da97.mp3
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+assistant: Hello, I'm Alice, speaking from WellRing. So, are you ?
+user:  yes it's me
+assistant:  How're you feeling today?
+user:  yeah i'm feeling good
+assistant:  That's wonderful to hear. Take care and have a lovely day! Goodbye!
+user:  ok good bye
+assistant: Just give me a moment, I'll be back with you.
+assistant:  Goodbye! If you need anything, we'll check in again soon.
+user:  hello i have a question
+assistant:  Hi there! I’m glad you called. I’m just checking in today, so if you have something on your mind, I’ll make sure to pass it along to the right folks. How can I help?
+user:  so what's your name can you tell me
+assistant:   Of course! I'm Alice, calling from WellRing. How're you doing today?
+user:  so what's doing do you know
+assistant: I’m here to check in on how you’re feeling and make sure you’re doing okay. If there’s an
+user:  so are you a human or an ai bot
+assistant: I’m a friendly voice assistant, here to check in on you and make sure you’re feeling alright. Think of
+user:  means real person or an
+assistant:  I’m not a real person, but I’m here to listen and help just like one. How’re you feeling today?
+user:  not a real person so
+user:  you mean you are an ai
+assistant:  Yes, I’m an AI assistant here to check in on you and make sure you’re doing okay. How’re you feeling today?
+user:  ok
+assistant: Glad to hear that.
+user:  i just have little bit fever and cold
+assistant:  Sorry to hear that. How long have you been feeling feverish and cold?
+user:  since last night
+assistant: Just give me a moment, I'll be back with you.
+assistant: Thanks for letting me know. Since you've had fever and cold since last night, please make su
+
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: d821332c-a7d8-4e6d-ab35-72ac9e81ca1d
+User: Test User (+919082487585)
+Date: 2026-07-26 12:35:52.773646+00:00
+Intent: health_check | Symptoms: [] | Severity: low
+Score: 0 | Risk Level: LOW
+Bolna Call ID: test_call_phone_lookup
+Recording URL: https://example.com/test_nested_recording.mp3
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+**Assistant**: Hello, how are you feeling today?
+
+**User**: I feel fine, no problems.
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: a7e4aa58-fa10-4922-92c1-a65ca3a91dcc
+User: Anonymous (None)
+Date: 2026-07-26 10:18:23.823059+00:00
+Intent: health_issue | Symptoms: ['chest_pain'] | Severity: critical
+Score: 105 | Risk Level: CRITICAL
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: CRITICAL condition! Alerting caregiver AND emergency services NOW.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 3b5af3f9-aea5-479d-8da7-d5451d6e2202
+User: Anonymous (None)
+Date: 2026-07-26 09:55:18.421227+00:00
+Intent: health_issue | Symptoms: ['stroke_symptoms'] | Severity: critical
+Score: 139 | Risk Level: CRITICAL
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: CRITICAL condition! Alerting caregiver AND emergency services NOW.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: b46ace75-ac86-427e-b0e8-94a4c37f18aa
+User: Anonymous (None)
+Date: 2026-07-26 09:55:09.674443+00:00
+Intent: health_issue | Symptoms: ['fall_detected'] | Severity: high
+Score: 81 | Risk Level: HIGH
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: Significant symptoms detected. Notifying the caregiver immediately.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: bdb63ccd-fbf4-4374-b7be-d15479697593
+User: Anonymous (None)
+Date: 2026-07-26 09:54:57.378404+00:00
+Intent: health_issue | Symptoms: ['dizziness'] | Severity: medium
+Score: 32 | Risk Level: MEDIUM
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: Some symptoms detected. Ask follow-up questions to clarify.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 37e3ae53-df78-44dd-a4ba-17d9c4bcb526
+User: Anonymous (None)
+Date: 2026-07-25 21:26:37.939115+00:00
+Intent: health_issue | Symptoms: [] | Severity: medium
+Score: 10 | Risk Level: LOW
+Bolna Call ID: integrity-test-1785014793
+Recording URL: None
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+Patient reports chest pain and shortness of breath since morning.
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 3e90952c-2c2a-45f8-95e1-2367af2d4e07
+User: Anonymous (None)
+Date: 2026-07-25 19:43:46.167172+00:00
+Intent: health_issue | Symptoms: ['stroke_symptoms', 'unconscious'] | Severity: critical
+Score: 356 | Risk Level: CRITICAL
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: CRITICAL condition! Alerting caregiver AND emergency services NOW.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 209d4801-7af2-4657-902c-b4ff3f6f1572
+User: Anonymous (None)
+Date: 2026-07-25 19:43:43.171413+00:00
+Intent: health_issue | Symptoms: ['fall_detected', 'chest_pain'] | Severity: high
+Score: 217 | Risk Level: CRITICAL
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: CRITICAL condition! Alerting caregiver AND emergency services NOW.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: d82761e2-9518-4028-9787-ea5c9bf2c25e
+User: Anonymous (None)
+Date: 2026-07-25 19:43:40.074138+00:00
+Intent: health_issue | Symptoms: ['dizziness', 'headache'] | Severity: medium
+Score: 59 | Risk Level: MEDIUM
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: Some symptoms detected. Ask follow-up questions to clarify.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: fc170fc6-7e51-4ea3-9e92-511c378746fc
+User: Anonymous (None)
+Date: 2026-07-25 19:43:37.171735+00:00
+Intent: health_issue | Symptoms: ['medicine_missed'] | Severity: low
+Score: 16 | Risk Level: LOW
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 9ac0959b-5b51-4b64-b726-cef0615bdd6b
+User: Anonymous (None)
+Date: 2026-07-25 19:43:08.140542+00:00
+Intent: health_issue | Symptoms: ['stroke_symptoms', 'unconscious'] | Severity: critical
+Score: 317 | Risk Level: CRITICAL
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: CRITICAL condition! Alerting caregiver AND emergency services NOW.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 81d3d6fd-1d54-492a-a626-63bbaad7aafd
+User: Anonymous (None)
+Date: 2026-07-25 19:43:05.154792+00:00
+Intent: health_issue | Symptoms: ['fall_detected', 'chest_pain'] | Severity: high
+Score: 192 | Risk Level: CRITICAL
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: CRITICAL condition! Alerting caregiver AND emergency services NOW.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: d0e8892b-e3a7-4240-9050-83bfe3b202e0
+User: Anonymous (None)
+Date: 2026-07-25 19:43:02.023873+00:00
+Intent: health_issue | Symptoms: ['dizziness', 'headache'] | Severity: medium
+Score: 53 | Risk Level: MEDIUM
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: Some symptoms detected. Ask follow-up questions to clarify.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 4a0ab5e4-8e3e-408d-a500-a6e835af4aec
+User: Anonymous (None)
+Date: 2026-07-25 19:42:59.585082+00:00
+Intent: health_issue | Symptoms: ['medicine_missed'] | Severity: low
+Score: 14 | Risk Level: LOW
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 75f855fc-b187-486b-a02f-b658cb01afa9
+User: Anonymous (None)
+Date: 2026-07-25 19:42:04.215015+00:00
+Intent: health_issue | Symptoms: ['stroke_symptoms', 'unconscious'] | Severity: critical
+Score: 277 | Risk Level: CRITICAL
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: CRITICAL condition! Alerting caregiver AND emergency services NOW.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 49f4c42f-23ed-46a8-815f-8b2aecab88a0
+User: Anonymous (None)
+Date: 2026-07-25 19:42:01.153919+00:00
+Intent: health_issue | Symptoms: ['fall_detected', 'chest_pain'] | Severity: high
+Score: 167 | Risk Level: CRITICAL
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: CRITICAL condition! Alerting caregiver AND emergency services NOW.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 774145c1-0eb1-41b7-928d-ae7d29a4a4f6
+User: Anonymous (None)
+Date: 2026-07-25 19:41:58.106664+00:00
+Intent: health_issue | Symptoms: ['dizziness', 'headache'] | Severity: medium
+Score: 47 | Risk Level: MEDIUM
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: Some symptoms detected. Ask follow-up questions to clarify.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: f5eaeeda-683b-49f0-9608-965cd518d736
+User: Anonymous (None)
+Date: 2026-07-25 19:41:55.727378+00:00
+Intent: health_issue | Symptoms: ['medicine_missed'] | Severity: low
+Score: 12 | Risk Level: LOW
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: d19a0700-b837-4a8e-b436-c4990cee0f98
+User: Anonymous (None)
+Date: 2026-07-25 19:41:10.437213+00:00
+Intent: health_issue | Symptoms: ['stroke_symptoms', 'unconscious'] | Severity: critical
+Score: 238 | Risk Level: CRITICAL
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: CRITICAL condition! Alerting caregiver AND emergency services NOW.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: 254bbe2c-4de5-46fd-ac04-1dd547e9abe2
+User: Anonymous (None)
+Date: 2026-07-25 19:41:07.446621+00:00
+Intent: health_issue | Symptoms: ['fall_detected', 'chest_pain'] | Severity: high
+Score: 142 | Risk Level: CRITICAL
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: CRITICAL condition! Alerting caregiver AND emergency services NOW.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: e19fdbfd-00ca-4a1b-920b-4f0c227f5e22
+User: Anonymous (None)
+Date: 2026-07-25 19:41:03.880369+00:00
+Intent: health_issue | Symptoms: ['dizziness', 'headache'] | Severity: medium
+Score: 40 | Risk Level: MEDIUM
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: Some symptoms detected. Ask follow-up questions to clarify.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+
+================================================================================
+ASSESSMENT ID: a276619d-0557-4f2e-8654-51555df50e61
+User: Anonymous (None)
+Date: 2026-07-25 19:41:01.534351+00:00
+Intent: health_issue | Symptoms: ['medicine_missed'] | Severity: low
+Score: 10 | Risk Level: LOW
+Bolna Call ID: None
+Recording URL: None
+Summary/Message: No immediate concern. Continue monitoring the user.
+----------------------------------------
+TRANSCRIPT:
+None
+----------------------------------------
+No conversation turns logged in database.
+================================================================================
+
+

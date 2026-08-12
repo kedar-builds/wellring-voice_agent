@@ -6,7 +6,6 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - USE_SUPABASE=false
       - USE_TWILIO=false
     volumes:
       - .:/app
