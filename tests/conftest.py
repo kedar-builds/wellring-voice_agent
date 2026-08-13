@@ -20,6 +20,24 @@ os.environ["DATABASE_URL"] = ""
 # Set a test-only API key so auth functions don't 500 on missing env var.
 # This value is not a secret — it exists only within the test process.
 os.environ.setdefault("WELLRING_API_KEY", "wellring-test-key-local")
+# Rate limiting: keep the middleware ACTIVE in tests (so its code path runs)
+# but never trip it — the TestClient shares one IP, the suite makes hundreds
+# of requests, and several tests deliberately provoke 401s.
+# The blocking behavior itself is unit-tested in tests/test_ratelimit.py.
+os.environ.setdefault("RATE_LIMIT_REQUESTS_PER_MINUTE", "100000")
+os.environ.setdefault("RATE_LIMIT_FAILURES_PER_WINDOW", "100000")
+# The test session must NEVER make real external calls — the local .env sets
+# USE_TWILIO/USE_ROUTINE_UPDATES=true and OPENROUTER_API_KEY, which made the
+# suite spend minutes on real Twilio sends + Nemotron LLM calls. test_
+# notifications.py controls these flags per-test via patch(), so forcing them
+# off here is safe. (Set BEFORE src.* is imported — load_dotenv never
+# overrides already-set variables. Direct assignment, NOT setdefault: a
+# developer shell exporting USE_TWILIO=true or OPENROUTER_API_KEY must not
+# leak those values into the suite — that was a real external-call regression.)
+os.environ["USE_TWILIO"] = "false"
+os.environ["USE_WHATSAPP"] = "false"
+os.environ["USE_ROUTINE_UPDATES"] = "false"
+os.environ["OPENROUTER_API_KEY"] = ""
 
 
 @pytest.fixture(scope="session", autouse=True)

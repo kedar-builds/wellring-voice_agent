@@ -78,12 +78,24 @@ def twilio_quota_exhausted() -> bool:
         return _time.time() - _quota_exhausted_ts < QUOTA_COOLDOWN_SECONDS
 
 
-def _notify_dev_via_webhook(err_msg: str) -> None:
-    """POST a dev alert to DEV_ALERT_WEBHOOK_URL (Slack/Discord/ntfy style)."""
+def _notify_dev_via_webhook(
+    err_msg: str,
+    title: str = "WellRing: Twilio message quota exceeded!",
+    footer: str = (
+        "WhatsApp/SMS alerts are NOT being delivered. "
+        "Check the account at https://console.twilio.com and upgrade the plan "
+        "or wait for the daily limit to reset."
+    ),
+) -> None:
+    """
+    POST a dev alert to DEV_ALERT_WEBHOOK_URL (Slack/Discord/ntfy style).
+
+    Callers may override the title/footer text (e.g. the auth-health watchdog).
+    """
     if not DEV_ALERT_WEBHOOK_URL:
         logger.error(
-            "[TWILIO-QUOTA] Set DEV_ALERT_WEBHOOK_URL to get notified the next time "
-            "Twilio hits its message quota."
+            "[DEV-ALERT] Set DEV_ALERT_WEBHOOK_URL to get notified when the backend "
+            "needs attention (Twilio quota, auth health, ...)."
         )
         return
     try:
@@ -91,20 +103,18 @@ def _notify_dev_via_webhook(err_msg: str) -> None:
 
         payload = {
             "text": (
-                "🚨 *WellRing: Twilio message quota exceeded!*\n\n"
+                f"🚨 *{title}*\n\n"
                 f"{err_msg}\n\n"
-                "WhatsApp/SMS alerts are NOT being delivered. "
-                "Check the account at https://console.twilio.com and upgrade the plan "
-                "or wait for the daily limit to reset."
+                f"{footer}"
             )
         }
         resp = httpx.post(DEV_ALERT_WEBHOOK_URL, json=payload, timeout=10)
         if resp.status_code >= 400:
-            logger.error(f"[TWILIO-QUOTA] Dev webhook returned HTTP {resp.status_code}")
+            logger.error(f"[DEV-ALERT] Dev webhook returned HTTP {resp.status_code}")
         else:
-            logger.info(f"[TWILIO-QUOTA] Dev webhook notified ({resp.status_code}).")
+            logger.info(f"[DEV-ALERT] Dev webhook notified ({resp.status_code}).")
     except Exception as exc:
-        logger.error(f"[TWILIO-QUOTA] Dev webhook notification failed: {exc}")
+        logger.error(f"[DEV-ALERT] Dev webhook notification failed: {exc}")
 
 
 _last_dev_alert_ts = 0.0

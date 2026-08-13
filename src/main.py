@@ -37,6 +37,13 @@ import secrets
 from google import genai
 from google.genai import types
 from src.storage import upload_recording_to_b2, get_presigned_url, is_storage_configured
+from src.ratelimit import make_limiter_from_env, RateLimitMiddleware
+from src.auth_health import (
+    record_clerk_rejection,
+    run_auth_health_watchdog,
+    current_env,
+    _PRODUCTION_LIKE_ENVS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,12 +130,25 @@ async def get_verified_clerk_uid(request: Request) -> Optional[str]:
         from clerk_backend_api.security.authenticaterequest import authenticate_request_async
         from clerk_backend_api.security.types import AuthenticateRequestOptions
 
-        state = await authenticate_request_async(
-            request,
-            AuthenticateRequestOptions(secret_key=secret_key, accepts_token=["session_token"]),
+        # Optional hardening: restrict which frontend origins a session token is
+        # valid for (Clerk "authorized parties" — the JWT `azp` claim). Opt-in
+        # via CLERK_AUTHORIZED_PARTIES (comma-separated origins) because the SDK
+        # REJECTS tokens whose `azp` claim is missing (e.g. sessions minted
+        # before this option was enabled). Leave unset to accept any token issued
+        # by the configured Clerk instance.
+        authorized_parties = os.environ.get("CLERK_AUTHORIZED_PARTIES", "")
+        options = AuthenticateRequestOptions(
+            secret_key=secret_key,
+            accepts_token=["session_token"],
+            authorized_parties=(
+                [p.strip() for p in authorized_parties.split(",") if p.strip()]
+                if authorized_parties else None
+            ),
         )
+        state = await authenticate_request_async(request, options)
     except Exception as exc:
         logger.error(f"[CLERK-AUTH] Token verification error: {exc}")
+        record_clerk_rejection()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not verify Clerk session",
@@ -140,6 +160,7 @@ async def get_verified_clerk_uid(request: Request) -> Optional[str]:
             return str(sub)
     reason = state.reason.value[1] if state.reason else "invalid token"
     logger.warning(f"[CLERK-AUTH] Rejected request: {reason}")
+    record_clerk_rejection()
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or missing Clerk session token",
@@ -430,11 +451,47 @@ def seed_demo_data():
 
 scheduler_task = None
 watchdog_task = None
+auth_watchdog_task = None
+
+def _clerk_auth_startup_guard(env: str) -> None:
+    """
+    Fail fast when a production-like environment would run with Clerk session
+    verification disabled. Without CLERK_SECRET_KEY the backend runs in "dev
+    mode" where any caller holding the static WELLRING_API_KEY can pass any
+    clerk_id and read/write every account's data.
+
+    `ALLOW_INSECURE_DEV_AUTH=true` is an emergency override that logs a
+    critical warning instead of refusing to start.
+    """
+    env = (env or "").strip().lower()
+    if env not in _PRODUCTION_LIKE_ENVS:
+        return
+    if os.environ.get("CLERK_SECRET_KEY"):
+        return
+    if os.environ.get("ALLOW_INSECURE_DEV_AUTH", "").lower() == "true":
+        logger.critical(
+            "[STARTUP] ALLOW_INSECURE_DEV_AUTH=true in a production-like environment — "
+            "Clerk session verification is DISABLED. Patient data is exposed to any "
+            "caller holding the static API key. Remove this override immediately."
+        )
+        return
+    raise RuntimeError(
+        "CLERK_SECRET_KEY is not set in a production-like environment. Refusing to start: "
+        "Clerk session verification would be disabled, exposing all patient data to "
+        "anyone holding the static WELLRING_API_KEY. Set CLERK_SECRET_KEY, or set "
+        "ENV=development for local dev."
+    )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scheduler_task, watchdog_task
     from src.database import init_pg_tables
+    # Production guard: never boot with Clerk session verification disabled.
+    # (Skipped while running under pytest — a dev shell may carry a platform
+    # env var like ENV or RAILWAY_ENVIRONMENT and must not break `pytest`.)
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        _clerk_auth_startup_guard(current_env())
     init_db()
     init_pg_tables()   # Creates PG tables if they don't exist (safe on each startup)
     if is_storage_configured():
@@ -447,11 +504,19 @@ async def lifespan(app: FastAPI):
         logger.error(f"[SEED] Demo data seeding failed (non-fatal): {e}")
     scheduler_task = asyncio.create_task(run_reminder_scheduler())
     watchdog_task = asyncio.create_task(run_watchdog())  # 🧠 Nemotron system watchdog
+    # Auth-health watchdog: alerts the team (DEV_ALERT_WEBHOOK_URL) when Clerk
+    # session verification is disabled in production, or a rejection spike
+    # suggests a broken frontend login flow. Skipped under pytest so test
+    # 401s never page anyone.
+    global auth_watchdog_task
+    auth_watchdog_task = None
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        auth_watchdog_task = asyncio.create_task(run_auth_health_watchdog())
     try:
         yield
     finally:
         # ---- shutdown ----
-        for task in (scheduler_task, watchdog_task):
+        for task in (scheduler_task, watchdog_task, auth_watchdog_task):
             if task:
                 task.cancel()
                 try:
@@ -498,8 +563,34 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    # Vercel preview deployments live on *.vercel.app subdomains (e.g.
+    # wellring-frontend-git-*.vercel.app); allow them so preview builds can
+    # exercise the dashboard end-to-end.
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    # allow_credentials=True is required so browsers send the Clerk `__session`
+    # cookie on cross-origin requests when the frontend uses cookie-based
+    # sessions. Explicit origins (never "*") are mandatory for credentials.
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# Rate limiting: per-IP caps on protected routes + brute-force blocking of
+# IPs that produce a burst of 401s (protects the static API key + Clerk
+# login endpoints). Webhook endpoints are exempt (provider server IPs).
+app.add_middleware(
+    RateLimitMiddleware,
+    limiter=make_limiter_from_env(),
+    exempt_paths=(
+        "/",
+        "/health",
+        "/health/auth",
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+        "/twilio-webhook",
+        "/bolna-webhook",
+    ),
 )
 
 
@@ -607,6 +698,36 @@ def health():
     return HealthResponse(status="ok", version="1.0.0")
 
 
+@app.get("/health/auth", tags=["Health"])
+def health_auth():
+    """
+    Auth-layer health status for ops dashboards and the Railway healthcheck.
+
+    Reports whether Clerk session verification is active in the current
+    environment. Never reveals secrets — only configuration state. Always
+    returns HTTP 200 (the auth watchdog pages the team via
+    DEV_ALERT_WEBHOOK_URL when something is wrong).
+    """
+    from src.auth_health import production_like_env, current_alerts
+    secret_configured = bool(os.environ.get("CLERK_SECRET_KEY"))
+    prod = production_like_env()
+    alerts = current_alerts()
+    secure = not alerts
+    body = {
+        "status": "degraded" if alerts else "ok",
+        "mode": "production" if prod else "development",
+        "clerk_secret_key": "configured" if secret_configured else "missing",
+        "secure": secure,
+        "alerts": alerts,
+    }
+    # Degraded (auth disabled in a production-like env) → 503 so a Railway
+    # healthcheck pointing at /health/auth marks the deploy unhealthy instead
+    # of silently shipping with login auth off.
+    if not secure:
+        return JSONResponse(status_code=503, content=body)
+    return body
+
+
 @app.get("/storage-status", tags=["Health"])
 def storage_status(api_key: str = Depends(get_api_key)):
     """
@@ -628,7 +749,10 @@ def storage_status(api_key: str = Depends(get_api_key)):
 
 
 @app.get("/config-check", tags=["Health"])
-def config_check(api_key: str = Depends(get_api_key)):
+def config_check(
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
     """
     Check environment configuration and return masked API keys to debug credential issues.
     Requires a valid X-API-Key — masked key fragments and service-configuration
@@ -1743,8 +1867,8 @@ async def setup_profile(
             
         return {"status": "success", "user_id": user_id}
     except Exception as e:
-        logger.error(f"Error in setup_profile: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error in setup_profile: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to save profile")
 
 @app.get("/setup-profile")
 async def get_profile(
@@ -1821,8 +1945,25 @@ async def get_family_contacts_route(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/family-contacts/{contact_id}")
-async def delete_family_contact_route(contact_id: str, api_key: str = Depends(get_api_key)):
+async def delete_family_contact_route(
+    contact_id: str,
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
+    """Delete a family contact.
+
+    With a verified Clerk session the contact must belong to that caller's
+    elder — guessing another account's contact id returns 404 (same contract
+    as DELETE /reminders/{id}).
+    """
     try:
+        if verified_uid:
+            profile = get_user_profile(verified_uid)
+            if not profile:
+                raise HTTPException(status_code=404, detail="Contact not found")
+            owned_ids = {str(c["user_id"]) for c in get_family_contacts(str(profile["user_id"]))}
+            if contact_id not in owned_ids:
+                raise HTTPException(status_code=404, detail="Contact not found")
         success = delete_family_contact(contact_id)
         if not success:
             raise HTTPException(status_code=404, detail="Contact not found")
@@ -1831,7 +1972,7 @@ async def delete_family_contact_route(contact_id: str, api_key: str = Depends(ge
         raise
     except Exception as e:
         logger.error(f"Error deleting family contact: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to delete family contact")
 
 # genai already imported at module top
 
@@ -2361,6 +2502,7 @@ async def bolna_webhook(request: Request, token: Optional[str] = Query(None)):
 @app.get("/watchdog/logs")
 async def get_watchdog_logs(
     limit: int = Query(default=20, ge=1, le=200, description="Number of audit log entries to return"),
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
     api_key: str = Depends(get_api_key),
 ):
     """
@@ -2372,4 +2514,23 @@ async def get_watchdog_logs(
     return {
         "audits": logs,
         "count": len(logs),
+    }
+
+
+@app.get("/auth/events", tags=["Ops"])
+async def get_auth_events_endpoint(
+    limit: int = Query(default=50, ge=1, le=500, description="Number of auth-health / rate-limit events to return"),
+    verified_uid: Optional[str] = Depends(get_verified_clerk_uid),
+    api_key: str = Depends(get_api_key),
+):
+    """
+    Recent auth-health / rate-limit events for the ops dashboard: IP blocks
+    from brute-force attempts, missing CLERK_SECRET_KEY alerts, and Clerk
+    rejection spikes. Same access contract as /watchdog/logs.
+    """
+    from src.database import get_auth_events
+    events = await asyncio.to_thread(get_auth_events, limit)
+    return {
+        "events": events,
+        "count": len(events),
     }

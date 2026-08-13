@@ -31,7 +31,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `CONTRIBUTING.md` — branch + review process documentation (Phase 7.1/7.3)
 - Nemotron 70B watchdog integration: hallucination detection, confidence-based follow-ups,
   audit logging to `nemotron_audits` table (7 tests, all passing)
+- Rate limiting (`src/ratelimit.py`): dependency-free in-memory per-IP request
+  caps + 401-burst brute-force blocking (webhooks/health exempt). Config via
+  `RATE_LIMIT_*` env vars. Tests in `tests/test_ratelimit.py`.
+- Auth-health watchdog (`src/auth_health.py`) + `GET /health/auth`: pages the
+  team via `DEV_ALERT_WEBHOOK_URL` when CLERK_SECRET_KEY is missing in a
+  production-like environment or a rejection spike suggests a broken frontend
+  login flow (at most once/hour). Tests in `tests/test_auth_health.py`.
+- `scripts/smoke_test_login.py` — end-to-end login-flow smoke test (dev mode
+  by default; production `--token` mode asserts 401 fail-closed; `--live
+  BASE_URL` probes a DEPLOYED backend's fail-closed contract without a token).
+  Hermetic (isolated SQLite DB, external sends forced off).
+- `auth_events` persistence + `GET /auth/events` (Clerk-protected): rate-limit
+  IP blocks, missing-secret alerts, and Clerk rejection spikes are recorded in
+  an `auth_events` table (SQLite + Postgres, lazily created) for the ops
+  dashboard. The DDL is split per backend (SQLite `AUTOINCREMENT`/TEXT vs
+  Postgres `BIGSERIAL`/`TIMESTAMPTZ`); a single shared DDL silently killed the
+  feature on production Postgres. Rate-limit blocks are also written off the
+  event loop via `asyncio.to_thread`.
+- `railway.toml` — config-as-code with `healthcheckPath = "/health/auth"`;
+  `/health/auth` returns **503 when insecure**, so a deploy that would run
+  with Clerk verification disabled is marked failed instead of shipping
+  silently.
 ### Fixed
+- **Clerk auth hardening (production-ready login):**
+  - `DELETE /family-contacts/{id}` now requires a verified Clerk session and
+    ownership-scopes the delete (cross-account contact IDs return 404) — it was
+    the only dashboard endpoint missing the Clerk check.
+  - `/watchdog/logs` and `/config-check` now require a verified Clerk session in
+    addition to the static API key.
+  - CORS now sets `allow_credentials=True` so browsers send the Clerk `__session`
+    cookie cross-origin (explicit origins only).
+  - Optional `CLERK_AUTHORIZED_PARTIES` (comma-separated origins) validates the
+    JWT `azp` claim — opt-in because the SDK rejects tokens with a missing `azp`.
+  - **Production startup guard:** the backend refuses to boot with
+    `CLERK_SECRET_KEY` unset when `ENV`/`RAILWAY_ENVIRONMENT`/`VERCEL_ENV` is
+    `production` (override: `ALLOW_INSECURE_DEV_AUTH=true`, logged as critical).
+  - `setup_profile` no longer leaks DB error strings to clients (500 → generic
+    message; full detail logged server-side).
+  - `tests/test_clerk_auth.py` — 16 new tests covering token requirements +
+    ownership scoping on every dashboard/outbound endpoint, the startup guard
+    (pure-function tests), and `CLERK_AUTHORIZED_PARTIES` pass-through.
+  - `_notify_dev_via_webhook` now accepts custom title/footer text (used by
+    the auth-health watchdog); Twilio-quota callers unchanged.
+  - Fixed a self-deadlock in `RateLimiter.check_and_record` — it called a
+    lock-taking helper (`remaining_block_seconds`) while holding the
+    non-reentrant `threading.Lock` (every request after the first auth block
+    would hang).
+  *Verification: `pytest tests/ -q` → 140 passed in 4.53s (2026-08-13)*
 - `get_symptom_repeat_count` — excluded `is_system` sentinel user from global symptom
   counts to prevent score inflation (Phase 3.4); both Postgres and SQLite paths corrected
 - `_migrate_sqlite_schema` — added `is_system INTEGER NOT NULL DEFAULT 0` to migration dict

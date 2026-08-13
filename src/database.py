@@ -2704,3 +2704,103 @@ def assessment_exists_for_call(call_id: str, db_path: Optional[str] = None) -> b
         logger.error(f"[ASSESSMENT-EXISTS] SQLite query failed: {exc}")
         return False
 
+
+# ===========================================================================
+# Auth events  (rate-limit blocks + auth-health alerts, for the ops dashboard)
+# ===========================================================================
+
+# SQLite and Postgres need different DDL for the auth_events table:
+# AUTOINCREMENT is a SQLite keyword (invalid in Postgres), and the PG column
+# must be TIMESTAMPTZ to accept now()/timestamps. Keeping one DDL string
+# silently broke the feature on production (Postgres) — see review fix.
+_AUTH_EVENTS_DDL_SQLITE = (
+    "CREATE TABLE IF NOT EXISTS auth_events ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " created_at TEXT NOT NULL,"
+    " event_type TEXT NOT NULL,"
+    " detail TEXT,"
+    " ip TEXT)"
+)
+_AUTH_EVENTS_DDL_PG = (
+    "CREATE TABLE IF NOT EXISTS auth_events ("
+    " id BIGSERIAL PRIMARY KEY,"
+    " created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+    " event_type TEXT NOT NULL,"
+    " detail TEXT,"
+    " ip TEXT)"
+)
+
+
+def log_auth_event(event_type: str, detail: str = "", ip: Optional[str] = None) -> None:
+    """
+    Append a row to the auth_events table (created lazily, both backends).
+    Used by the rate limiter (IP blocks) and the auth-health watchdog (missing
+    secret / rejection spikes) so ops can audit them via GET /auth/events.
+
+    NOTE: callers on the request path (rate-limit middleware) invoke this
+    synchronously — acceptable because it only fires when an IP is blocked
+    (rare), but it does make a blocking DB round-trip on the event loop.
+    """
+    if _use_postgres() and _PG_AVAILABLE:
+        try:
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    cur.execute(_AUTH_EVENTS_DDL_PG)
+                    cur.execute(
+                        "INSERT INTO auth_events (created_at, event_type, detail, ip) "
+                        "VALUES (now(), %s, %s, %s)",
+                        (event_type, detail, ip),
+                    )
+            return
+        except Exception as exc:
+            logger.error(f"[AUTH-EVENTS] Postgres write failed: {exc}")
+            return
+    now_str = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z"
+    try:
+        db_path = _resolve_db_path(None)
+        conn = sqlite3.connect(db_path)
+        conn.execute(_AUTH_EVENTS_DDL_SQLITE)
+        conn.execute(
+            "INSERT INTO auth_events (created_at, event_type, detail, ip) VALUES (?, ?, ?, ?)",
+            (now_str, event_type, detail, ip),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.error(f"[AUTH-EVENTS] SQLite write failed: {exc}")
+
+
+def get_auth_events(limit: int = 50) -> List[Dict[str, Any]]:
+    """Most recent auth-health / rate-limit events, newest first."""
+    if _use_postgres() and _PG_AVAILABLE:
+        try:
+            with get_pg_conn() as conn:
+                with _pg_cursor(conn) as cur:
+                    cur.execute(_AUTH_EVENTS_DDL_PG)
+                    cur.execute(
+                        "SELECT id, created_at, event_type, detail, ip "
+                        "FROM auth_events ORDER BY created_at DESC, id DESC LIMIT %s",
+                        (limit,),
+                    )
+                    return [dict(r) for r in cur.fetchall()]
+        except Exception as exc:
+            logger.error(f"[AUTH-EVENTS] Postgres read failed: {exc}")
+            return []
+    try:
+        db_path = _resolve_db_path(None)
+        conn = sqlite3.connect(db_path)
+        conn.execute(_AUTH_EVENTS_DDL_SQLITE)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, created_at, event_type, detail, ip "
+            "FROM auth_events ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as exc:
+        logger.error(f"[AUTH-EVENTS] SQLite read failed: {exc}")
+        return []
+

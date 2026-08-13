@@ -1,0 +1,18 @@
+# Railway config-as-code.
+# Reference: https://docs.railway.com/config-as-code/reference
+# The app builds from ./Dockerfile; uvicorn is started by the Dockerfile CMD,
+# so no startCommand override is needed here.
+
+[deploy]
+# Auth-aware healthcheck: GET /health/auth returns 200 when Clerk session
+# verification is configured for the environment and 503 when it is missing
+# or disabled (a "secure": false state). Railway runs this check once at
+# startup, so a deploy that would ship with login auth turned off is marked
+# failed instead of going live silently. (The startup guard in src/main.py
+# refuses to boot at all in production-like environments without
+# CLERK_SECRET_KEY; this healthcheck is the second line of defense, e.g. when
+# ALLOW_INSECURE_DEV_AUTH=true is set.)
+healthcheckPath = "/health/auth"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
