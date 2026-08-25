@@ -534,6 +534,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     import traceback
